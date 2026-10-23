@@ -1,6 +1,6 @@
 # oasa-sec
 
-**OASA-SEC:** device identity, encrypted pairing and link keys for [OASA](https://joinoasa.org) autonomous systems. Tech tree node **R-SEC1**.
+**OASA-SEC:** device identity, encrypted pairing and the encrypted link for [OASA](https://joinoasa.org) autonomous systems. Tech tree nodes **R-SEC1** (identity, pairing) and **R-COM2** (the link, milestone M2).
 
 > **Prototype.** Not independently reviewed. Do not fly with it. See [SECURITY.md](SECURITY.md).
 
@@ -11,7 +11,39 @@
 3. The ground station reads it and runs an encrypted, mutually authenticated **Noise** handshake (`IKpsk1`). Without the code, the drone won't even reply.
 4. Inside that encrypted channel they share a **MAVLink 2 signing key**. On first pairing the ground station makes it; the drone loads it into its autopilot over its local wired link and proves it works before saving it. Later ground stations receive the same key.
 
-Signing is only a second layer. Encrypting the drone link itself is next (R-COM2). The design is in [docs/oasa-sec-v0-pairing.md](docs/oasa-sec-v0-pairing.md).
+Signing is only a second layer. The design is in [docs/oasa-sec-v0-pairing.md](docs/oasa-sec-v0-pairing.md).
+
+## The encrypted link (R-COM2)
+
+One encrypted, authenticated link between two trusted devices, over any radio that can carry a packet. Modeled on WireGuard: Noise `IK`, 21 bytes of overhead, every packet stands alone (loss, reordering and duplicates never break it), and a device that is not in `trusted-peers` gets no reply at all. Design: [docs/oasa-sec-v0-link.md](docs/oasa-sec-v0-link.md).
+
+- **`oasa_sec::link`** is a library with no sockets, threads or clock inside: bytes and the time go in, events come out. `Link` is one peer; `Endpoint` serves several (one ground station, many drones).
+- **`oasa-link`** carries local UDP packets (for example MAVLink) over the link and logs one JSON line per event.
+
+Try it on one machine, with no hardware:
+
+```sh
+cargo build --bins
+B=target/debug
+for d in gcs drone; do $B/oasa-pair init --dir /tmp/$d --name $d; done
+key() { $B/oasa-pair show --dir /tmp/$1 | sed -E 's/.*"public_key":"([0-9a-f]{64})".*/\1/'; }
+$B/oasa-pair trust --dir /tmp/gcs --name drone --key "$(key drone)"   # compare the fingerprints out loud
+$B/oasa-pair trust --dir /tmp/drone --name gcs --key "$(key gcs)"
+
+# Drone: waits for the ground station. Plaintext in on 7011, out on 7012.
+$B/oasa-link --dir /tmp/drone --peer gcs --bind 127.0.0.1:7001 \
+  --plain-listen 127.0.0.1:7011 --plain-send 127.0.0.1:7012 &
+# Ground station: starts the handshake. Plaintext in on 7021, out on 7022.
+$B/oasa-link --dir /tmp/gcs --peer drone --bind 127.0.0.1:7002 --remote 127.0.0.1:7001 --initiate \
+  --plain-listen 127.0.0.1:7021 --plain-send 127.0.0.1:7022 &
+
+# Anything sent to 7021 comes out of 7012 (and the other way round).
+echo hello | nc -u -q1 127.0.0.1 7021
+```
+
+Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line.
+
+`cargo test` runs two endpoints through a seeded simulated channel (loss, reordering, duplicates, corruption, replays, an untrusted device, rekeys under 20% loss). `scripts/link-e2e.sh` runs real `oasa-link` processes over localhost UDP.
 
 ## Try it (no hardware)
 
@@ -44,7 +76,7 @@ Run `oasa-pair --help` for every command.
 
 | Project | Used for | License |
 |---|---|---|
-| [snow](https://github.com/mcginty/snow) | Noise handshake | Apache-2.0 or MIT |
+| [snow](https://github.com/mcginty/snow) | Noise handshakes and the link's packet encryption (stateless transport) | Apache-2.0 or MIT |
 | [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) | X25519 public keys (already used inside snow) | BSD-3 |
 | [rust-mavlink](https://github.com/mavlink/rust-mavlink) | MAVLink 2 messages and signing | Apache-2.0 or MIT |
 | [blake2](https://github.com/RustCrypto/hashes), [zeroize](https://github.com/RustCrypto/utils), [data-encoding](https://github.com/ia0/data-encoding), [qrcode](https://github.com/kennytm/qrcode-rust) | Fingerprints, wiping secrets, base32, QR codes | Apache-2.0 / MIT |
@@ -56,7 +88,7 @@ Choices follow OASA's [adoption standard](https://joinoasa.org/docs/adopting-sof
 
 - Test on real autopilot hardware (PX4 and ArduPilot SITL already pass: [docs/sitl.md](docs/sitl.md)).
 - An on-drone confirm button, and checking key file ownership.
-- R-COM2: encrypt the drone link with these identities.
+- R-COM2: radio adapters in [oasa-radio](https://github.com/joinoasa/oasa-radio) plug in where `oasa-link` uses UDP; handshakes for radios under 128 bytes; DoS cookies; group keys.
 - R-SEC2: key rotation and lost-device lockout.
 - Independent review.
 

@@ -47,7 +47,7 @@ pass "identities made and trusted with oasa-pair show / trust"
 # --- 1. A session, traffic both ways, a rekey, an untrusted device -------
 $B/oasa-link --dir "$T/drone" --peer gcs --bind 127.0.0.1:$D_ENC \
   --plain-listen 127.0.0.1:$D_IN --plain-send 127.0.0.1:$D_OUT \
-  --duration 40 > "$T/drone.log" 2>&1 & DRONE=$!; PIDS+=($DRONE)
+  --duration 120 > "$T/drone.log" 2>&1 & DRONE=$!; PIDS+=($DRONE)
 sleep 0.5
 $B/oasa-link --dir "$T/gcs" --peer drone --bind 127.0.0.1:$G_ENC --remote 127.0.0.1:$D_ENC --initiate \
   --plain-listen 127.0.0.1:$G_IN --plain-send 127.0.0.1:$G_OUT \

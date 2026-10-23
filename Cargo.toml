@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-description = "OASA-SEC v0 prototype: device identity, encrypted pairing and MAVLink signing keys (R-SEC1)"
+description = "OASA-SEC v0 prototype: device identity, encrypted pairing, MAVLink signing keys (R-SEC1) and the encrypted link (R-COM2)"
 repository = "https://github.com/joinoasa/oasa-sec"
 publish = false
 
