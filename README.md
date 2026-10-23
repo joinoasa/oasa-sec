@@ -43,6 +43,8 @@ echo hello | nc -u -q1 127.0.0.1 7021
 
 Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line. It reads `trusted-peers` once at startup, so restart it after `oasa-pair trust` or `remove`. `--plain-listen` must be a loopback address unless you pass `--allow-remote-plain`. If a peer's clock was wrong and its handshakes are now refused as stale, fix the clock and run `oasa-pair reset-stamp --dir DIR --peer NAME`. Set the same rekey limits on both sides. Give `--remote` whenever you know the peer's address: a device without it cannot start a handshake itself. Use `--trusted-clock` only on a device whose clock is set before it starts.
 
+On a drone (a device folder with `mavlink-signing-key.bin`) `oasa-link` also runs a **MAVLink guard** on what comes out of the link: it drops datagrams carrying `SETUP_SIGNING`, MAVLink FTP, writes to signing parameters or malformed frames, so a ground station can't change the autopilot's key through the tunnel (`--no-mavlink-guard` turns it off, `--allow-mavlink-ftp` lets log download through; see section 7 of the link doc).
+
 `cargo test` runs two endpoints through a seeded simulated channel (loss, reordering, duplicates, corruption, replays, an untrusted device, rekeys under 20% loss). `scripts/link-e2e.sh` runs real `oasa-link` processes over localhost UDP.
 
 ## Try it (no hardware)
@@ -70,7 +72,7 @@ Run `oasa-pair --help` for every command.
 
 ## Test against a real autopilot (SITL)
 
-`scripts/sitl/px4-sitl-test.sh` and `scripts/sitl/ardupilot-sitl-test.sh` pair with a real PX4 or ArduPilot simulator and check that signed commands work and unsigned or wrong-key ones don't. They aren't in CI (the builds take 20+ minutes). See [docs/sitl.md](docs/sitl.md). With ArduPilot, connect the companion computer on SERIAL1 or higher, never SERIAL0 (see the design doc).
+`scripts/sitl/px4-sitl-test.sh` and `scripts/sitl/ardupilot-sitl-test.sh` pair with a real PX4 or ArduPilot simulator and check that signed commands work and unsigned or wrong-key ones don't. They aren't in CI (the builds take 20+ minutes). See [docs/sitl.md](docs/sitl.md), which also records what each autopilot does with key changes. The [oasa-lab](https://github.com/joinoasa/oasa-lab) suite `l1-mavlink-sitl` flies both simulators through the encrypted link and checks the guard. With ArduPilot, connect the companion computer on SERIAL1 or higher, never SERIAL0 (see the design doc).
 
 ## Built on
 

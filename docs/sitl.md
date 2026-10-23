@@ -110,3 +110,48 @@ It takes about 8 minutes: it restarts SITL several times, waits through ArduPilo
 ## Helpers
 
 Test tools only, in `tests/sitl/`: `px4_client.py` (send a signed or unsigned command), `px4_setup.py` (send `SETUP_SIGNING`), `approbe.py` (same for ArduPilot, plus a check that frames are signed).
+
+## What the autopilots do with key changes (2026-10-23)
+
+Checked by hand against the same builds as above (PX4 `d4d4c154`, ArduPilot `2badacc9a607`), directly on the autopilots, not through the tunnel. Built to decide what the MAVLink guard in `oasa-link` must block ([link doc](oasa-sec-v0-link.md) section 7). Each result is a run of pymavlink against a fresh simulator; the probe scripts were throwaway and are not kept, but `l1-mavlink-sitl` in [oasa-lab](https://github.com/joinoasa/oasa-lab) repeats the guard cases through the tunnel.
+
+### PX4
+
+| Question | Result |
+|---|---|
+| Does a **signed** `SETUP_SIGNING` change the key once keyed? | **Yes, on both ports.** Signed with key 1, new key 2 on 14580: key file became key 2, key 1 stopped working. Then new key 3 on 18570: same. |
+| Does an all-zero `SETUP_SIGNING` (zero key, zero timestamp) matter? | **Signed with the current key it turns signing off**: the key file became all zero and an unsigned command was then acknowledged. Unsigned, it is refused (earlier section, check f). |
+| Does PX4 sign what it sends once keyed? | **Yes.** On 14580, 1698 frames counted from the raw datagrams, all signed (flag set), none unsigned. |
+| Signing parameters? | **None.** 1027 parameters; the only names containing `SIGN` are `ADSB_CALLSIGN_1` and `_2`; `MAV_*` are `COMP_ID`, `FWDEXTSP`, `HASH_CHK_EN`, `HB_FORW_EN`, `PROTO_VER`, `RADIO_TOUT`, `SIK_RADIO_ID`, `SYS_ID`, `TYPE`, `USEHILGPS`. The source has no signing setting either (`mavlink_params.yaml`). So no `PARAM_SET` can turn signing off. |
+| FTP enabled in SITL? | **Yes**, on 14580 and 18570. The FTP root is PX4's working folder, so the key is `/fs/mavlink/mavlink-signing-key.bin`. |
+| Can FTP **read** the key? | **Yes.** A signed FTP open and read of that path returned the 40-byte key file (first 32 bytes equal the key in use). |
+| Can FTP **write** the key? | **Yes.** A signed FTP create and write of that path replaced the key file. After a PX4 restart, PX4 used the new key. (Writes are allowed under `./fs/`, which holds the key.) |
+| Unsigned FTP? | Ignored once keyed. |
+| Signed `SETUP_SIGNING` while armed? | **Refused.** Armed in SIH, signed `SETUP_SIGNING` with a new key: key file unchanged, the old key still worked, the new one did not. |
+| An unsigned MAVLink 1 command to a keyed PX4? | Not answered. |
+
+Why FTP matters: any peer that can send signed FTP can read the key out of the drone or replace it, and the next restart makes the replacement real.
+
+### ArduPilot
+
+| Question | Result |
+|---|---|
+| Signed `SETUP_SIGNING` while armed? | **Refused.** The autopilot sent `ERROR: Won't setup signing when armed`; the old key kept working and the new one did not. After disarming, the same message was accepted. |
+| All-zero `SETUP_SIGNING`, signed? | Turns signing off (an unsigned command was then acknowledged). |
+| Does ArduPilot sign what it sends once keyed? | **Yes.** On SERIAL1 4 of 4 frames and on SERIAL2 7 of 7 were signed, none unsigned (a short count; the earlier section counted every link). |
+| Signing parameters? | No parameter has `SIGN` in its name apart from the unrelated `SIM_ARSPD_SIGN`. But **`MAV<n>_OPTIONS` bit 0 turns signing off for that link**: in the code (`GCS_MAVLINK::load_signing_key`) the bit is `MAVLINK2_SIGNING_DISABLED`, although the parameter text says "Accept unsigned MAVLink2 messages". Signed `PARAM_SET` of `MAV2_OPTIONS` and `MAV3_OPTIONS` to 1 had no effect at once; after a restart, unsigned commands were acknowledged on SERIAL1 and SERIAL2. (`MAV1_OPTIONS` alone changed nothing on those two ports; `MAV_OPTIONS` is a different setting.) It also takes effect at the next key load. |
+| FTP? | Not tested. ArduPilot keeps its key in storage, not in a file. |
+
+### The guard's block list
+
+From these results:
+
+| Block | Because |
+|---|---|
+| `SETUP_SIGNING` (256) | Both autopilots take a signed one: it replaces the key, and an all-zero one turns signing off |
+| `FILE_TRANSFER_PROTOCOL` (110), unless `--allow-mavlink-ftp` | PX4 FTP reads and replaces the key file |
+| `PARAM_SET` (23) and `PARAM_EXT_SET` (323) for names starting `MAV_SIGN`, or `MAV<n>_OPTIONS` | `MAV<n>_OPTIONS` turns ArduPilot signing off after a restart. PX4 has no signing parameter; `MAV_SIGN` stays for a future one |
+
+Both autopilots refuse key changes while armed, so the guard's job is the disarmed case (and a drone on the ground is where an attacker would try it).
+
+Not covered by the guard: `MAV_CMD_PREFLIGHT_STORAGE` (resets parameters on ArduPilot), reboot commands, or other writes that need full command inspection. They need the key and the link, like any other command.
