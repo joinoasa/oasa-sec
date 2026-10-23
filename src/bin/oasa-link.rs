@@ -778,6 +778,27 @@ mod tests {
     }
 
     #[test]
+    fn guard_flags_are_checked() {
+        let a = parse_args(&v(BASE)).unwrap().unwrap();
+        assert_eq!((a.guard, a.allow_ftp), (None, false));
+        let a = parse_args(&v(&format!("{BASE} --mavlink-guard --allow-mavlink-ftp")))
+            .unwrap()
+            .unwrap();
+        assert_eq!((a.guard, a.allow_ftp), (Some(true), true));
+        let a = parse_args(&v(&format!("{BASE} --no-mavlink-guard")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.guard, Some(false));
+        for bad in [
+            "--mavlink-guard --no-mavlink-guard",
+            "--no-mavlink-guard --allow-mavlink-ftp",
+            "--mavlink-guard x",
+        ] {
+            assert!(parse_args(&v(&format!("{BASE} {bad}"))).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn the_future_check_is_off_unless_asked_for() {
         let off = parse_args(&v(BASE)).unwrap().unwrap();
         assert_eq!(config_from(&off).unwrap().max_future, None);

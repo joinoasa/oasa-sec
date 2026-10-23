@@ -119,9 +119,7 @@ impl Guard {
             MSG_PARAM_SET if is_signing_param(&param_id(f.payload, PARAM_SET_ID_AT)) => {
                 block(Why::SigningParam)
             }
-            MSG_PARAM_EXT_SET
-                if is_signing_param(&param_id(f.payload, PARAM_EXT_SET_ID_AT)) =>
-            {
+            MSG_PARAM_EXT_SET if is_signing_param(&param_id(f.payload, PARAM_EXT_SET_ID_AT)) => {
                 block(Why::SigningParam)
             }
             _ => Ok(()),
@@ -340,7 +338,12 @@ mod tests {
     fn truncated_frames_are_malformed() {
         for f in [v2(0, &[1; 9], false), v2(0, &[1; 9], true), v1(0, &[1; 9])] {
             for cut in 1..f.len() {
-                assert_eq!(blocked(&f[..cut]), malformed(), "cut at {cut} of {}", f.len());
+                assert_eq!(
+                    blocked(&f[..cut]),
+                    malformed(),
+                    "cut at {cut} of {}",
+                    f.len()
+                );
             }
             assert!(guard().check(&f).is_ok());
         }
@@ -382,7 +385,11 @@ mod tests {
         // 0x010100 is not 0x0100 (256): the third byte counts.
         assert!(guard().check(&v2(0x01_0100, &[0; 42], false)).is_ok());
         assert!(guard().check(&v2(0x01_0000 | 110, &[0; 5], false)).is_ok());
-        assert!(guard().check(&v2(0x80_0000 | 23, &param_set("MAV_SIGN"), false)).is_ok());
+        assert!(
+            guard()
+                .check(&v2(0x80_0000 | 23, &param_set("MAV_SIGN"), false))
+                .is_ok()
+        );
         // MAVLink 1 has one byte: id 256 can't be sent, and 110 is FTP.
         assert_eq!(blocked(&v1(110, &[0; 5])).why, Why::Ftp);
     }
@@ -398,7 +405,10 @@ mod tests {
         assert_eq!(b.why, Why::SetupSigning);
         // Allowing FTP changes nothing here.
         let g = Guard { allow_ftp: true };
-        assert_eq!(g.check(&v2(256, &[0; 42], false)).unwrap_err().why, Why::SetupSigning);
+        assert_eq!(
+            g.check(&v2(256, &[0; 42], false)).unwrap_err().why,
+            Why::SetupSigning
+        );
     }
 
     #[test]
@@ -429,11 +439,18 @@ mod tests {
         ] {
             let b = blocked(&v2(23, &param_set(name), false));
             assert_eq!((b.why, b.msgid), (Why::SigningParam, Some(23)), "{name}");
-            assert_eq!(blocked(&v2(23, &param_set(name), true)).why, Why::SigningParam);
+            assert_eq!(
+                blocked(&v2(23, &param_set(name), true)).why,
+                Why::SigningParam
+            );
             assert_eq!(blocked(&v1(23, &param_set(name))).why, Why::SigningParam);
             // MAVLink 2 trims trailing zeros, which cuts into the name field.
             let t = trimmed(param_set(name));
-            assert_eq!(blocked(&v2(23, &t, false)).why, Why::SigningParam, "{name} trimmed");
+            assert_eq!(
+                blocked(&v2(23, &t, false)).why,
+                Why::SigningParam,
+                "{name} trimmed"
+            );
         }
     }
 
@@ -443,10 +460,18 @@ mod tests {
             let b = blocked(&v2(323, &param_ext_set(name), false));
             assert_eq!((b.why, b.msgid), (Why::SigningParam, Some(323)), "{name}");
             let t = trimmed(param_ext_set(name));
-            assert_eq!(blocked(&v2(323, &t, false)).why, Why::SigningParam, "{name} trimmed");
+            assert_eq!(
+                blocked(&v2(323, &t, false)).why,
+                Why::SigningParam,
+                "{name} trimmed"
+            );
         }
         // An ordinary one passes.
-        assert!(guard().check(&v2(323, &param_ext_set("MPC_XY_VEL_MAX"), false)).is_ok());
+        assert!(
+            guard()
+                .check(&v2(323, &param_ext_set("MPC_XY_VEL_MAX"), false))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -469,16 +494,31 @@ mod tests {
             "SIM_ARSPD_SIGN",
             "ADSB_CALLSIGN_1",
         ] {
-            assert!(guard().check(&v2(23, &param_set(name), false)).is_ok(), "{name:?}");
-            assert!(guard().check(&v2(23, &trimmed(param_set(name)), false)).is_ok(), "{name:?}");
-            assert!(guard().check(&v2(323, &param_ext_set(name), false)).is_ok(), "{name:?}");
+            assert!(
+                guard().check(&v2(23, &param_set(name), false)).is_ok(),
+                "{name:?}"
+            );
+            assert!(
+                guard()
+                    .check(&v2(23, &trimmed(param_set(name)), false))
+                    .is_ok(),
+                "{name:?}"
+            );
+            assert!(
+                guard().check(&v2(323, &param_ext_set(name), false)).is_ok(),
+                "{name:?}"
+            );
         }
     }
 
     #[test]
     fn param_names_only_count_in_the_param_field() {
         // MAV_SIGN where a different message keeps its data: no block.
-        assert!(guard().check(&v2(22, &param_set("MAV_SIGN_CFG"), false)).is_ok());
+        assert!(
+            guard()
+                .check(&v2(22, &param_set("MAV_SIGN_CFG"), false))
+                .is_ok()
+        );
         // The name in the wrong place of a PARAM_SET (right at the start): no block.
         let mut p = b"MAV_SIGN_CFG\0\0\0\0".to_vec();
         p.resize(23, 0);
