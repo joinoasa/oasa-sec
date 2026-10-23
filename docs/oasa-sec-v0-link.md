@@ -103,7 +103,101 @@ Two ways in:
 - **Library:** a sans-IO state machine (`oasa_sec::link`): bytes in, bytes out, and a clock passed in. No sockets or threads inside, so it runs the same on a laptop, a companion computer or a microcontroller later, and tests drive it through a simulated channel.
 - **Tunnel:** `oasa-link` carries plaintext UDP packets from local programs (for example MAVLink from a ground station) over the encrypted link. `--plain-listen` must be a loopback address and plaintext is accepted only from the `--plain-send` host, unless `--allow-remote-plain` is given (anyone who reaches that port can otherwise inject packets). Its radio side is UDP for now; radio adapters in [oasa-radio](https://github.com/joinoasa/oasa-radio) plug in there. It logs JSON lines for the [lab](https://github.com/joinoasa/oasa-lab).
 - MAVLink signing keeps running inside the link as a second layer.
-- **MAVLink guard:** `oasa-link` checks every packet that comes **out of** the link, before `--plain-send`, so a paired ground station can't change the autopilot's key or signing settings through the tunnel. It parses each MAVLink 1 and 2 frame in the datagram (shape and length only, no CRC; signed frames count their 13 extra bytes; the message id is 24 bits) and **drops the whole datagram** if any frame is malformed or blocked. Blocked: `SETUP_SIGNING` (256); `FILE_TRANSFER_PROTOCOL` (110) unless `--allow-mavlink-ftp`; `PARAM_SET` (23) and `PARAM_EXT_SET` (323) for names starting `MAV_SIGN` or `MAV<n>_OPTIONS` (ArduPilot's switch for signing). Why these: [sitl.md](sitl.md). It is **on by default when the device folder holds `mavlink-signing-key.bin`** (a drone); `--mavlink-guard` forces it on, `--no-mavlink-guard` turns it off and prints a warning. Drops count as `mavlink_blocked` in the stats and are logged with the rest (rate limited): `{"event":"drop","reason":"mavlink_blocked","why":"setup_signing","msgid":256}`. Contents are never logged. The guard is `oasa_sec::mavguard`, a pure module. The stats' `delivered` still counts datagrams the link decrypted, including those the guard then dropped.
+- **MAVLink guard (allowlist):** `oasa-link` checks every packet that comes **out of** the link, before `--plain-send`. It parses each MAVLink 1 and 2 frame in the datagram (signed frames count their 13 extra bytes; the message id is 24 bits), checks the **CRC** of each one (CRC_EXTRA from the `mavlink` crate), and passes the datagram only if **every** frame is whole, CRC-valid and allowed, with nothing else in it. Otherwise the **whole datagram is dropped**. Rules, in order:
+  1. `SETUP_SIGNING` (256) is always dropped.
+  2. `FILE_TRANSFER_PROTOCOL` (110) is dropped unless `--allow-mavlink-ftp`.
+  3. `PARAM_SET` (23) and `PARAM_EXT_SET` (323) are dropped unless the name was allowed with `--allow-param NAME` (repeatable). Names starting `MAV_SIGN` or `MAV<n>_OPTIONS` (ArduPilot's switch for signing) can never be allowed.
+  4. Any other message id not in the table below is dropped. `--allow-msg ID` (repeatable) adds one; ids the crate has no CRC for, and 256, 110, 23 and 323, are refused.
+  5. In `COMMAND_LONG`, `COMMAND_INT`, `MISSION_ITEM` and `MISSION_ITEM_INT` the command id must be in the command table below. `--allow-command ID` (repeatable) adds one.
+
+  Each widening flag logs a `warning` line at start naming what it widened. Why this design and what the autopilots do: [sitl.md](sitl.md). The guard is **on by default when the device folder holds `mavlink-signing-key.bin`** (a drone); `--mavlink-guard` forces it on, `--no-mavlink-guard` turns it off and prints a warning (the widening flags need the guard on). Drops count as `mavlink_blocked` in the stats and are logged with the rest (rate limited): `{"event":"drop","reason":"mavlink_blocked","why":"command_not_allowed","msgid":76,"command":246}`. `why` is one of `malformed`, `bad_crc`, `setup_signing`, `ftp`, `signing_param`, `param_write`, `msg_not_allowed`, `command_not_allowed`. Contents are never logged. The guard is `oasa_sec::mavguard`, a pure module. The stats' `delivered` still counts datagrams the link decrypted, including those the guard then dropped.
+
+  **Allowed messages**
+
+  | Id | Name | Why it is allowed |
+  |---|---|---|
+  | 0 | `HEARTBEAT` | Ground station presence; ArduPilot's GCS failsafe needs it |
+  | 2 | `SYSTEM_TIME` | Clock sync |
+  | 4 | `PING` | Link latency check |
+  | 11 | `SET_MODE` | Legacy flight mode change (same effect as DO_SET_MODE) |
+  | 20 | `PARAM_REQUEST_READ` | Read one parameter |
+  | 21 | `PARAM_REQUEST_LIST` | Read all parameters |
+  | 37 | `MISSION_REQUEST_PARTIAL_LIST` | Mission download (part) |
+  | 38 | `MISSION_WRITE_PARTIAL_LIST` | Mission upload (part) |
+  | 39 | `MISSION_ITEM` | Mission upload; the item's command is filtered |
+  | 40 | `MISSION_REQUEST` | Mission download |
+  | 41 | `MISSION_SET_CURRENT` | Jump to a mission item |
+  | 43 | `MISSION_REQUEST_LIST` | Mission download |
+  | 44 | `MISSION_COUNT` | Mission upload |
+  | 45 | `MISSION_CLEAR_ALL` | Clear the mission |
+  | 47 | `MISSION_ACK` | Ends a mission transfer |
+  | 51 | `MISSION_REQUEST_INT` | Mission download |
+  | 66 | `REQUEST_DATA_STREAM` | Legacy telemetry rate request (Mission Planner) |
+  | 69 | `MANUAL_CONTROL` | Joystick flying |
+  | 70 | `RC_CHANNELS_OVERRIDE` | Stick input over the link |
+  | 73 | `MISSION_ITEM_INT` | Mission upload; the item's command is filtered |
+  | 75 | `COMMAND_INT` | Commands; the command id is filtered |
+  | 76 | `COMMAND_LONG` | Commands; the command id is filtered |
+  | 77 | `COMMAND_ACK` | Answers a command the autopilot sent |
+  | 82 | `SET_ATTITUDE_TARGET` | Offboard flying |
+  | 84 | `SET_POSITION_TARGET_LOCAL_NED` | Offboard flying |
+  | 86 | `SET_POSITION_TARGET_GLOBAL_INT` | Offboard flying |
+  | 111 | `TIMESYNC` | Clock sync |
+  | 117 | `LOG_REQUEST_LIST` | List logs (ArduPilot log download over MAVLink) |
+  | 119 | `LOG_REQUEST_DATA` | Download a log |
+  | 122 | `LOG_REQUEST_END` | End a log download |
+  | 123 | `GPS_INJECT_DATA` | RTK corrections |
+  | 134 | `TERRAIN_DATA` | Terrain tiles the autopilot asked for |
+  | 233 | `GPS_RTCM_DATA` | RTK corrections |
+  | 320 | `PARAM_EXT_REQUEST_READ` | Read one parameter |
+  | 321 | `PARAM_EXT_REQUEST_LIST` | Read all parameters |
+
+  **Allowed commands**
+
+  | Id | Name | Why it is allowed |
+  |---|---|---|
+  | 16 | `NAV_WAYPOINT` | Fly to a point |
+  | 17 | `NAV_LOITER_UNLIM` | Loiter |
+  | 18 | `NAV_LOITER_TURNS` | Loiter for turns |
+  | 19 | `NAV_LOITER_TIME` | Loiter for a time |
+  | 20 | `NAV_RETURN_TO_LAUNCH` | Return to launch |
+  | 21 | `NAV_LAND` | Land |
+  | 22 | `NAV_TAKEOFF` | Take off |
+  | 30 | `NAV_CONTINUE_AND_CHANGE_ALT` | Change altitude |
+  | 31 | `NAV_LOITER_TO_ALT` | Loiter while changing altitude |
+  | 34 | `DO_ORBIT` | Orbit a point |
+  | 82 | `NAV_SPLINE_WAYPOINT` | Fly a spline |
+  | 84 | `NAV_VTOL_TAKEOFF` | VTOL takeoff |
+  | 85 | `NAV_VTOL_LAND` | VTOL landing |
+  | 92 | `NAV_GUIDED_ENABLE` | Hand over to guided control |
+  | 93 | `NAV_DELAY` | Wait in a mission |
+  | 112 | `CONDITION_DELAY` | Mission condition |
+  | 113 | `CONDITION_CHANGE_ALT` | Mission condition |
+  | 114 | `CONDITION_DISTANCE` | Mission condition |
+  | 115 | `CONDITION_YAW` | Turn to a heading |
+  | 176 | `DO_SET_MODE` | Change flight mode |
+  | 177 | `DO_JUMP` | Mission jump |
+  | 178 | `DO_CHANGE_SPEED` | Set speed |
+  | 179 | `DO_SET_HOME` | Set home |
+  | 186 | `DO_CHANGE_ALTITUDE` | Change altitude |
+  | 189 | `DO_LAND_START` | Start the landing sequence |
+  | 192 | `DO_REPOSITION` | Go to a point (PX4's 'fly here') |
+  | 193 | `DO_PAUSE_CONTINUE` | Pause or continue |
+  | 195 | `DO_SET_ROI_LOCATION` | Point at a location |
+  | 196 | `DO_SET_ROI_WPNEXT_OFFSET` | Point at the next waypoint |
+  | 197 | `DO_SET_ROI_NONE` | Stop pointing |
+  | 201 | `DO_SET_ROI` | Point at a location |
+  | 205 | `DO_MOUNT_CONTROL` | Gimbal pointing |
+  | 224 | `DO_SET_MISSION_CURRENT` | Jump to a mission item |
+  | 300 | `MISSION_START` | Start the mission |
+  | 400 | `COMPONENT_ARM_DISARM` | Arm and disarm |
+  | 511 | `SET_MESSAGE_INTERVAL` | Telemetry rates |
+  | 512 | `REQUEST_MESSAGE` | Ask for one message |
+  | 519 | `REQUEST_PROTOCOL_VERSION` | Protocol version |
+  | 520 | `REQUEST_AUTOPILOT_CAPABILITIES` | Autopilot version |
+  | 3000 | `DO_VTOL_TRANSITION` | VTOL transition |
+
+  Blocked by default, and commonly sent by ground stations: parameter writes (QGroundControl and Mission Planner parameter editors, tuning), FTP (QGC's parameter and log downloads on PX4, file browser), calibration and reboot commands (`PREFLIGHT_CALIBRATION` 241, `PREFLIGHT_REBOOT_SHUTDOWN` 246, `PREFLIGHT_STORAGE` 245), `DO_SET_SERVO`/`DO_SET_RELAY` (183, 181), `DO_FLIGHTTERMINATION` (185), `DO_MOTOR_TEST` (209), fence and rally enable commands, camera and `LOG_*` erase messages, `SERIAL_CONTROL` (126), `SET_GPS_GLOBAL_ORIGIN`, `SET_HOME_POSITION`, and everything else not listed.
 - **Plain side:** decrypted packets leave from the `--plain-listen` socket, so a program that answers the address a packet came from (PX4 does) answers into the tunnel.
 
 ## 8. Tested

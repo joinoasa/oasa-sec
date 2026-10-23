@@ -35,6 +35,7 @@ USAGE:
             [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N]
             [--mtu BYTES] [--duration SECS]
             [--mavlink-guard | --no-mavlink-guard] [--allow-mavlink-ftp]
+            [--allow-msg ID]... [--allow-command ID]... [--allow-param NAME]...
 
   --dir            Device folder made by `oasa-pair init`.
   --peer           Name of a trusted peer (see `oasa-pair peers`, `oasa-pair trust`).
@@ -60,19 +61,28 @@ USAGE:
   --keepalive-secs Send an empty packet after this many idle seconds (default 25, 0 = off).
   --mtu            Largest encrypted packet in bytes (default 128, the smallest radio the
                    link supports). Plaintext must fit in MTU minus 21 bytes (23 with 4).
-  --mavlink-guard  Check every packet from the link before it goes to --plain-send, and
-                   drop any datagram with a malformed or blocked MAVLink frame
-                   (SETUP_SIGNING, FTP, PARAM_SET of a signing setting). On by default
-                   when --dir holds mavlink-signing-key.bin (a drone); this forces it on.
+  --mavlink-guard  Check every packet from the link before it goes to --plain-send. Only
+                   whole, CRC-valid frames of allowed messages and commands pass; the rest
+                   of the datagram is dropped. Parameter writes, FTP and SETUP_SIGNING are
+                   off. On by default when --dir holds mavlink-signing-key.bin (a drone);
+                   this forces it on. The allowlist is in docs/oasa-sec-v0-link.md.
   --no-mavlink-guard
                    Turn the guard off (prints a warning). Not for flight.
   --allow-mavlink-ftp
                    Let FILE_TRANSFER_PROTOCOL through the guard (log download needs it).
+  --allow-msg ID   Also allow this MAVLink message id (repeatable). Logs a warning.
+  --allow-command ID
+                   Also allow this command id in COMMAND_LONG, COMMAND_INT and mission
+                   items (repeatable). Logs a warning.
+  --allow-param NAME
+                   Allow PARAM_SET / PARAM_EXT_SET for this one parameter (repeatable).
+                   Signing parameters can never be allowed. Logs a warning.
   --duration       Stop after this many seconds. Stops on SIGINT or SIGTERM too.
 
 Prints one JSON line per event: handshake_sent, session_established, rekey, drop, hint,
 mavlink_guard (at start), warning. A datagram stopped by the guard is a drop with reason
-mavlink_blocked and the message id (never its contents).
+mavlink_blocked, a why word, the message id and (for commands) the command id
+(never contents). The widening flags each print a warning at start.
 At most 10 drop lines a second are printed; a drops_suppressed line counts the rest. The
 trusted peers are read once at startup: restart oasa-link after `oasa-pair trust` or
 `remove`. On exit prints {\"event\":\"stats\",...} and exits 0. Packet contents and keys are never printed.
@@ -138,6 +148,9 @@ struct Args {
     trusted_clock: bool,
     guard: Option<bool>,
     allow_ftp: bool,
+    allow_msgs: Vec<u32>,
+    allow_commands: Vec<u32>,
+    allow_params: Vec<String>,
     plain_listen: SocketAddr,
     plain_send: SocketAddr,
     counter: CounterLen,
@@ -158,6 +171,9 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
     let mut guard_on = false;
     let mut guard_off = false;
     let mut allow_ftp = false;
+    let mut allow_msgs: Vec<u32> = Vec::new();
+    let mut allow_commands: Vec<u32> = Vec::new();
+    let mut allow_params: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -168,6 +184,20 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
             "--mavlink-guard" => guard_on = true,
             "--no-mavlink-guard" => guard_off = true,
             "--allow-mavlink-ftp" => allow_ftp = true,
+            "--allow-msg" | "--allow-command" => {
+                let v = it.next().ok_or(format!("{a} needs a value"))?;
+                let n: u32 = v
+                    .parse()
+                    .map_err(|_| format!("{a}: {v:?} is not a number"))?;
+                if a == "--allow-msg" {
+                    allow_msgs.push(n);
+                } else {
+                    allow_commands.push(n);
+                }
+            }
+            "--allow-param" => {
+                allow_params.push(it.next().ok_or("--allow-param needs a value")?.clone());
+            }
             _ => {
                 let k = a
                     .strip_prefix("--")
@@ -216,8 +246,13 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
     if guard_on && guard_off {
         return Err("--mavlink-guard and --no-mavlink-guard together make no sense".into());
     }
-    if guard_off && allow_ftp {
-        return Err("--allow-mavlink-ftp has no effect with --no-mavlink-guard".into());
+    if guard_off
+        && (allow_ftp
+            || !allow_msgs.is_empty()
+            || !allow_commands.is_empty()
+            || !allow_params.is_empty())
+    {
+        return Err("the --allow-* guard flags have no effect with --no-mavlink-guard".into());
     }
     let guard = match (guard_on, guard_off) {
         (true, _) => Some(true),
@@ -270,6 +305,9 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         trusted_clock,
         guard,
         allow_ftp,
+        allow_msgs,
+        allow_commands,
+        allow_params,
         plain_listen,
         plain_send: addr("plain-send")?,
         counter,
@@ -278,6 +316,48 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         mtu,
         duration: secs("duration", MAX_SECS)?.map(Duration::from_secs),
     }))
+}
+
+/// The guard the flags ask for.
+fn build_guard(a: &Args) -> Result<Guard, String> {
+    let mut g = Guard::new();
+    if a.allow_ftp {
+        g = g.allow_ftp();
+    }
+    for &m in &a.allow_msgs {
+        g = g.allow_msg(m)?;
+    }
+    for &c in &a.allow_commands {
+        g = g.allow_command(c)?;
+    }
+    for p in &a.allow_params {
+        g = g.allow_param(p)?;
+    }
+    Ok(g)
+}
+
+/// One line per thing the flags widened, for the start-up warnings.
+fn widened(a: &Args) -> Vec<String> {
+    let mut w = Vec::new();
+    if a.allow_ftp {
+        w.push("FILE_TRANSFER_PROTOCOL (110) is allowed".to_string());
+    }
+    w.extend(
+        a.allow_msgs
+            .iter()
+            .map(|m| format!("message {m} is allowed")),
+    );
+    w.extend(
+        a.allow_commands
+            .iter()
+            .map(|c| format!("command {c} is allowed")),
+    );
+    w.extend(
+        a.allow_params
+            .iter()
+            .map(|p| format!("writes to parameter {} are allowed", p.to_ascii_uppercase())),
+    );
+    w
 }
 
 fn config_from(a: &Args) -> R<Config> {
@@ -412,8 +492,11 @@ impl Tunnel {
         *self.local_drops.entry("mavlink_blocked").or_insert(0) += 1;
         if self.drop_log.allow() {
             let id = b.msgid.map_or(String::new(), |m| format!(",\"msgid\":{m}"));
+            let cmd = b
+                .command
+                .map_or(String::new(), |c| format!(",\"command\":{c}"));
             println!(
-                "{{\"ts\":\"{}\",\"event\":\"drop\",\"reason\":\"mavlink_blocked\",\"why\":\"{}\"{id}}}",
+                "{{\"ts\":\"{}\",\"event\":\"drop\",\"reason\":\"mavlink_blocked\",\"why\":\"{}\"{id}{cmd}}}",
                 rfc3339(SystemTime::now()),
                 b.why.as_str()
             );
@@ -453,7 +536,7 @@ impl Tunnel {
                     }
                 }
                 Event::Deliver(p) => {
-                    if let Some(Err(b)) = self.guard.map(|g| g.check(&p)) {
+                    if let Some(Err(b)) = self.guard.as_ref().map(|g| g.check(&p)) {
                         self.guard_drop(b);
                         continue;
                     }
@@ -585,17 +668,23 @@ fn run(args: &[String]) -> R {
         Some(on) => on,
         None => has_key,
     }
-    .then_some(Guard {
-        allow_ftp: a.allow_ftp,
-    });
+    .then(|| build_guard(&a))
+    .transpose()?;
     let now = rfc3339(SystemTime::now());
-    match (guard, a.guard) {
-        (Some(g), _) => println!(
-            "{{\"ts\":\"{now}\",\"event\":\"mavlink_guard\",\"state\":\"on\",\"ftp\":{}}}",
-            g.allow_ftp
-        ),
+    match (&guard, a.guard) {
+        (Some(g), _) => {
+            println!(
+                "{{\"ts\":\"{now}\",\"event\":\"mavlink_guard\",\"state\":\"on\",\"ftp\":{}}}",
+                g.ftp_allowed()
+            );
+            for what in widened(&a) {
+                println!(
+                    "{{\"ts\":\"{now}\",\"event\":\"warning\",\"what\":\"the MAVLink guard is widened: {what}\"}}"
+                );
+            }
+        }
         (None, Some(false)) => println!(
-            "{{\"ts\":\"{now}\",\"event\":\"warning\",\"what\":\"the MAVLink guard is off: the link can carry SETUP_SIGNING, FTP and signing parameter changes to the autopilot\"}}"
+            "{{\"ts\":\"{now}\",\"event\":\"warning\",\"what\":\"the MAVLink guard is off: the link can carry any MAVLink to the autopilot, including SETUP_SIGNING, FTP and parameter writes\"}}"
         ),
         (None, _) => println!(
             "{{\"ts\":\"{now}\",\"event\":\"mavlink_guard\",\"state\":\"off\",\"ftp\":false}}"
@@ -773,6 +862,41 @@ mod tests {
         let v6 = "--dir d --peer p --bind 127.0.0.1:1 --plain-listen [::1]:2 --plain-send [::1]:3";
         assert!(parse_args(&v(v6)).unwrap().is_some());
         assert!(!parse_args(&v(BASE)).unwrap().unwrap().allow_remote_plain);
+    }
+
+    #[test]
+    fn guard_widening_flags_are_checked() {
+        let a = parse_args(&v(&format!(
+            "{BASE} --allow-msg 33 --allow-msg 24 --allow-command 185 --allow-param WP_SPD --allow-param MPC_X"
+        )))
+        .unwrap()
+        .unwrap();
+        assert_eq!(a.allow_msgs, [33, 24]);
+        assert_eq!(a.allow_commands, [185]);
+        assert_eq!(a.allow_params, ["WP_SPD", "MPC_X"]);
+        let g = build_guard(&a).unwrap();
+        assert_eq!(widened(&a).len(), 5);
+        assert!(g.ftp_allowed() == a.allow_ftp);
+        for bad in [
+            "--allow-msg",
+            "--allow-msg x",
+            "--allow-command -1",
+            "--allow-param",
+            "--no-mavlink-guard --allow-msg 33",
+            "--no-mavlink-guard --allow-param WP_SPD",
+        ] {
+            assert!(parse_args(&v(&format!("{BASE} {bad}"))).is_err(), "{bad}");
+        }
+        // Refused by the guard itself: reported when the guard is built.
+        for bad in [
+            "--allow-msg 256",
+            "--allow-msg 110",
+            "--allow-param MAV_SIGN_CFG",
+            "--allow-command 70000",
+        ] {
+            let a = parse_args(&v(&format!("{BASE} {bad}"))).unwrap().unwrap();
+            assert!(build_guard(&a).is_err(), "{bad}");
+        }
     }
 
     #[test]
