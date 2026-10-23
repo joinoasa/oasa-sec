@@ -13,7 +13,7 @@ snow = { version = "0.10", default-features = false, features = ["default-resolv
 mavlink = { version = "0.20", default-features = false, features = ["std", "dialect-common", "transport-tcp", "transport-udp", "mav2-message-signing"] }
 curve25519-dalek = { version = "5.0", default-features = false, features = ["zeroize"] }
 blake2 = "0.10"
-getrandom = "0.3"
+getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 data-encoding = "2"
 qrcode = { version = "0.14", default-features = false }
