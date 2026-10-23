@@ -35,6 +35,7 @@ USAGE:
             [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N]
             [--mtu BYTES] [--duration SECS]
             [--mavlink-guard | --no-mavlink-guard] [--allow-mavlink-ftp]
+            [--allow-rtk] [--allow-fence-rally]
             [--allow-msg ID]... [--allow-command ID]... [--allow-param NAME]...
 
   --dir            Device folder made by `oasa-pair init`.
@@ -70,6 +71,10 @@ USAGE:
                    Turn the guard off (prints a warning). Not for flight.
   --allow-mavlink-ftp
                    Let FILE_TRANSFER_PROTOCOL through the guard (log download needs it).
+  --allow-rtk      Allow GPS_INJECT_DATA and GPS_RTCM_DATA (RTK corrections). Logs a warning.
+  --allow-fence-rally
+                   Allow geofence and rally mission messages (mission types 1 and 2) and the
+                   fence and rally commands (5000 to 5004, 5100). Logs a warning.
   --allow-msg ID   Also allow this MAVLink message id (repeatable). Logs a warning.
   --allow-command ID
                    Also allow this command id in COMMAND_LONG, COMMAND_INT and mission
@@ -148,6 +153,8 @@ struct Args {
     trusted_clock: bool,
     guard: Option<bool>,
     allow_ftp: bool,
+    allow_rtk: bool,
+    allow_fence_rally: bool,
     allow_msgs: Vec<u32>,
     allow_commands: Vec<u32>,
     allow_params: Vec<String>,
@@ -171,6 +178,8 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
     let mut guard_on = false;
     let mut guard_off = false;
     let mut allow_ftp = false;
+    let mut allow_rtk = false;
+    let mut allow_fence_rally = false;
     let mut allow_msgs: Vec<u32> = Vec::new();
     let mut allow_commands: Vec<u32> = Vec::new();
     let mut allow_params: Vec<String> = Vec::new();
@@ -184,6 +193,8 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
             "--mavlink-guard" => guard_on = true,
             "--no-mavlink-guard" => guard_off = true,
             "--allow-mavlink-ftp" => allow_ftp = true,
+            "--allow-rtk" => allow_rtk = true,
+            "--allow-fence-rally" => allow_fence_rally = true,
             "--allow-msg" | "--allow-command" => {
                 let v = it.next().ok_or(format!("{a} needs a value"))?;
                 let n: u32 = v
@@ -248,6 +259,8 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
     }
     if guard_off
         && (allow_ftp
+            || allow_rtk
+            || allow_fence_rally
             || !allow_msgs.is_empty()
             || !allow_commands.is_empty()
             || !allow_params.is_empty())
@@ -305,6 +318,8 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         trusted_clock,
         guard,
         allow_ftp,
+        allow_rtk,
+        allow_fence_rally,
         allow_msgs,
         allow_commands,
         allow_params,
@@ -324,6 +339,12 @@ fn build_guard(a: &Args) -> Result<Guard, String> {
     if a.allow_ftp {
         g = g.allow_ftp();
     }
+    if a.allow_rtk {
+        g = g.allow_rtk();
+    }
+    if a.allow_fence_rally {
+        g = g.allow_fence_rally();
+    }
     for &m in &a.allow_msgs {
         g = g.allow_msg(m)?;
     }
@@ -341,6 +362,12 @@ fn widened(a: &Args) -> Vec<String> {
     let mut w = Vec::new();
     if a.allow_ftp {
         w.push("FILE_TRANSFER_PROTOCOL (110) is allowed".to_string());
+    }
+    if a.allow_rtk {
+        w.push("GPS_INJECT_DATA (123) and GPS_RTCM_DATA (233) are allowed".to_string());
+    }
+    if a.allow_fence_rally {
+        w.push("geofence and rally mission messages (types 1 and 2) and commands 5000-5004, 5100 are allowed".to_string());
     }
     w.extend(
         a.allow_msgs
@@ -495,6 +522,10 @@ impl Tunnel {
             let cmd = b
                 .command
                 .map_or(String::new(), |c| format!(",\"command\":{c}"));
+            let cmd = match b.mission_type {
+                Some(t) => format!("{cmd},\"mission_type\":{t}"),
+                None => cmd,
+            };
             println!(
                 "{{\"ts\":\"{}\",\"event\":\"drop\",\"reason\":\"mavlink_blocked\",\"why\":\"{}\"{id}{cmd}}}",
                 rfc3339(SystemTime::now()),
@@ -686,9 +717,14 @@ fn run(args: &[String]) -> R {
         (None, Some(false)) => println!(
             "{{\"ts\":\"{now}\",\"event\":\"warning\",\"what\":\"the MAVLink guard is off: the link can carry any MAVLink to the autopilot, including SETUP_SIGNING, FTP and parameter writes\"}}"
         ),
-        (None, _) => println!(
-            "{{\"ts\":\"{now}\",\"event\":\"mavlink_guard\",\"state\":\"off\",\"ftp\":false}}"
-        ),
+        (None, _) => {
+            println!(
+                "{{\"ts\":\"{now}\",\"event\":\"mavlink_guard\",\"state\":\"off\",\"ftp\":false}}"
+            );
+            println!(
+                "{{\"ts\":\"{now}\",\"event\":\"hint\",\"what\":\"the MAVLink guard is off because --dir has no mavlink-signing-key.bin; drones whose key lives elsewhere: use --mavlink-guard\"}}"
+            );
+        }
     }
 
     let (tx, rx) = mpsc::sync_channel::<Msg>(4096);
@@ -896,6 +932,26 @@ mod tests {
         ] {
             let a = parse_args(&v(&format!("{BASE} {bad}"))).unwrap().unwrap();
             assert!(build_guard(&a).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rtk_and_fence_rally_flags_are_checked() {
+        let a = parse_args(&v(&format!("{BASE} --allow-rtk --allow-fence-rally")))
+            .unwrap()
+            .unwrap();
+        assert!(a.allow_rtk && a.allow_fence_rally);
+        let g = build_guard(&a).unwrap();
+        assert!(g.rtk_allowed() && g.fence_rally_allowed());
+        assert_eq!(widened(&a).len(), 2);
+        let a = parse_args(&v(BASE)).unwrap().unwrap();
+        assert!(!a.allow_rtk && !a.allow_fence_rally);
+        assert!(widened(&a).is_empty());
+        for bad in [
+            "--no-mavlink-guard --allow-rtk",
+            "--no-mavlink-guard --allow-fence-rally",
+        ] {
+            assert!(parse_args(&v(&format!("{BASE} {bad}"))).is_err(), "{bad}");
         }
     }
 

@@ -72,7 +72,7 @@ pub const DEFAULT_MESSAGES: &[(u32, &str, &str)] = &[
     (
         66,
         "REQUEST_DATA_STREAM",
-        "Legacy telemetry rate request (Mission Planner)",
+        "Legacy telemetry rate request (Mission Planner); on ArduPlane it saves the SRn_* rates to storage",
     ),
     (69, "MANUAL_CONTROL", "Joystick flying"),
     (70, "RC_CHANNELS_OVERRIDE", "Stick input over the link"),
@@ -95,9 +95,7 @@ pub const DEFAULT_MESSAGES: &[(u32, &str, &str)] = &[
     ),
     (119, "LOG_REQUEST_DATA", "Download a log"),
     (122, "LOG_REQUEST_END", "End a log download"),
-    (123, "GPS_INJECT_DATA", "RTK corrections"),
     (134, "TERRAIN_DATA", "Terrain tiles the autopilot asked for"),
-    (233, "GPS_RTCM_DATA", "RTK corrections"),
     (320, "PARAM_EXT_REQUEST_READ", "Read one parameter"),
     (321, "PARAM_EXT_REQUEST_LIST", "Read all parameters"),
 ];
@@ -140,15 +138,84 @@ pub const DEFAULT_COMMANDS: &[(u32, &str, &str)] = &[
     ),
     (197, "DO_SET_ROI_NONE", "Stop pointing"),
     (201, "DO_SET_ROI", "Point at a location"),
+    (203, "DO_DIGICAM_CONTROL", "Take a picture"),
     (205, "DO_MOUNT_CONTROL", "Gimbal pointing"),
     (224, "DO_SET_MISSION_CURRENT", "Jump to a mission item"),
     (300, "MISSION_START", "Start the mission"),
     (400, "COMPONENT_ARM_DISARM", "Arm and disarm"),
+    (410, "GET_HOME_POSITION", "Ask for the home position"),
     (511, "SET_MESSAGE_INTERVAL", "Telemetry rates"),
     (512, "REQUEST_MESSAGE", "Ask for one message"),
     (519, "REQUEST_PROTOCOL_VERSION", "Protocol version"),
     (520, "REQUEST_AUTOPILOT_CAPABILITIES", "Autopilot version"),
+    (1000, "DO_GIMBAL_MANAGER_PITCHYAW", "Gimbal pointing"),
+    (2000, "IMAGE_START_CAPTURE", "Start taking pictures"),
+    (2001, "IMAGE_STOP_CAPTURE", "Stop taking pictures"),
+    (2500, "VIDEO_START_CAPTURE", "Start video"),
+    (2501, "VIDEO_STOP_CAPTURE", "Stop video"),
     (3000, "DO_VTOL_TRANSITION", "VTOL transition"),
+];
+
+/// Messages allowed only with `--allow-rtk`: raw bytes for the GPS receiver, which could
+/// reconfigure it.
+pub const RTK_MESSAGES: &[(u32, &str, &str)] = &[
+    (
+        123,
+        "GPS_INJECT_DATA",
+        "RTK corrections; raw bytes to the GPS receiver",
+    ),
+    (
+        233,
+        "GPS_RTCM_DATA",
+        "RTK corrections; raw bytes to the GPS receiver",
+    ),
+];
+
+/// Commands allowed only with `--allow-fence-rally` (the fence and rally items of a mission).
+pub const FENCE_RALLY_COMMANDS: &[(u32, &str, &str)] = &[
+    (5000, "NAV_FENCE_RETURN_POINT", "Geofence return point"),
+    (
+        5001,
+        "NAV_FENCE_POLYGON_VERTEX_INCLUSION",
+        "Geofence polygon corner (inside)",
+    ),
+    (
+        5002,
+        "NAV_FENCE_POLYGON_VERTEX_EXCLUSION",
+        "Geofence polygon corner (outside)",
+    ),
+    (
+        5003,
+        "NAV_FENCE_CIRCLE_INCLUSION",
+        "Geofence circle (inside)",
+    ),
+    (
+        5004,
+        "NAV_FENCE_CIRCLE_EXCLUSION",
+        "Geofence circle (outside)",
+    ),
+    (5100, "NAV_RALLY_POINT", "Rally point"),
+];
+
+/// `mission_type` values: the normal mission, the geofence and the rally points. `ALL` (255)
+/// only appears in a clear-all and is never allowed.
+const MISSION_TYPE_MISSION: u8 = 0;
+const MISSION_TYPE_FENCE: u8 = 1;
+const MISSION_TYPE_RALLY: u8 = 2;
+
+/// Mission-protocol messages and where each keeps its `mission_type` (an extension field, so
+/// MAVLink 1 frames and cut-short MAVLink 2 payloads read as 0, the normal mission).
+const MISSION_TYPE_AT: &[(u32, usize)] = &[
+    (37, 6),  // MISSION_REQUEST_PARTIAL_LIST
+    (38, 6),  // MISSION_WRITE_PARTIAL_LIST
+    (39, 37), // MISSION_ITEM
+    (40, 4),  // MISSION_REQUEST
+    (43, 2),  // MISSION_REQUEST_LIST
+    (44, 4),  // MISSION_COUNT
+    (45, 2),  // MISSION_CLEAR_ALL
+    (47, 3),  // MISSION_ACK
+    (51, 4),  // MISSION_REQUEST_INT
+    (73, 37), // MISSION_ITEM_INT
 ];
 
 /// Where `param_id` (16 bytes, zero padded) starts in each payload. Fields are in wire order:
@@ -196,6 +263,8 @@ pub enum Why {
     MsgNotAllowed,
     /// A command id (in a command or a mission item) that is not on the list.
     CommandNotAllowed,
+    /// A mission message for the geofence or rally points (or all types).
+    MissionType,
 }
 
 impl Why {
@@ -210,6 +279,7 @@ impl Why {
             Why::ParamWrite => "param_write",
             Why::MsgNotAllowed => "msg_not_allowed",
             Why::CommandNotAllowed => "command_not_allowed",
+            Why::MissionType => "mission_type",
         }
     }
 }
@@ -222,12 +292,16 @@ pub struct Block {
     pub msgid: Option<u32>,
     /// The command id, for `CommandNotAllowed`.
     pub command: Option<u32>,
+    /// The `mission_type`, for `MissionType`.
+    pub mission_type: Option<u8>,
 }
 
 /// The guard's rules: the default lists, plus whatever the operator widened.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Guard {
     allow_ftp: bool,
+    allow_rtk: bool,
+    allow_fence_rally: bool,
     msgs: BTreeSet<u32>,
     commands: BTreeSet<u32>,
     params: BTreeSet<Vec<u8>>,
@@ -247,6 +321,27 @@ impl Guard {
 
     pub fn ftp_allowed(&self) -> bool {
         self.allow_ftp
+    }
+
+    /// Let `GPS_INJECT_DATA` and `GPS_RTCM_DATA` through (RTK corrections).
+    pub fn allow_rtk(mut self) -> Guard {
+        self.allow_rtk = true;
+        self
+    }
+
+    pub fn rtk_allowed(&self) -> bool {
+        self.allow_rtk
+    }
+
+    /// Let geofence and rally mission messages (`mission_type` 1 and 2) and the fence and rally
+    /// commands through. `ALL` (255) stays refused.
+    pub fn allow_fence_rally(mut self) -> Guard {
+        self.allow_fence_rally = true;
+        self
+    }
+
+    pub fn fence_rally_allowed(&self) -> bool {
+        self.allow_fence_rally
     }
 
     /// Also allow message `id`. Refused for `SETUP_SIGNING`, for FTP (use `allow_ftp`), for the
@@ -317,6 +412,9 @@ impl Guard {
     fn check_frame(&self, f: &Frame) -> Result<(), Block> {
         let id = f.msgid;
         let deny = |why| Err(block(why, Some(id), None));
+        if !f.length_ok() {
+            return Err(block(Why::Malformed, None, None));
+        }
         match id {
             MSG_SETUP_SIGNING => return deny(Why::SetupSigning),
             MSG_FILE_TRANSFER_PROTOCOL if !self.allow_ftp => return deny(Why::Ftp),
@@ -338,8 +436,24 @@ impl Guard {
                     return deny(Why::ParamWrite);
                 }
             }
-            _ if self.msgs.contains(&id) || DEFAULT_MESSAGES.iter().any(|m| m.0 == id) => {}
+            _ if self.msgs.contains(&id)
+                || DEFAULT_MESSAGES.iter().any(|m| m.0 == id)
+                || (self.allow_rtk && RTK_MESSAGES.iter().any(|m| m.0 == id)) => {}
             _ => return deny(Why::MsgNotAllowed),
+        }
+        if let Some(&(_, at)) = MISSION_TYPE_AT.iter().find(|m| m.0 == id) {
+            let t = f.payload.get(at).copied().unwrap_or(0);
+            let ok = match t {
+                MISSION_TYPE_MISSION => true,
+                MISSION_TYPE_FENCE | MISSION_TYPE_RALLY => self.allow_fence_rally,
+                _ => false,
+            };
+            if !ok {
+                return Err(Block {
+                    mission_type: Some(t),
+                    ..block(Why::MissionType, Some(id), None)
+                });
+            }
         }
         let at = match id {
             MSG_COMMAND_LONG | MSG_COMMAND_INT => Some(COMMAND_AT),
@@ -348,7 +462,10 @@ impl Guard {
         };
         if let Some(at) = at {
             let cmd = u32::from(u16_at(f.payload, at));
-            if !self.commands.contains(&cmd) && !DEFAULT_COMMANDS.iter().any(|c| c.0 == cmd) {
+            if !self.commands.contains(&cmd)
+                && !DEFAULT_COMMANDS.iter().any(|c| c.0 == cmd)
+                && !(self.allow_fence_rally && FENCE_RALLY_COMMANDS.iter().any(|c| c.0 == cmd))
+            {
                 return Err(block(Why::CommandNotAllowed, Some(id), Some(cmd)));
             }
         }
@@ -377,6 +494,7 @@ fn block(why: Why, msgid: Option<u32>, command: Option<u32>) -> Block {
         why,
         msgid,
         command,
+        mission_type: None,
     }
 }
 
@@ -387,6 +505,7 @@ fn known_message(id: u32) -> bool {
 
 /// One frame's shape: how long it is, its message id and its payload.
 struct Frame<'a> {
+    v1: bool,
     total: usize,
     msgid: u32,
     payload: &'a [u8],
@@ -432,12 +551,30 @@ impl<'a> Frame<'a> {
             return None;
         }
         Some(Frame {
+            v1: buf[0] == V1_START,
             total,
             msgid,
             payload: &buf[header..crc_at],
             covered: &buf[1..crc_at],
             crc: u16::from_le_bytes([buf[crc_at], buf[crc_at + 1]]),
         })
+    }
+
+    /// Is the payload length one the message can have? MAVLink 1 sends exactly the base length;
+    /// MAVLink 2 sends at most the longest length (it cuts trailing zero bytes). Ids that are
+    /// not in the length table are not checked here (the CRC check still needs the crate to know them).
+    fn length_ok(&self) -> bool {
+        match crate::mavlens::LENGTHS.binary_search_by_key(&self.msgid, |l| l.0) {
+            Ok(i) => {
+                let (_, base, max) = crate::mavlens::LENGTHS[i];
+                if self.v1 {
+                    self.payload.len() == usize::from(base)
+                } else {
+                    self.payload.len() <= usize::from(max)
+                }
+            }
+            Err(_) => true,
+        }
     }
 
     /// Is the CRC right for this message id (CRC_EXTRA from the common dialect)? An id the table
@@ -516,7 +653,16 @@ mod tests {
         f
     }
 
+    /// A MAVLink 1 frame. MAVLink 1 always sends the message's base length, so the payload is cut
+    /// or zero-padded to it.
     fn v1(msgid: u8, payload: &[u8]) -> Vec<u8> {
+        let base = crate::mavlens::LENGTHS
+            .iter()
+            .find(|l| l.0 == u32::from(msgid))
+            .map_or(payload.len(), |l| usize::from(l.1));
+        let mut payload = payload.to_vec();
+        payload.resize(base, 0);
+        let payload = &payload[..];
         let mut f = vec![V1_START, payload.len() as u8, 3, 255, 190, msgid];
         f.extend_from_slice(payload);
         let crc = crc_for(u32::from(msgid), &f[1..]);
@@ -579,7 +725,7 @@ mod tests {
     fn payload_for(id: u32) -> Vec<u8> {
         match id {
             75 | 76 | 39 | 73 => with_command(id, 400),
-            _ => vec![1, 2, 3, 4, 5],
+            _ => vec![1],
         }
     }
 
@@ -605,7 +751,12 @@ mod tests {
     #[test]
     fn the_link_doc_lists_every_entry() {
         let doc = include_str!("../docs/oasa-sec-v0-link.md");
-        for (id, name, why) in DEFAULT_MESSAGES.iter().chain(DEFAULT_COMMANDS) {
+        for (id, name, why) in DEFAULT_MESSAGES
+            .iter()
+            .chain(DEFAULT_COMMANDS)
+            .chain(RTK_MESSAGES)
+            .chain(FENCE_RALLY_COMMANDS)
+        {
             assert!(
                 doc.contains(&format!("| {id} | `{name}` |")),
                 "{id} {name} is missing from the link doc"
@@ -622,7 +773,7 @@ mod tests {
         for id in [
             256, 110, 23, 323, 126, /* SERIAL_CONTROL */
             121, /* LOG_ERASE */
-            33, 253,
+            33, 253, 123, 233,
         ] {
             assert!(DEFAULT_MESSAGES.iter().all(|m| m.0 != id), "message {id}");
         }
@@ -681,7 +832,7 @@ mod tests {
             11000,
             0x00FF_FFFF,
         ] {
-            let b = blocked(&v2(id, &[1, 2, 3], false));
+            let b = blocked(&v2(id, &[1], false));
             assert_eq!((b.why, b.msgid), (Why::MsgNotAllowed, Some(id)), "{id}");
         }
         assert_eq!(blocked(&v1(30, &[0; 28])).why, Why::MsgNotAllowed);
@@ -1076,14 +1227,15 @@ mod tests {
 
     #[test]
     fn long_payloads_work() {
-        let big = vec![7u8; 255];
-        assert!(guard().check(&v2(233, &big, false)).is_ok()); // GPS_RTCM_DATA
-        assert!(guard().check(&v2(233, &big, true)).is_ok());
+        let big = vec![7u8; 182];
+        let g = guard().allow_rtk();
+        assert!(g.check(&v2(233, &big, false)).is_ok()); // GPS_RTCM_DATA, its longest
+        assert!(g.check(&v2(233, &big, true)).is_ok());
         let mut d = v2(233, &big, true);
         d.extend(v2(233, &big, true));
-        assert!(guard().check(&d).is_ok());
+        assert!(g.check(&d).is_ok());
         d.pop();
-        assert_eq!(blocked(&d), malformed());
+        assert_eq!(g.check(&d).unwrap_err(), malformed());
     }
 
     #[test]
@@ -1122,6 +1274,230 @@ mod tests {
         assert_eq!(frames(&bad), Some(vec![(0, a.len())]));
     }
 
+    /// A payload with `mission_type` `t` at `at`, as MAVLink 2 would send it (trailing zeros cut).
+    fn mission_payload(id: u32, at: usize, t: u8) -> Vec<u8> {
+        let mut x = vec![0u8; at + 1];
+        x[at] = t;
+        if id == 39 || id == 73 {
+            x[MISSION_ITEM_COMMAND_AT..MISSION_ITEM_COMMAND_AT + 2]
+                .copy_from_slice(&16u16.to_le_bytes());
+        }
+        trimmed(x)
+    }
+
+    #[test]
+    fn mission_messages_are_for_the_normal_mission_only() {
+        for &(id, at) in MISSION_TYPE_AT {
+            let q = |t| v2(id, &mission_payload(id, at, t), false);
+            assert!(guard().check(&q(0)).is_ok(), "{id} type 0");
+            for t in [1u8, 2, 3, 100, 255] {
+                let b = blocked(&q(t));
+                assert_eq!(
+                    (b.why, b.msgid, b.mission_type),
+                    (Why::MissionType, Some(id), Some(t)),
+                    "{id} type {t}"
+                );
+            }
+            // Fence and rally only with the flag; 255 and the rest never.
+            let g = guard().allow_fence_rally();
+            assert!(g.check(&q(1)).is_ok(), "{id} fence");
+            assert!(g.check(&q(2)).is_ok(), "{id} rally");
+            for t in [3u8, 255] {
+                assert_eq!(
+                    g.check(&q(t)).unwrap_err().why,
+                    Why::MissionType,
+                    "{id} type {t}"
+                );
+            }
+            // A bad CRC is still caught after the type check passes.
+            let mut bad = q(0);
+            let n = bad.len();
+            bad[n - 1] ^= 1;
+            assert_eq!(blocked(&bad).why, Why::BadCrc, "{id}");
+        }
+    }
+
+    #[test]
+    fn the_mission_type_is_read_from_the_right_place() {
+        // MISSION_CLEAR_ALL: target_system, target_component, mission_type.
+        assert_eq!(
+            blocked(&v2(45, &[0, 0, 255], false)).mission_type,
+            Some(255)
+        );
+        assert!(guard().check(&v2(45, &[255, 255], false)).is_ok()); // type cut = 0
+        // MISSION_COUNT 0 for the rally points erases them: count(2), targets(2), type.
+        assert_eq!(
+            blocked(&v2(44, &[0, 0, 1, 1, 2], false)).mission_type,
+            Some(2)
+        );
+        // MISSION_ACK: targets(2), type, mission_type.
+        assert!(guard().check(&v2(47, &[1, 1, 5], false)).is_ok());
+        assert_eq!(blocked(&v2(47, &[1, 1, 0, 1], false)).mission_type, Some(1));
+        // MISSION_SET_CURRENT has no mission_type.
+        assert!(guard().check(&v2(41, &[1, 0, 1, 1], false)).is_ok());
+        // MAVLink 1 cannot carry the field: it is the normal mission.
+        assert!(guard().check(&v1(45, &[1, 1])).is_ok());
+        assert_eq!(blocked(&v2(45, &[1, 1, 1], true)).why, Why::MissionType);
+    }
+
+    #[test]
+    fn fence_and_rally_commands_need_the_flag() {
+        for (cmd, name, _) in FENCE_RALLY_COMMANDS {
+            for id in [39u32, 73, 75, 76] {
+                let f = v2(id, &with_command(id, *cmd), false);
+                let b = blocked(&f);
+                assert_eq!(
+                    (b.why, b.command),
+                    (Why::CommandNotAllowed, Some(*cmd)),
+                    "{name} in {id}"
+                );
+                assert!(
+                    guard().allow_fence_rally().check(&f).is_ok(),
+                    "{name} in {id} with the flag"
+                );
+            }
+        }
+        assert!(!guard().fence_rally_allowed());
+        assert!(guard().allow_fence_rally().fence_rally_allowed());
+        assert!(!guard().rtk_allowed());
+        // DO_FENCE_ENABLE (207) is not part of the flag.
+        let f = v2(76, &with_command(76, 207), false);
+        assert_eq!(
+            guard().allow_fence_rally().check(&f).unwrap_err().command,
+            Some(207)
+        );
+    }
+
+    #[test]
+    fn rtk_messages_need_the_flag() {
+        for (id, name, _) in RTK_MESSAGES {
+            assert!(known_message(*id), "{name}");
+            let f = v2(*id, &[1, 2, 3], false);
+            let b = blocked(&f);
+            assert_eq!((b.why, b.msgid), (Why::MsgNotAllowed, Some(*id)), "{name}");
+            assert!(guard().allow_rtk().check(&f).is_ok(), "{name}");
+            assert!(guard().allow_rtk().rtk_allowed());
+            assert!(
+                guard().allow_msg(*id).unwrap().check(&f).is_ok(),
+                "{name} by id"
+            );
+        }
+        assert!(DEFAULT_MESSAGES.iter().all(|m| m.0 != 123 && m.0 != 233));
+    }
+
+    #[test]
+    fn the_length_table_matches_the_crate() {
+        use mavlink::MavlinkVersion;
+        assert!(crate::mavlens::LENGTHS.windows(2).all(|w| w[0].0 < w[1].0));
+        for &(id, base, max) in crate::mavlens::LENGTHS {
+            let m = MavMessage::default_message_from_id(id)
+                .unwrap_or_else(|| panic!("{id} unknown to the crate"));
+            let mut buf = [0u8; 300];
+            assert_eq!(
+                m.ser(MavlinkVersion::V1, &mut buf),
+                usize::from(base),
+                "base length of {id}"
+            );
+            assert!(max >= base);
+        }
+        // Every message the guard may let through has a length.
+        let listed = |id: u32| crate::mavlens::LENGTHS.iter().any(|l| l.0 == id);
+        for (id, name, _) in DEFAULT_MESSAGES.iter().chain(RTK_MESSAGES) {
+            assert!(listed(*id), "{name} has no length");
+        }
+        assert!(listed(MSG_FILE_TRANSFER_PROTOCOL) && listed(MSG_SETUP_SIGNING));
+    }
+
+    #[test]
+    fn payloads_longer_than_the_message_are_malformed() {
+        // MAVLink 2: at most the longest length (HEARTBEAT 9; COMMAND_LONG 33).
+        assert!(guard().check(&v2(0, &[1; 9], false)).is_ok());
+        assert_eq!(blocked(&v2(0, &[1; 10], false)), malformed());
+        assert_eq!(blocked(&v2(0, &[1; 255], true)), malformed());
+        assert!(
+            guard()
+                .check(&v2(76, &with_command(76, 400), false))
+                .is_ok()
+        );
+        let mut long = with_command(76, 400);
+        long.resize(34, 1);
+        assert_eq!(blocked(&v2(76, &long, false)), malformed());
+        // GPS_RTCM_DATA is at most 182 bytes, FTP 254.
+        let g = guard().allow_rtk();
+        assert_eq!(
+            g.check(&v2(233, &[1; 183], false)).unwrap_err(),
+            malformed()
+        );
+        assert_eq!(
+            guard()
+                .allow_ftp()
+                .check(&v2(110, &[1; 255], false))
+                .unwrap_err(),
+            malformed()
+        );
+        // A bad length is malformed even for a message that would be refused anyway.
+        assert_eq!(blocked(&v2(256, &[0; 43], false)), malformed());
+    }
+
+    #[test]
+    fn mavlink_1_frames_carry_exactly_the_base_length() {
+        // Built by hand: the `v1` helper pads to the right length.
+        let raw = |id: u8, payload: &[u8]| {
+            let mut f = vec![V1_START, payload.len() as u8, 3, 255, 190, id];
+            f.extend_from_slice(payload);
+            let crc = crc_for(u32::from(id), &f[1..]);
+            f.extend_from_slice(&crc);
+            f
+        };
+        assert!(guard().check(&raw(0, &[1; 9])).is_ok());
+        assert_eq!(
+            blocked(&raw(0, &[1; 8])),
+            malformed(),
+            "trimmed payloads are MAVLink 2 only"
+        );
+        assert_eq!(blocked(&raw(0, &[1; 10])), malformed());
+        assert_eq!(blocked(&raw(0, &[])), malformed());
+        // MISSION_ITEM_INT: the extension (mission_type) is not in a v1 frame.
+        assert_eq!(blocked(&raw(73, &[0; 38])), malformed());
+    }
+
+    #[test]
+    fn a_full_length_param_name_works_with_and_without_trimming() {
+        let name = "ABCDEFGHIJKLMNOP"; // 16 characters, no terminating zero
+        let g = guard().allow_param(name).unwrap();
+        // PARAM_SET: value, targets, 16-byte name, then the type. A zero type is cut by MAVLink 2.
+        let mut full = 1.0f32.to_le_bytes().to_vec();
+        full.extend_from_slice(&[1, 1]);
+        full.extend_from_slice(name.as_bytes());
+        let mut with_type = full.clone();
+        with_type.push(9);
+        assert_eq!(full.len(), 22);
+        assert!(
+            g.check(&v2(23, &full, false)).is_ok(),
+            "the name ends the payload"
+        );
+        assert!(g.check(&v2(23, &with_type, false)).is_ok());
+        assert!(g.check(&v2(23, &with_type, true)).is_ok());
+        assert!(g.check(&v1(23, &with_type)).is_ok());
+        // One character short or long is a different name.
+        for other in ["ABCDEFGHIJKLMNO", "ABCDEFGHIJKLMNOQ"] {
+            assert_eq!(
+                g.check(&v2(23, &param_set(other), false)).unwrap_err().why,
+                Why::ParamWrite
+            );
+        }
+        // PARAM_EXT_SET: targets(2), name, value(128), type; trailing zeros cut.
+        let mut ext = vec![1, 1];
+        ext.extend_from_slice(name.as_bytes());
+        assert!(
+            g.check(&v2(323, &ext, false)).is_ok(),
+            "ext: the name ends the payload"
+        );
+        ext.resize(146, 0);
+        ext.push(2);
+        assert!(g.check(&v2(323, &ext, true)).is_ok());
+    }
+
     #[test]
     fn why_has_fixed_words() {
         let all = [
@@ -1133,6 +1509,7 @@ mod tests {
             (Why::ParamWrite, "param_write"),
             (Why::MsgNotAllowed, "msg_not_allowed"),
             (Why::CommandNotAllowed, "command_not_allowed"),
+            (Why::MissionType, "mission_type"),
         ];
         for (w, s) in all {
             assert_eq!(w.as_str(), s);

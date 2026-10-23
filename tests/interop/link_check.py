@@ -117,7 +117,13 @@ def guard(args):
     gpi = mav(33, bytes(28), signed=True)
     reboot = command_long(246, signed=True)
     param_ok = mav(23, param_set("MPC_XY_VEL_MAX"), signed=True)
+    clear_normal = mav(45, bytes([1, 1]))  # MISSION_CLEAR_ALL, the normal mission (type cut)
+    clear_fence = mav(45, bytes([1, 1, 1]))
+    clear_all = mav(45, bytes([1, 1, 255]))
+    rtk = mav(233, bytes([0, 4]) + bytes(180))
     always_blocked = {
+        "clear_all_types": clear_all,
+        "too_long": mav(0, bytes(10)),  # HEARTBEAT is at most 9 bytes
         "setup_signing": mav(256, bytes(range(42)), signed=True),
         "setup_signing_v2": mav(256, bytes(42)),
         "param_set_sign": mav(23, param_set("MAV_SIGN_CFG")),
@@ -132,11 +138,14 @@ def guard(args):
     by_default = {
         "ftp": ftp,
         "global_position_int": gpi,
+        "clear_fence": clear_fence,
+        "rtk": rtk,
         "command_reboot": reboot,
         "param_set_ok": param_ok,
     }
     passing = {
         "heartbeat": hb,
+        "clear_mission": clear_normal,
         "arm": command_long(400, signed=True),
         "takeoff": command_long(22),
         "mission_item": mission_item_int(16),
@@ -145,7 +154,7 @@ def guard(args):
     }
     send = {**passing, **always_blocked, **by_default}
     allowed_now = {"default": set(), "ftp": {"ftp"},
-                   "wide": {"global_position_int", "command_reboot", "mission_reboot", "param_set_ok"}}.get(mode, set())
+                   "wide": {"clear_fence", "rtk", "global_position_int", "command_reboot", "mission_reboot", "param_set_ok"}}.get(mode, set())
     if mode == "off":
         expect_pass = set(send)
     else:

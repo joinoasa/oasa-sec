@@ -136,6 +136,7 @@ pass "timestamp files are 600 and no private key is in any log"
 # A device dir with mavlink-signing-key.bin is a drone: the guard is on by default.
 # (The file only has to exist here; its bytes are random and never printed.)
 grep -q '"event":"mavlink_guard","state":"off"' "$T/drone.log" || fail "a device without the autopilot key should start with the guard off"
+grep -q '"event":"hint".*mavlink-signing-key.bin' "$T/drone.log" || fail "no hint about the guard being off"
 for d in gcsg dronek; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
 $B/oasa-pair trust --dir "$T/gcsg" --name dronek --key "$(pubkey "$T/dronek")" >/dev/null
 $B/oasa-pair trust --dir "$T/dronek" --name gcsg --key "$(pubkey "$T/gcsg")" >/dev/null
@@ -168,6 +169,9 @@ grep -q '"reason":"mavlink_blocked","why":"command_not_allowed","msgid":76,"comm
 grep -q '"reason":"mavlink_blocked","why":"msg_not_allowed","msgid":33' "$T/guard-drone.log" || fail "no log line for a message not on the list"
 grep -q '"reason":"mavlink_blocked","why":"param_write","msgid":23' "$T/guard-drone.log" || fail "no log line for a parameter write"
 grep -q '"reason":"mavlink_blocked","why":"bad_crc"' "$T/guard-drone.log" || fail "no log line for a bad CRC"
+grep -q '"reason":"mavlink_blocked","why":"mission_type","msgid":45,"mission_type":1' "$T/guard-drone.log" || fail "no log line for a fence clear"
+grep -q '"reason":"mavlink_blocked","why":"mission_type","msgid":45,"mission_type":255' "$T/guard-drone.log" || fail "no log line for a clear of all types"
+grep -q '"reason":"mavlink_blocked","why":"msg_not_allowed","msgid":233' "$T/guard-drone.log" || fail "no log line for RTK data"
 grep -q '"reason":"mavlink_blocked","why":"malformed"' "$T/guard-drone.log" || fail "no log line for a malformed datagram"
 [ "$($CHECK drops "$T/guard-drone.log")" -le 20 ] || fail "guard drop lines are not rate limited with the others"
 pass "decrypted packets leave from the --plain-listen port, so replies come back through the tunnel"
@@ -177,8 +181,8 @@ guard_run guardftp ftp --allow-mavlink-ftp
 grep -q '"event":"warning".*FILE_TRANSFER_PROTOCOL' "$T/guardftp-drone.log" || fail "--allow-mavlink-ftp printed no warning"
 pass "--allow-mavlink-ftp lets FTP through, logs a warning, and nothing else changes"
 
-guard_run guardwide wide --allow-msg 33 --allow-command 246 --allow-param mpc_xy_vel_max
-for w in "message 33 is allowed" "command 246 is allowed" "writes to parameter MPC_XY_VEL_MAX are allowed"; do
+guard_run guardwide wide --allow-msg 33 --allow-command 246 --allow-param mpc_xy_vel_max --allow-rtk --allow-fence-rally
+for w in "GPS_RTCM_DATA (233) are allowed" "geofence and rally mission messages" "message 33 is allowed" "command 246 is allowed" "writes to parameter MPC_XY_VEL_MAX are allowed"; do
   grep -q "\"event\":\"warning\".*$w" "$T/guardwide-drone.log" || fail "no warning for: $w"
 done
 pass "--allow-msg, --allow-command and --allow-param each widen exactly one thing and each log a warning; signing parameters stay blocked"
@@ -187,7 +191,7 @@ guard_run guardoff off --no-mavlink-guard
 grep -q '"event":"warning"' "$T/guardoff-drone.log" || fail "--no-mavlink-guard printed no warning"
 pass "--no-mavlink-guard prints a warning and lets everything through"
 
-for bad in "--no-mavlink-guard --allow-msg 33" "--allow-msg 256" "--allow-param MAV_SIGN_CFG" "--allow-command 99999"; do
+for bad in "--no-mavlink-guard --allow-msg 33" "--allow-msg 256" "--allow-param MAV_SIGN_CFG" "--allow-command 99999" "--no-mavlink-guard --allow-rtk" "--no-mavlink-guard --allow-fence-rally"; do
   if $B/oasa-link --dir "$T/dronek" --peer gcsg --bind 127.0.0.1:7791 --plain-listen 127.0.0.1:7792 \
     --plain-send 127.0.0.1:7793 --duration 1 $bad >"$T/bad.log" 2>&1; then fail "oasa-link accepted: $bad"; fi
 done

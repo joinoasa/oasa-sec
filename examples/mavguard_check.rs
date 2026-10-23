@@ -2,7 +2,7 @@
 //! one line each: `pass ID:LEN,...` or `drop WHY`. Used by tests/interop/mavguard_diff.py, which
 //! compares the answers with pymavlink's.
 //!
-//! `--wide` widens the guard to every message and command the CRC table knows, and FTP, so
+//! `--wide` widens the guard to every message and command the CRC table knows, FTP, RTK and fence and rally, so
 //! the comparison covers all of them. Parameter writes stay off.
 //!
 //! Usage: cargo run --example mavguard_check [-- --wide]
@@ -13,7 +13,7 @@ use std::io::BufRead;
 fn main() {
     let mut g = Guard::new();
     if std::env::args().any(|a| a == "--wide") {
-        g = g.allow_ftp();
+        g = g.allow_ftp().allow_rtk().allow_fence_rally();
         for id in 0..=u32::from(u16::MAX) {
             if let Ok(w) = g.clone().allow_msg(id) {
                 g = w;

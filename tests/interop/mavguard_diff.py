@@ -27,7 +27,7 @@ from pymavlink.dialects.v10 import common as m1  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.join(HERE, "..", "..", "target", "release", "examples", "mavguard_check")
-POLICY = {"setup_signing", "param_write", "signing_param", "ftp", "msg_not_allowed", "command_not_allowed"}
+POLICY = {"setup_signing", "param_write", "signing_param", "ftp", "msg_not_allowed", "command_not_allowed", "mission_type"}
 
 
 class Sink:
@@ -136,6 +136,20 @@ def damage(rng, d):
     return bytes(d)
 
 
+def check_lengths():
+    """src/mavlens.rs against pymavlink: the longest payload of every message it lists. (Ids that
+    only the Rust crate knows are not in pymavlink; they are listed in no table.)"""
+    import re
+    text = open(os.path.join(HERE, "..", "..", "src", "mavlens.rs")).read()
+    bad = 0
+    for i, base, mx in re.findall(r"\((\d+), (\d+), (\d+)\)", text):
+        cls = m2.mavlink_map.get(int(i))
+        if cls is None or cls.unpacker.size != int(mx) or int(base) > int(mx):
+            print(f"LENGTH MISMATCH: {i} table max {mx}, pymavlink {cls and cls.unpacker.size}")
+            bad += 1
+    return bad
+
+
 def main():
     n = 3000
     seed = 1
@@ -155,7 +169,7 @@ def main():
     corpus.extend([b"", b"\x00", b"\xfd", b"\xfe", b"\xfd" * 20, bytes(300)])
     corpus = [c for c in corpus if c]
 
-    bad = 0
+    bad = check_lengths()
     stats = {"pass": 0, "policy": 0, "invalid": 0, "py_valid": 0}
     for wide in (False, True):
         res = run_guard(corpus, wide)
