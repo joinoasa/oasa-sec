@@ -112,6 +112,24 @@ impl FileTimestampStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Forget the saved timestamps (`sent`, `seen` or both) and return what
+    /// was there. For the case where a peer's clock was set far into the
+    /// future and its timestamp got saved: nothing newer is accepted from it
+    /// until then. Forgetting `seen` makes us accept an old recorded
+    /// handshake 1 from this peer once more, until a newer one arrives.
+    pub fn reset(&mut self, sent: bool, seen: bool) -> Result<StoredStamps> {
+        let old = self.load()?;
+        let mut next = old;
+        if sent {
+            next.sent = None;
+        }
+        if seen {
+            next.seen = None;
+        }
+        self.save(&next)?;
+        Ok(old)
+    }
 }
 
 impl TimestampStore for FileTimestampStore {
@@ -182,6 +200,22 @@ mod tests {
             .next(),
             Timestamp { secs: 2, nanos: 0 }
         );
+    }
+
+    #[test]
+    fn reset_forgets_only_what_was_asked() {
+        let dir = crate::files::tempdir("stamp-reset");
+        let mut s = FileTimestampStore::new(&dir, &[4u8; 32]);
+        let st = StoredStamps {
+            sent: Some(Timestamp { secs: 10, nanos: 5 }),
+            seen: Some(Timestamp { secs: 99, nanos: 1 }),
+        };
+        s.save(&st).unwrap();
+        assert_eq!(s.reset(false, true).unwrap(), st);
+        let now = s.load().unwrap();
+        assert_eq!((now.sent, now.seen), (st.sent, None));
+        s.reset(true, false).unwrap();
+        assert_eq!(s.load().unwrap(), StoredStamps::default());
     }
 
     #[test]

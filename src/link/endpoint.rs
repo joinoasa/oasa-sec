@@ -140,6 +140,9 @@ impl std::fmt::Debug for Endpoint {
     }
 }
 
+/// How far ahead of our clock a handshake 1 timestamp may be (10 minutes).
+const MAX_FUTURE_SECS: u64 = 600;
+
 fn noise_params() -> NoiseParams {
     LINK_NOISE.parse().expect("valid Noise name")
 }
@@ -176,6 +179,7 @@ impl Endpoint {
         public: [u8; 32],
         mut store: Box<dyn TimestampStore>,
     ) -> Result<PeerId> {
+        crate::identity::check_peer_public(&public)?;
         if public == self.sh.public {
             return Err(Error::Link("a device cannot be its own peer"));
         }
@@ -539,6 +543,16 @@ impl PeerLink {
             sh.stats.count_drop(r);
             out.push(Event::Dropped(r));
         };
+        // With a real clock, a timestamp far in the future is refused. It
+        // would otherwise lock the peer out until that time (one forged by
+        // nobody, but sent by a peer whose clock was wrong): spec section 6.
+        if !sh.wall_base.is_zero() {
+            let now_wall = (sh.wall_base + now).as_secs();
+            if ts.secs > now_wall.saturating_add(MAX_FUTURE_SECS) {
+                drop_with(DropReason::StaleHandshake);
+                return;
+            }
+        }
         // A recorded handshake 1 is never newer than what we have seen.
         if self.stamps.seen.is_some_and(|seen| ts <= seen) {
             drop_with(DropReason::StaleHandshake);

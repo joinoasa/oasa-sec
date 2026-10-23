@@ -168,3 +168,72 @@ fn trust_refuses_bad_input() {
         .contains("init")
     );
 }
+
+#[test]
+fn trust_refuses_small_order_keys_and_fingerprint_shaped_names() {
+    let (a, b) = (tempdir("sa"), tempdir("sb"));
+    ok(&["init", "--dir", s(&a), "--name", "gcs"]);
+    ok(&["init", "--dir", s(&b), "--name", "relay"]);
+    let kb = field(&ok(&["show", "--dir", s(&b)]), "public_key").to_string();
+    for k in [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+    ] {
+        let e = err(&["trust", "--dir", s(&a), "--name", "evil", "--key", k]);
+        assert!(e.contains("not a valid device key"), "{e}");
+    }
+    let fp = field(&ok(&["show", "--dir", s(&b)]), "fingerprint").to_string();
+    let e = err(&["trust", "--dir", s(&a), "--name", &fp, "--key", &kb]);
+    assert!(e.contains("fingerprint"), "{e}");
+    assert!(!a.join("trusted-peers").exists());
+}
+
+#[test]
+fn reset_stamp_forgets_saved_timestamps() {
+    let (a, b) = (tempdir("ta"), tempdir("tb"));
+    ok(&["init", "--dir", s(&a), "--name", "gcs"]);
+    ok(&["init", "--dir", s(&b), "--name", "relay"]);
+    let kb = field(&ok(&["show", "--dir", s(&b)]), "public_key").to_string();
+    let fp = field(&ok(&["show", "--dir", s(&b)]), "fingerprint").to_string();
+    ok(&["trust", "--dir", s(&a), "--name", "relay", "--key", &kb]);
+    // Save stamps the way the link does: 24 bytes, sent then seen.
+    let file = a.join(format!("link-timestamp-{fp}"));
+    let mut bytes = [0u8; 24];
+    bytes[..8].copy_from_slice(&100u64.to_be_bytes());
+    bytes[12..20].copy_from_slice(&4_000_000_000u64.to_be_bytes());
+    std::fs::write(&file, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let out = ok(&[
+        "reset-stamp",
+        "--dir",
+        s(&a),
+        "--peer",
+        "relay",
+        "--which",
+        "seen",
+    ]);
+    assert!(out.contains("seen 4000000000 s"), "{out}");
+    let after = std::fs::read(&file).unwrap();
+    assert_eq!(&after[..8], &100u64.to_be_bytes());
+    assert!(after[12..].iter().all(|b| *b == 0));
+    ok(&["reset-stamp", "--dir", s(&a), "--peer", &fp]);
+    assert!(std::fs::read(&file).unwrap().iter().all(|b| *b == 0));
+    assert!(err(&["reset-stamp", "--dir", s(&a), "--peer", "nobody"]).contains("no trusted peer"));
+    assert!(
+        err(&[
+            "reset-stamp",
+            "--dir",
+            s(&a),
+            "--peer",
+            "relay",
+            "--which",
+            "x"
+        ])
+        .contains("--which")
+    );
+}

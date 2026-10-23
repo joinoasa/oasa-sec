@@ -140,8 +140,23 @@ impl Config {
         if self.stale_after.is_zero() {
             return bad("stale_after must be above zero");
         }
-        if self.reject_after > Duration::from_secs(10 * 365 * 86_400) {
-            return bad("reject_after is over ten years");
+        // Time arithmetic never overflows if every setting stays under ten years.
+        let cap = Duration::from_secs(10 * 365 * 86_400);
+        if [
+            self.reject_after,
+            self.retry_max,
+            self.stale_after,
+            self.previous_grace,
+            self.peer_handshake_gap,
+            self.keepalive.unwrap_or_default(),
+        ]
+        .iter()
+        .any(|d| *d > cap)
+        {
+            return bad("a time setting is over ten years");
+        }
+        if self.keepalive.is_some_and(|k| k.is_zero()) {
+            return bad("keepalive must be above zero (use None for off)");
         }
         Ok(())
     }

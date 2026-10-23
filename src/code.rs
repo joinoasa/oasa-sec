@@ -28,6 +28,7 @@ pub struct PairingCode {
 impl PairingCode {
     /// A new code for the device with this public key, with a fresh secret.
     pub fn new(responder_public: [u8; 32]) -> Result<Self> {
+        crate::identity::check_peer_public(&responder_public)?;
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|e| Error::Io(std::io::Error::other(e)))?;
         Ok(Self {
@@ -92,6 +93,9 @@ impl PairingCode {
             let mut responder_public = [0u8; 32];
             let mut secret = [0u8; 32];
             responder_public.copy_from_slice(&body[1..33]);
+            if crate::identity::is_small_order(&responder_public) {
+                return Err(Error::BadCode("the device key is not valid"));
+            }
             secret.copy_from_slice(&body[33..65]);
             Ok(Self {
                 responder_public,

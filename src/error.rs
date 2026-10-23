@@ -17,6 +17,9 @@ pub enum Error {
     /// The encrypted link was set up wrongly (bad settings, a peer that can't
     /// be added).
     Link(&'static str),
+    /// A public key that is a small-order point (zero, one and the like). No
+    /// real device has one, and a Diffie-Hellman with it proves nothing.
+    SmallOrderKey,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -30,6 +33,7 @@ impl fmt::Display for Error {
             Error::BadKeyFile(why) => write!(f, "bad key file: {why}"),
             Error::Protocol(why) => write!(f, "pairing protocol error: {why}"),
             Error::Link(why) => write!(f, "link error: {why}"),
+            Error::SmallOrderKey => write!(f, "that public key is not a valid device key"),
         }
     }
 }

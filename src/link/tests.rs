@@ -936,6 +936,34 @@ fn config_validation_refuses_unsafe_settings() {
             handshakes_per_second: 0,
             ..ok.clone()
         },
+        Config {
+            handshakes_per_second: 100_001,
+            ..ok.clone()
+        },
+        Config {
+            stale_after: Duration::ZERO,
+            ..ok.clone()
+        },
+        Config {
+            keepalive: Some(Duration::ZERO),
+            ..ok.clone()
+        },
+        Config {
+            keepalive: Some(Duration::from_secs(u64::MAX)),
+            ..ok.clone()
+        },
+        Config {
+            retry_max: Duration::from_secs(u64::MAX),
+            ..ok.clone()
+        },
+        Config {
+            reject_after: Duration::from_secs(u64::MAX),
+            ..ok.clone()
+        },
+        Config {
+            previous_grace: Duration::MAX,
+            ..ok.clone()
+        },
     ];
     for c in bad {
         assert!(c.validate().is_err(), "{c:?}");
@@ -1190,4 +1218,80 @@ fn a_side_that_only_receives_sends_a_keepalive_before_the_peer_gives_up() {
     assert!(!handshake_sent(
         &p.a.poll_timers(t1 + Duration::from_secs(80))
     ));
+}
+
+#[test]
+fn a_timestamp_far_in_the_future_is_refused_when_there_is_a_clock() {
+    let (a_key, b_key) = (random_key(), random_key());
+    let hour = Duration::from_secs(3600);
+    let base = Duration::from_secs(1_700_000_000);
+    // (initiator clock ahead by, responder has a clock, expected accepted)
+    for (ahead, has_clock, accepted) in [
+        (Duration::ZERO, true, true),
+        (Duration::from_secs(500), true, true),
+        (Duration::from_secs(700), true, false),
+        (hour * 24 * 365, true, false),
+        // A device with no clock (wall_base zero) cannot judge.
+        (hour * 24 * 365, false, true),
+    ] {
+        let mut a = link_from(
+            &a_key,
+            pub_of(&b_key),
+            1,
+            Box::new(MemoryTimestampStore::default()),
+            base + ahead,
+        );
+        let wall_b = if has_clock { base } else { Duration::ZERO };
+        let mut b = link_from(
+            &b_key,
+            pub_of(&a_key),
+            2,
+            Box::new(MemoryTimestampStore::default()),
+            wall_b,
+        );
+        let hs1 = sends(&a.start_handshake(ms(10)).unwrap()).remove(0);
+        let ev = b.handle_packet(ms(10), &hs1);
+        if accepted {
+            assert_eq!(sends(&ev).len(), 1, "{ahead:?} {has_clock}");
+        } else {
+            assert_eq!(drops(&ev), vec![DropReason::StaleHandshake]);
+            assert!(sends(&ev).is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_future_timestamp_that_was_refused_does_not_lock_the_peer_out() {
+    let (a_key, b_key) = (random_key(), random_key());
+    let base = Duration::from_secs(1_700_000_000);
+    let mut b = link_from(
+        &b_key,
+        pub_of(&a_key),
+        2,
+        Box::new(MemoryTimestampStore::default()),
+        base,
+    );
+    // A's clock is a year ahead: refused, and B's saved state is untouched.
+    let mut bad = link_from(
+        &a_key,
+        pub_of(&b_key),
+        1,
+        Box::new(MemoryTimestampStore::default()),
+        base + Duration::from_secs(365 * 86_400),
+    );
+    let hs1 = sends(&bad.start_handshake(ms(10)).unwrap()).remove(0);
+    assert_eq!(
+        drops(&b.handle_packet(ms(10), &hs1)),
+        vec![DropReason::StaleHandshake]
+    );
+    // A with a fixed clock gets through at once.
+    let mut good = link_from(
+        &a_key,
+        pub_of(&b_key),
+        3,
+        Box::new(MemoryTimestampStore::default()),
+        base,
+    );
+    let hs1 = sends(&good.start_handshake(ms(20)).unwrap()).remove(0);
+    assert_eq!(sends(&b.handle_packet(ms(20), &hs1)).len(), 1);
 }

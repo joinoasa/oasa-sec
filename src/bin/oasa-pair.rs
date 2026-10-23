@@ -28,6 +28,7 @@ USAGE:
                      [--code-file FILE | --code -] [--expect-drone FINGERPRINT]
   oasa-pair show     --dir DIR
   oasa-pair trust    --dir DIR --name PEERNAME --key HEX64
+  oasa-pair reset-stamp --dir DIR --peer NAME|FINGERPRINT [--which sent|seen|both]
   oasa-pair peers    --dir DIR
   oasa-pair remove   --dir DIR FINGERPRINT
   oasa-pair command  --dir DIR --to MAVLINK_ADDR [--peer NAME|FINGERPRINT]
@@ -52,6 +53,13 @@ USAGE:
             doesn't show up in the process list or shell history. --expect-drone
             refuses to pair unless the code names that drone (compare with the
             fingerprint printed on the drone).
+  reset-stamp
+            Forget the handshake timestamps saved for one peer (default both). Use it
+            when a peer's clock was set far ahead and its handshakes are now refused,
+            or after fixing this device's own clock. Fix the clock first. Forgetting
+            `seen` lets one recorded old handshake from that peer be accepted again
+            until a newer one arrives; do it only for a peer you trust. Restart
+            oasa-link afterwards.
   peers     List paired devices.
   remove    Remove a device from the list. This does not lock it out: that needs
             key rotation, which is the next node (R-SEC2).
@@ -94,6 +102,7 @@ fn run(args: &[String]) -> R {
         "ground" => ground(&opts),
         "show" => show(&opts),
         "trust" => trust(&opts),
+        "reset-stamp" => reset_stamp(&opts),
         "peers" => peers(&opts),
         "remove" => remove(&opts),
         "command" => command(&opts),
@@ -188,6 +197,34 @@ fn trust(o: &Opts) -> R {
         "Trusted {} {}\nCheck that this fingerprint matches the one shown on that device.",
         peer.name,
         peer.fingerprint()
+    );
+    Ok(())
+}
+
+/// Forget the saved handshake timestamps for one peer.
+fn reset_stamp(o: &Opts) -> R {
+    use oasa_sec::link::FileTimestampStore;
+    let dir = o.dir()?;
+    let which = o.get("which").unwrap_or("both");
+    let (sent, seen) = match which {
+        "sent" => (true, false),
+        "seen" => (false, true),
+        "both" => (true, true),
+        _ => return Err("--which must be sent, seen or both".into()),
+    };
+    let who = o.req("peer")?;
+    let peer = store::find(&dir, who)?.ok_or(format!("no trusted peer {who}"))?;
+    let mut st = FileTimestampStore::new(&dir, &peer.public);
+    let old = st.reset(sent, seen)?;
+    let show = |t: Option<oasa_sec::link::Timestamp>| {
+        t.map_or("none".to_string(), |t| format!("{} s", t.secs))
+    };
+    println!(
+        "Reset {which} for {} {} (was sent {}, seen {}).\nFix the clock first if it was wrong, then restart oasa-link.",
+        peer.name,
+        peer.fingerprint(),
+        show(old.sent),
+        show(old.seen)
     );
     Ok(())
 }
