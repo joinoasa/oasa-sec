@@ -1641,3 +1641,194 @@ fn the_same_entry_needs_one_vote_for_a_peer_and_two_for_an_admin() {
     );
     assert!(is_listed(&device, &as_admin), "an admin needs a second");
 }
+
+// ---- signing-key rotation through the simulated channel (R-SEC2 phase B) ------
+//
+// Side A is the drone (it holds an autopilot key), side B its operator.
+
+struct Pair {
+    sim: Sim,
+    drone: PathBuf,
+    operator: PathBuf,
+    drone_fp: String,
+}
+
+fn rotation_pair(seed: u64, channel: Channel) -> Pair {
+    let mut sim = Sim::new(seed, config(CounterLen::Short), channel);
+    let (a, b) = (pub_of(&sim.keys[&Side::A]), pub_of(&sim.keys[&Side::B]));
+    let (drone, operator) = (tmpdir("rot-drone"), tmpdir("rot-operator"));
+    // Both start with the key from pairing.
+    let key = oasa_sec::signing::SigningKey::generate().unwrap();
+    key.save(&drone.join(oasa_sec::signing::AUTOPILOT_KEY_FILE))
+        .unwrap();
+    let drone_fp = fingerprint(&a);
+    key.save(&oasa_sec::signing::peer_key_path(&operator, &drone_fp))
+        .unwrap();
+    trust(&drone, b, "operator", Role::Operator);
+    trust(&operator, a, "drone", Role::Peer);
+    sim.attach_control(Side::A, &drone, seed ^ 1);
+    sim.attach_control(Side::B, &operator, seed ^ 2);
+    Pair {
+        sim,
+        drone,
+        operator,
+        drone_fp,
+    }
+}
+
+impl Pair {
+    fn tell_drone(&mut self) {
+        let now = self.sim.now;
+        let acts = self.sim.ctl.get_mut(&Side::A).unwrap().signing_changed(now);
+        self.sim.run_ctl(Side::A, acts);
+    }
+
+    /// The signer's side of a rotation, without an autopilot: issue, and commit.
+    fn issue(&mut self) -> oasa_sec::rotation::Begun {
+        let b = oasa_sec::rotation::begin(&self.drone).unwrap();
+        self.tell_drone();
+        b
+    }
+
+    fn commit(&mut self, g: u32) {
+        oasa_sec::rotation::commit(&self.drone, g, 0).unwrap();
+        self.tell_drone();
+    }
+
+    fn operator_key(&self) -> oasa_sec::signing::SigningKey {
+        oasa_sec::signing::SigningKey::load(&oasa_sec::signing::peer_key_path(
+            &self.operator,
+            &self.drone_fp,
+        ))
+        .unwrap()
+    }
+
+    fn operator_gen(&self) -> u32 {
+        oasa_sec::rotation::operator_gen(&self.operator, &self.drone_fp).unwrap()
+    }
+}
+
+#[test]
+fn a_rotation_reaches_the_operator_through_a_lossy_channel_on_many_seeds() {
+    for seed in 1..=8u64 {
+        let mut p = rotation_pair(seed, Channel::rough(0.30));
+        p.sim.start();
+        p.sim.run(Duration::from_secs(20), ms(10), ms(250), |_| {});
+        let b = p.issue();
+        p.sim.run(Duration::from_secs(300), ms(10), ms(250), |s| {
+            if s.rng.chance(0.02) {
+                s.replay_random();
+            }
+        });
+        // The pending key arrived; the operator still uses the old one.
+        let pending = oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+            .unwrap()
+            .unwrap_or_else(|| panic!("seed {seed}: no pending key"));
+        assert_eq!((pending.0, pending.1.as_bytes()), (1, b.key.as_bytes()));
+        assert_eq!(
+            p.operator_gen(),
+            0,
+            "seed {seed}: switched before the commit"
+        );
+        p.commit(1);
+        p.sim.run(Duration::from_secs(300), ms(10), ms(250), |_| {});
+        assert_eq!(p.operator_gen(), 1, "seed {seed}");
+        assert_eq!(p.operator_key().as_bytes(), b.key.as_bytes(), "seed {seed}");
+        let acked =
+            oasa_sec::rotation::read_acked(&p.drone, &fingerprint(&pub_of(&p.sim.keys[&Side::B])))
+                .unwrap();
+        assert_eq!(
+            acked,
+            oasa_sec::rotation::Acked { next: 1, commit: 1 },
+            "seed {seed}"
+        );
+        // Nothing left to send, and the key was never on the wire in the clear.
+        let far = p.sim.now + Duration::from_secs(100_000);
+        assert!(p.sim.ctl.get_mut(&Side::A).unwrap().poll(far).is_empty());
+        for (_, w) in &p.sim.wire {
+            assert!(
+                !w.windows(32).any(|x| x == b.key.as_bytes()),
+                "seed {seed}: the key is on the wire"
+            );
+        }
+        p.sim.check_accounting();
+        p.sim.check_delivery_integrity();
+    }
+}
+
+#[test]
+fn an_operator_that_was_away_for_two_rotations_catches_up_when_it_returns() {
+    let mut p = rotation_pair(41, Channel::rough(0.15));
+    p.sim.blackout = true;
+    p.sim.start();
+    p.sim.run(Duration::from_secs(10), ms(10), ms(500), |_| {});
+    for g in 1..=2 {
+        let b = p.issue();
+        assert_eq!(b.generation, g);
+        p.commit(g);
+    }
+    p.sim.run(Duration::from_secs(60), ms(10), ms(500), |_| {});
+    assert_eq!(p.operator_gen(), 0, "nothing gets through a blackout");
+    p.sim.blackout = false;
+    p.sim.run(Duration::from_secs(400), ms(10), ms(500), |_| {});
+    assert_eq!(p.operator_gen(), 2);
+    let cur = oasa_sec::rotation::load_drone_keys(&p.drone)
+        .unwrap()
+        .unwrap()
+        .current;
+    assert_eq!(p.operator_key(), cur);
+    p.sim.check_accounting();
+}
+
+#[test]
+fn a_new_next_replaces_a_pending_one_after_a_dropped_rotation() {
+    let mut p = rotation_pair(43, Channel::clean());
+    p.sim.start();
+    p.sim.run(Duration::from_secs(10), ms(10), ms(500), |_| {});
+    let first = p.issue();
+    p.sim.run(Duration::from_secs(20), ms(10), ms(500), |_| {});
+    assert_eq!(
+        oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+            .unwrap()
+            .unwrap()
+            .0,
+        1
+    );
+    // The autopilot kept the old key: the signer drops it and tries again.
+    oasa_sec::rotation::abandon(&p.drone).unwrap();
+    let second = p.issue();
+    assert_eq!(second.generation, 2);
+    p.sim.run(Duration::from_secs(20), ms(10), ms(500), |_| {});
+    let (g, k) = oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+        .unwrap()
+        .unwrap();
+    assert_eq!((g, k.as_bytes()), (2, second.key.as_bytes()));
+    p.commit(2);
+    p.sim.run(Duration::from_secs(20), ms(10), ms(500), |_| {});
+    assert_eq!(p.operator_gen(), 2);
+    assert_ne!(p.operator_key().as_bytes(), first.key.as_bytes());
+}
+
+#[test]
+fn a_removed_operator_is_never_sent_the_new_key() {
+    let mut p = rotation_pair(47, Channel::clean());
+    let (a, b) = (pub_of(&p.sim.keys[&Side::A]), pub_of(&p.sim.keys[&Side::B]));
+    p.sim.start();
+    p.sim.run(Duration::from_secs(10), ms(10), ms(500), |_| {});
+    // The operator is removed on the drone; its link process learns of it.
+    removal::remove_local(&p.drone, &a, &b, 5).unwrap();
+    p.sim.ctl.get_mut(&Side::A).unwrap().peer_removed();
+    assert!(p.drone.join("rotation-pending").exists());
+    let issued = p.issue();
+    p.commit(issued.generation);
+    p.sim.run(Duration::from_secs(60), ms(10), ms(500), |_| {});
+    assert!(
+        oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(p.operator_gen(), 0);
+    for (_, w) in &p.sim.wire {
+        assert!(!w.windows(32).any(|x| x == issued.key.as_bytes()));
+    }
+}

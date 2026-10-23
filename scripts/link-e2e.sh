@@ -312,4 +312,64 @@ for f in "$T"/dev/removed "$T"/adm/removal-log "$T"/dev/removal-sync/*; do
 done
 pass "control messages are counted apart and never reach the application side; removal files are 600"
 
+# --- 8. Signing-key rotation (R-SEC2 phase B) ----------------------------
+# A drone with two operators and a stand-in autopilot. The drone removes operator o1; the
+# signer rotates the key; the drone's link to o2 hands o2 the new key; o1's old key stops working.
+key32() { head -c 32 "$1" | od -An -tx1; }
+for d in sd o1 o2; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+head -c 40 /dev/urandom > "$T/sd/mavlink-signing-key.bin"; chmod 600 "$T/sd/mavlink-signing-key.bin"
+SDFP=$(fp_of sd)
+for o in o1 o2; do
+  mkdir -p "$T/$o/signing-keys"; chmod 700 "$T/$o/signing-keys"
+  cp "$T/sd/mavlink-signing-key.bin" "$T/$o/signing-keys/$SDFP.bin"; chmod 600 "$T/$o/signing-keys/$SDFP.bin"
+  trust_as sd $o $o operator; trust_as $o sd sd peer
+done
+# The stand-in starts with the drone's key, as after pairing.
+head -c 32 "$T/sd/mavlink-signing-key.bin" > "$T/ap8.key"
+$B/examples/fake_autopilot udpin:127.0.0.1:14640 --armed-file "$T/sw-armed" --state-file "$T/ap8.key" > "$T/ap8.log" 2>&1 & PIDS+=($!)
+wait_for 10 "has a signing key" "$T/ap8.log" || fail "stand-in autopilot did not start with the key"
+link sdA sd o1 7820; SDA=$LAST
+link o1l o1 sd 7821 --remote 127.0.0.1:7820 --initiate; O1L=$LAST
+link sdB sd o2 7822; SDB=$LAST
+link o2l o2 sd 7823 --remote 127.0.0.1:7822 --initiate; O2L=$LAST
+wait_for 15 session_established "$T/sdA.log" && wait_for 15 session_established "$T/sdB.log" || fail "rotation test: no sessions"
+$B/oasa-pair command --dir "$T/o2" --to udpout:127.0.0.1:14640 --wait 10 >/dev/null || fail "the starting key does not work"
+OLD8=$(key32 "$T/sd/mavlink-signing-key.bin")
+cp "$T/o1/signing-keys/$SDFP.bin" "$T/o1-old.bin"
+$B/oasa-pair signer --dir "$T/sd" --autopilot udpout:127.0.0.1:14640 > "$T/signer8.log" 2>&1 & SIGNER8=$!; PIDS+=($SIGNER8)
+wait_for 10 signer_started "$T/signer8.log" || fail "signer did not start"
+$B/oasa-pair remove --dir "$T/sd" o1 >/dev/null || fail "could not remove o1"
+wait_exit "$SDA" 5; [ "$EXIT_RC" = 3 ] || fail "the drone's link to the removed operator did not exit 3"
+wait_for 60 rotation_done "$T/signer8.log" || fail "the signer did not rotate the key"
+NEW8=$(key32 "$T/sd/mavlink-signing-key.bin")
+[ "$NEW8" != "$OLD8" ] || fail "the drone's key did not change"
+for i in $(seq 100); do [ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW8" ] && break; sleep 0.1; done
+[ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW8" ] || fail "operator o2 never got the new key"
+[ "$(cat "$T/o2/signing-keys/$SDFP.gen")" = 1 ] || fail "operator o2 has no generation 1"
+[ ! -e "$T/o2/signing-keys/$SDFP.next" ] && [ ! -e "$T/o2/signing-keys/$SDFP.next.gen" ] || fail "operator o2 kept pending files"
+[ "$(key32 "$T/o1/signing-keys/$SDFP.bin")" = "$OLD8" ] && [ ! -e "$T/o1/signing-keys/$SDFP.next" ] \
+  || fail "the removed operator was given the new key"
+grep -q '"event":"signing_key_next"' "$T/o2l.log" && grep -q '"event":"signing_key_commit"' "$T/o2l.log" || fail "o2 logged no key messages"
+grep -q "$(od -An -tx1 -v -N32 "$T/sd/mavlink-signing-key.bin" | tr -d ' \n')" "$T"/*.log && fail "a signing key is in a log"
+$B/oasa-pair command --dir "$T/o2" --to udpout:127.0.0.1:14640 --wait 10 >/dev/null || fail "o2's new key does not work"
+if $B/oasa-pair command --dir "$T/o1" --to udpout:127.0.0.1:14640 --wait 4 >/dev/null 2>&1; then fail "the removed operator's old key still works"; fi
+pass "after removing o1: the signer rotates, o2 gets the new key from the drone's link, o1's old key stops working"
+
+# An operator that is offline during a rotation catches up when it reconnects.
+kill -TERM "$O2L" 2>/dev/null || true; wait "$O2L" 2>/dev/null || true
+$B/oasa-pair rotate-signing --dir "$T/sd" >/dev/null
+wait_count_e() { local i; for i in $(seq $(($1 * 10))); do [ "$(grep -c "$2" "$3")" -ge "$4" ] && return 0; sleep 0.1; done; return 1; }
+wait_count_e 60 rotation_done "$T/signer8.log" 2 || fail "second rotation did not finish"
+NEW9=$(key32 "$T/sd/mavlink-signing-key.bin")
+[ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW8" ] || fail "o2 changed while it was offline"
+link o2l2 o2 sd 7824 --remote 127.0.0.1:7822 --initiate; O2L=$LAST
+for i in $(seq 150); do [ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW9" ] && break; sleep 0.1; done
+[ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW9" ] || fail "o2 did not catch up after reconnecting"
+[ "$(cat "$T/o2/signing-keys/$SDFP.gen")" = 2 ] || fail "o2 has the wrong generation after catching up"
+$B/oasa-pair command --dir "$T/o2" --to udpout:127.0.0.1:14640 --wait 10 >/dev/null || fail "o2's caught-up key does not work"
+$CHECK check "$T/sdB.log" && $CHECK check "$T/o2l.log" && $CHECK check "$T/o2l2.log" || fail "rotation log lines are not the agreed JSON"
+[ "$(stat -c %a "$T/o2/signing-keys/$SDFP.bin")" = 600 ] && [ "$(stat -c %a "$T/sd/mavlink-signing-ts" 2>/dev/null || echo 600)" = 600 ] || fail "key files are not owner-only"
+kill -TERM "$SDB" "$O2L" "$O1L" "$SIGNER8" 2>/dev/null || true
+pass "a reconnecting operator catches up to the current key and generation"
+
 echo "All link end-to-end checks passed."
