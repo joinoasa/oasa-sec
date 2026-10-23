@@ -55,7 +55,17 @@ MAVLink 2 signing proves who sent a message but doesn't hide it, so OASA only us
 - The first ground station to pair makes a fresh random 32-byte key (never from a passphrase) and sends it **inside** the encrypted pairing channel. Later ground stations receive the drone's existing key the same way, so pairing a second ground station never locks out the first.
 - The drone's companion computer loads a new key into the autopilot with `SETUP_SIGNING` over its **local wired link**, never the radio. It then sends a command signed with the new key and waits for a signed, matching acknowledgment. **Only then** is the key saved and the pairing confirmed. If the autopilot didn't take it, nothing is saved on either side.
 - A drone keeps one autopilot key (`mavlink-signing-key.bin`). A ground station keeps one key per drone (`signing-keys/<fingerprint>.bin`). Both use PX4's 40-byte layout (key, then 8-byte timestamp), mode `0600`, written atomically.
-- Changing an autopilot's existing key is key rotation (R-SEC2). PX4's docs say a key change must be signed with the current key; ArduPilot's behavior here is not yet confirmed.
+- Changing an autopilot's existing key is key rotation (R-SEC2). PX4 refuses an unsigned `SETUP_SIGNING` once it has a key. ArduPilot's behavior depends on the link; see below.
+
+**Known ArduPilot behavior to design around** (checked in SITL; source `libraries/GCS_MAVLink/GCS_Signing.cpp`):
+
+- **Channel 0 (SERIAL0, normally USB) accepts unsigned messages.** ArduPilot assumes channel 0 is a trusted cable. An unsigned `SETUP_SIGNING` there replaces the key, with or without a key already set. This is ArduPilot's design: physical USB access means full control.
+- **Rule: the companion computer connects on SERIAL1 or higher.** SERIAL0 must be physically protected or unused.
+- On SERIAL1 and up, an unsigned `SETUP_SIGNING` is dropped. A signed one rotates the key (this is what R-SEC2 can build on, and why a stolen key means takeover).
+- ArduPilot ignores the target ids in `SETUP_SIGNING`; any component that receives it applies it. It refuses it only while armed.
+- Once a key is set, ArduPilot signs its outgoing frames on every link, SERIAL0 included.
+
+**PX4 behavior** (SITL): the onboard (companion) link is UDP 14580 and the GCS link 18570. Once keyed, PX4 ignores unsigned commands and refuses an unsigned `SETUP_SIGNING` on both. The key persists in `/mavlink/mavlink-signing-key.bin`, across restarts.
 
 **Known PX4 behavior to design around:** with no key yet, PX4 accepts the first `SETUP_SIGNING` unsigned on any link. Until a drone is paired, someone in radio range could set a key first. Pair before flight, and keep the radio off or the vehicle disarmed until paired. If someone did get there first, the signed check in pairing fails and nothing is saved, so the problem shows up instead of hiding.
 
@@ -65,11 +75,16 @@ MAVLink 2 signing proves who sent a message but doesn't hide it, so OASA only us
 - Secret files are refused if others can read them or if they are symlinks, but the file owner isn't checked yet.
 - The drone accepts the first ground station with the code; there's no on-drone confirm button yet.
 - One MAVLink link ID per role (ground 0, companion 1).
+- **ArduPilot timestamp window.** After a reboot, ArduPilot sets its signing timestamp to the stored one plus 60 s, so a new signed stream is refused for up to about a minute. rust-mavlink can't set an initial timestamp, so `oasa-pair command` retries for up to 75 s (`--wait`). The key check during pairing runs right after `SETUP_SIGNING`, where the window doesn't apply. PX4 has no such window.
+- If the autopilot already has a different key, or is armed, pairing fails with "no signed acknowledgment" and a list of likely causes. Nothing is saved.
 
-## 7. Not covered yet
+## 7. Tested
+
+Against real PX4 and ArduPilot (ArduCopter) in SITL: pairing, signed commands, rejection of unsigned and wrong-key commands, key persistence across restarts, and the behaviors above. Not tested: real hardware, the armed case, signed key rotation by `oasa-pair`. Details, versions and how to repeat it: [sitl.md](sitl.md).
+
+## 8. Not covered yet
 
 - Encrypting the drone link (R-COM2), key rotation and lost-device lockout (R-SEC2).
 - Pairing over the radio itself (today: TCP, so Wi-Fi, Ethernet or USB networking).
 - Hardware key storage (secure elements) and other curves.
-- Testing against PX4 and ArduPilot SITL.
 - Independent review. Required before this moves past Draft.

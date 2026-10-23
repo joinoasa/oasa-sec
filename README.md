@@ -21,7 +21,7 @@ pip install pymavlink
 scripts/e2e.sh
 ```
 
-That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 13 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved.
+That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 14 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved (with a message naming the likely causes), and `command` keeps trying when the autopilot answers late.
 
 By hand:
 
@@ -35,6 +35,10 @@ $B/oasa-pair command --dir /tmp/gcs --to udpout:127.0.0.1:14540
 ```
 
 Run `oasa-pair --help` for every command.
+
+## Test against a real autopilot (SITL)
+
+`scripts/sitl/px4-sitl-test.sh` and `scripts/sitl/ardupilot-sitl-test.sh` pair with a real PX4 or ArduPilot simulator and check that signed commands work and unsigned or wrong-key ones don't. They aren't in CI (the builds take 20+ minutes). See [docs/sitl.md](docs/sitl.md). With ArduPilot, connect the companion computer on SERIAL1 or higher, never SERIAL0 (see the design doc).
 
 ## Built on
 
@@ -50,7 +54,7 @@ Choices follow OASA's [adoption standard](https://joinoasa.org/docs/adopting-sof
 
 ## Next
 
-- Test against PX4 SITL and ArduPilot SITL.
+- Test on real autopilot hardware (PX4 and ArduPilot SITL already pass: [docs/sitl.md](docs/sitl.md)).
 - An on-drone confirm button, and checking key file ownership.
 - R-COM2: encrypt the drone link with these identities.
 - R-SEC2: key rotation and lost-device lockout.

@@ -125,6 +125,16 @@ $B/oasa-pair command --dir "$T/gcs" --to udpout:127.0.0.1:14541 >/dev/null || fa
 wait "$PY_AP" || fail "pymavlink rejected our signature"
 pass "pymavlink verifies our signatures, and we verify its ACK"
 
+# The autopilot may answer late (ArduPilot refuses signed commands for up to a minute after a
+# reboot): command keeps trying, says so after a few seconds, and succeeds once it answers.
+$B/oasa-pair command --dir "$T/gcs" --to udpout:127.0.0.1:14542 --wait 40 > "$T/late.log" 2>&1 & LATE=$!
+sleep 7
+$PY autopilot "$GKEY" 14542 > "$T/py-late.log" 2>&1 & PY_LATE=$!
+wait "$LATE" || fail "command gave up before the late autopilot answered"
+wait "$PY_LATE" || fail "late pymavlink autopilot rejected our signature"
+grep -q "Still trying" "$T/late.log" || fail "command did not say it was still trying"
+pass "command keeps trying until a late autopilot answers"
+
 # --- 3. A second ground station joins ------------------------------------
 start_drone "$T/drone" drone-1 "$T/drone2.log" --autopilot udpout:127.0.0.1:14540
 echo "$CODE" | $B/oasa-pair ground --dir "$T/gcs2" --name gcs-2 --connect 127.0.0.1:7400 --code - >/dev/null \
@@ -143,6 +153,7 @@ echo "$CODE" | $B/oasa-pair ground --dir "$T/gcs" --name gcs-1 --connect 127.0.0
 kill "$DRONE" 2>/dev/null || true; wait "$DRONE" 2>/dev/null || true
 [ -e "$T/drone-b/mavlink-signing-key.bin" ] && fail "drone saved a key the autopilot doesn't have"
 ls "$T/gcs/signing-keys" | grep -qv "$DRONE_FP" && fail "ground station saved a key for the failed drone"
+grep -q "Likely causes" "$T/drone-b.log" || fail "the failure did not name its likely causes"
 pass "a key the autopilot didn't accept is never saved on either side"
 
 # --- 5. File permissions -------------------------------------------------

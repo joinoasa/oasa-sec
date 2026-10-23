@@ -29,7 +29,7 @@ USAGE:
   oasa-pair peers    --dir DIR
   oasa-pair remove   --dir DIR FINGERPRINT
   oasa-pair command  --dir DIR --to MAVLINK_ADDR [--peer NAME|FINGERPRINT]
-                     [--target SYS:COMP] [--link-id N]
+                     [--target SYS:COMP] [--link-id N] [--wait SECONDS]
 
   init      Make this device's identity (once per device) and print its fingerprint.
   drone     Show a one-time pairing code (text and QR) and wait for a ground station
@@ -48,6 +48,9 @@ USAGE:
   command   Send one signed test command (request AUTOPILOT_VERSION) and wait for
             a signed, matching acknowledgment. On a ground station, --peer picks
             which drone's key to use (optional if only one is paired).
+            Retries every second for up to --wait seconds (default 75). That long
+            because ArduPilot refuses new signed streams for up to a minute after
+            it reboots; PX4 answers at once.
 
 MAVLINK_ADDR uses the rust-mavlink format: udpout:HOST:PORT, udpin:HOST:PORT,
 tcpout:HOST:PORT, serial:PORT:BAUD.
@@ -196,7 +199,9 @@ fn install_key(o: &Opts, key: &SigningKey, key_path: &Path) -> oasa_sec::Result<
             conn.setup_signing(Some(key.mavlink_config(COMPANION_LINK_ID)));
             // The autopilot needs a moment to switch; then prove the key works.
             std::thread::sleep(Duration::from_millis(200));
-            signed_round_trip(conn, companion_header(sys), sys, comp)?;
+            // Right after SETUP_SIGNING ArduPilot's restart window doesn't apply,
+            // so a short wait is enough.
+            signed_round_trip(conn, companion_header(sys), sys, comp, INSTALL_WAIT, false)?;
             Ok(())
         })()
         .map_err(to_err)?;
@@ -301,7 +306,15 @@ fn command(o: &Opts) -> R {
     let mut conn = mavlink::connect::<MavMessage>(o.req("to")?)?;
     conn.set_protocol_version(mavlink::MavlinkVersion::V2);
     conn.setup_signing(Some(key.mavlink_config(link_id)));
-    signed_round_trip(conn, gcs_header(), sys, comp)?;
+    let wait = o.get("wait").map(str::parse).transpose()?.unwrap_or(75);
+    signed_round_trip(
+        conn,
+        gcs_header(),
+        sys,
+        comp,
+        Duration::from_secs(wait),
+        true,
+    )?;
     println!("Signed acknowledgment received from {sys}:{comp}: MAV_CMD_REQUEST_MESSAGE accepted.");
     Ok(())
 }
@@ -328,13 +341,34 @@ fn command_key(o: &Opts, dir: &Path) -> R<SigningKey> {
     }
 }
 
-/// Send a signed REQUEST_MESSAGE and wait for a signed COMMAND_ACK that
-/// matches it: same command, ACCEPTED, from the target.
+/// How long to wait for the check right after loading a key.
+const INSTALL_WAIT: Duration = Duration::from_secs(5);
+
+/// After this long with no reply, `command` tells the person it is still trying.
+const QUIET_HINT_AFTER: Duration = Duration::from_secs(5);
+
+/// Say why a signed command may get no reply. Never includes a key.
+fn no_ack_message(wait: Duration) -> String {
+    format!(
+        "no signed acknowledgment after {}s. Likely causes: \
+         (1) the autopilot already has a different signing key, from an earlier pairing; \
+         (2) the autopilot is armed (PX4 and ArduPilot refuse a new key while armed); \
+         (3) ArduPilot just rebooted and refuses signed commands for up to a minute; \
+         (4) the wrong link or address, or the autopilot is not listening",
+        wait.as_secs()
+    )
+}
+
+/// Send a signed REQUEST_MESSAGE once a second for up to `wait`, and stop at
+/// a signed COMMAND_ACK that matches it: same command, ACCEPTED, from the
+/// target. With `hint`, say once after a few quiet seconds that we are still trying.
 fn signed_round_trip(
     conn: impl MavConnection<MavMessage> + 'static,
     header: MavHeader,
     sys: u8,
     comp: u8,
+    wait: Duration,
+    hint: bool,
 ) -> R {
     let req = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
         param1: 148.0, // AUTOPILOT_VERSION message id
@@ -366,6 +400,14 @@ fn signed_round_trip(
                     return;
                 }
                 Ok(_) => {}
+                // TCP links time out reads when idle; that is not a failure.
+                Err(mavlink::error::MessageReadError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => {
                     let _ = tx.send(Err(e.to_string()));
                     return;
@@ -373,7 +415,9 @@ fn signed_round_trip(
             }
         }
     });
-    for _ in 0..5 {
+    let start = Instant::now();
+    let mut hinted = false;
+    loop {
         conn.send(&header, &req)?;
         if let Ok(r) = rx.recv_timeout(Duration::from_secs(1)) {
             return match r? {
@@ -381,8 +425,17 @@ fn signed_round_trip(
                 other => Err(format!("command was refused: {other:?}").into()),
             };
         }
+        let spent = start.elapsed();
+        if spent >= wait {
+            return Err(no_ack_message(wait).into());
+        }
+        if hint && !hinted && spent >= QUIET_HINT_AFTER {
+            hinted = true;
+            eprintln!(
+                "no reply yet; if the autopilot just rebooted, ArduPilot refuses signed commands for up to a minute. Still trying..."
+            );
+        }
     }
-    Err("no signed acknowledgment (wrong key, or autopilot not listening)".into())
 }
 
 fn gcs_header() -> MavHeader {
