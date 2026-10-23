@@ -142,16 +142,21 @@ Why FTP matters: any peer that can send signed FTP can read the key out of the d
 | Signing parameters? | No parameter has `SIGN` in its name apart from the unrelated `SIM_ARSPD_SIGN`. But **`MAV<n>_OPTIONS` bit 0 turns signing off for that link**: in the code (`GCS_MAVLINK::load_signing_key`) the bit is `MAVLINK2_SIGNING_DISABLED`, although the parameter text says "Accept unsigned MAVLink2 messages". Signed `PARAM_SET` of `MAV2_OPTIONS` and `MAV3_OPTIONS` to 1 had no effect at once; after a restart, unsigned commands were acknowledged on SERIAL1 and SERIAL2. (`MAV1_OPTIONS` alone changed nothing on those two ports; `MAV_OPTIONS` is a different setting.) It also takes effect at the next key load. |
 | FTP? | Not tested. ArduPilot keeps its key in storage, not in a file. |
 
-### The guard's block list
+### The guard: an allowlist
 
-From these results:
+The first version of the guard was a block list built from the results above. It is now an **allowlist** (2026-10-23): a block list only stops what we thought of, and every other message, command or parameter reaches the autopilot. The tables are in the [link doc](oasa-sec-v0-link.md) section 7. In short:
 
-| Block | Because |
+| Rule | Because |
 |---|---|
-| `SETUP_SIGNING` (256) | Both autopilots take a signed one: it replaces the key, and an all-zero one turns signing off |
-| `FILE_TRANSFER_PROTOCOL` (110), unless `--allow-mavlink-ftp` | PX4 FTP reads and replaces the key file |
-| `PARAM_SET` (23) and `PARAM_EXT_SET` (323) for names starting `MAV_SIGN`, or `MAV<n>_OPTIONS` | `MAV<n>_OPTIONS` turns ArduPilot signing off after a restart. PX4 has no signing parameter; `MAV_SIGN` stays for a future one |
+| `SETUP_SIGNING` (256) is always dropped | Both autopilots take a signed one: it replaces the key, and an all-zero one turns signing off |
+| `FILE_TRANSFER_PROTOCOL` (110) dropped, unless `--allow-mavlink-ftp` | PX4 FTP reads and replaces the key file |
+| `PARAM_SET` (23) and `PARAM_EXT_SET` (323) dropped, unless `--allow-param NAME` | `MAV<n>_OPTIONS` turns ArduPilot signing off after a restart, and any parameter can change what the vehicle does. Names starting `MAV_SIGN` or `MAV<n>_OPTIONS` can never be allowed |
+| Messages not in the default list dropped (`--allow-msg ID` widens) | A ground station needs a small set to monitor and fly |
+| Commands not in the default list dropped (`--allow-command ID` widens) | `COMMAND_LONG`, `COMMAND_INT` and mission items can reboot, calibrate, write storage, move servos or terminate flight |
+| Every allowed frame's CRC is checked | A frame with a wrong CRC is dropped, so what the guard read is what the autopilot reads |
 
-Both autopilots refuse key changes while armed, so the guard's job is the disarmed case (and a drone on the ground is where an attacker would try it).
+Both autopilots refuse key changes while armed, so the key rules matter on the ground. The other rules apply in flight too.
 
-Not covered by the guard: `MAV_CMD_PREFLIGHT_STORAGE` (resets parameters on ArduPilot), reboot commands, or other writes that need full command inspection. They need the key and the link, like any other command.
+Checked: the lab suite `l1-mavlink-sitl` flies both autopilots through the tunnel with the default allowlist (arm, takeoff, hold, mission upload and run, RTL, land) and repeats each drop case. `tests/interop/mavguard_diff.py` compares the guard with pymavlink on every message of the common dialect plus damaged and batched datagrams: where the guard passes a datagram, pymavlink reads the same frame boundaries and ids. `cargo mutants` on `src/mavguard.rs` (not in CI): 109 mutants, 102 caught, 2 unviable, 5 missed. The 5 are equivalent: `<` against `<=` on a header-length guard whose next check fails the same way, and `|` against `^` where the bits never overlap.
+
+Still possible with the default list: `SET_MODE`, `RC_CHANNELS_OVERRIDE`, `MANUAL_CONTROL` and offboard setpoints steer the vehicle. That is what a paired ground station is for. Signing keys and the pairing decide who may send them; the guard only limits what the paired station can ask for.
