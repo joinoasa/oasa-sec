@@ -13,7 +13,7 @@ use std::time::Duration;
 use oasa_sec::identity::Identity;
 use oasa_sec::link::{
     Config, CounterLen, DropReason, Entropy, Event, Link, MemoryTimestampStore, SendError,
-    data_overhead,
+    SourceLimiter, data_overhead, looks_like_handshake1,
 };
 
 /// splitmix64: small, fast, good enough for test randomness.
@@ -591,14 +591,14 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
     let hs1_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 113)
+        .find(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 119)
         .unwrap()
         .1
         .clone();
     let hs2_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 57)
+        .find(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 55)
         .unwrap()
         .1
         .clone();
@@ -612,7 +612,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs1s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 113)
+                .filter(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 119)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs1s {
@@ -630,7 +630,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs2s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 57)
+                .filter(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 55)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs2s {
@@ -809,24 +809,26 @@ fn a_blackout_over_32768_packets_stops_the_short_counter_until_rekey() {
 fn forged_handshake_2_does_not_spoil_the_real_one() {
     let mut sim = Sim::new(21, config(CounterLen::Short), Channel::clean());
     sim.start();
-    // Hold B's answer in the queue; forge one meanwhile with A's real index.
-    let hs1 = sim
-        .wire
-        .iter()
-        .find(|(to, _)| *to == Side::B)
-        .unwrap()
-        .1
-        .clone();
-    let a_index = u16::from_be_bytes([hs1[1], hs1[2]]);
-    let mut forged = vec![0x20u8, 0x12, 0x34];
-    forged.extend_from_slice(&a_index.to_be_bytes());
+    // B's answer is still in the queue. An attacker who cannot see A's
+    // index tries every one with random Noise bytes: exactly one routes to
+    // A's handshake and fails its tag, and A's state survives that.
     let mut r = Rng(1);
-    let mut noise = [0u8; 52];
-    r.fill(&mut noise);
-    forged.extend_from_slice(&noise);
-    assert_eq!(forged.len(), 57);
-    let ev = sim.inject(Side::A, &forged);
-    assert!(ev.contains(&Event::Dropped(DropReason::BadTag)));
+    let (mut bad_tag, mut unknown) = (0, 0);
+    for idx in 0..=u16::MAX {
+        let mut forged = vec![0x20u8];
+        forged.extend_from_slice(&idx.to_be_bytes());
+        let mut noise = [0u8; 52];
+        r.fill(&mut noise);
+        forged.extend_from_slice(&noise);
+        assert_eq!(forged.len(), 55);
+        let ev = sim.inject(Side::A, &forged);
+        if ev.contains(&Event::Dropped(DropReason::BadTag)) {
+            bad_tag += 1;
+        } else if ev.contains(&Event::Dropped(DropReason::UnknownIndex)) {
+            unknown += 1;
+        }
+    }
+    assert_eq!((bad_tag, unknown), (1, 65_535));
     assert_eq!(sim.logs[&Side::A].replies_to_injected, 0);
     // The real exchange still completes.
     sim.run(Duration::from_secs(5), ms(10), ms(100), |_| {});
@@ -885,7 +887,7 @@ fn sizes_on_the_wire_match_the_spec() {
             .filter(|(_, p)| p[0] == 0x10 || p[0] == 0x20)
             .map(|(_, p)| p.len())
             .collect();
-        assert_eq!(handshakes, vec![113, 57]);
+        assert_eq!(handshakes, vec![119, 55]);
         let min_data = sim
             .wire
             .iter()
@@ -933,6 +935,69 @@ fn a_handshake_2_changed_on_the_way_costs_seconds_not_minutes() {
             Duration::from_secs(90),
         );
         assert!(gap < 1.0, "seed {seed}: {gap}");
-        assert!(sim.stats(Side::A).dropped(DropReason::BadHeader) >= 1);
+        assert!(sim.stats(Side::A).dropped(DropReason::UnknownIndex) >= 1);
     }
+}
+
+/// A genuine peer rekeys every 5 s while an attacker floods the responder
+/// with junk handshake 1 packets and replays of a recorded real one, 50 a
+/// second each. Returns (rekeys at the initiator, rate_limited at the
+/// responder, mac1 junk drops at the responder).
+fn handshake_flood(use_source_limit: bool) -> (usize, u64, u64) {
+    let mut cfg = config(CounterLen::Short);
+    cfg.rekey_after = Duration::from_secs(5);
+    cfg.reject_after = Duration::from_secs(60);
+    let mut sim = Sim::new(77, cfg, Channel::clean());
+    sim.start();
+    sim.run(Duration::from_secs(1), ms(10), ms(100), |_| {});
+    let recorded = sim
+        .wire
+        .iter()
+        .find(|(to, p)| *to == Side::B && looks_like_handshake1(p))
+        .unwrap()
+        .1
+        .clone();
+    let mut limiter = SourceLimiter::new(5);
+    let junk_before = sim.stats(Side::B).dropped(DropReason::BadHeader);
+    let mut tick = 0u64;
+    sim.run(Duration::from_secs(30), ms(10), ms(100), |s| {
+        tick += 1;
+        if !tick.is_multiple_of(2) {
+            return; // 50 a second each: one of each every other 10 ms tick
+        }
+        // Junk: right size and header, wrong mac1. From address Y.
+        let mut junk = vec![0u8; recorded.len()];
+        s.rng.fill(&mut junk);
+        junk[0] = 0x10;
+        s.inject(Side::B, &junk);
+        // A recorded real handshake 1, replayed from address Z.
+        if !use_source_limit || limiter.allow(s.now, "Z") {
+            s.inject(Side::B, &recorded);
+        }
+    });
+    sim.drain();
+    sim.check_delivery_integrity();
+    let b = sim.stats(Side::B);
+    assert_eq!(sim.logs[&Side::B].replies_to_injected, 0);
+    (
+        rekeys(&sim, Side::A),
+        b.dropped(DropReason::RateLimited),
+        b.dropped(DropReason::BadHeader) - junk_before,
+    )
+}
+
+#[test]
+fn junk_and_replayed_handshakes_do_not_stop_a_genuine_peer() {
+    let (rekeys_a, limited, junk) = handshake_flood(true);
+    // 30 s at one rekey every ~5 s.
+    assert!(rekeys_a >= 5, "rekeys {rekeys_a}");
+    assert_eq!(limited, 0, "the genuine peer was never rate limited");
+    assert!(junk >= 1400, "the junk was thrown away by mac1: {junk}");
+}
+
+#[test]
+fn without_the_per_source_limit_replays_do_starve_the_budget() {
+    // Shows why the per-address limit exists, and that the test above bites.
+    let (_, limited, _) = handshake_flood(false);
+    assert!(limited > 100, "limited {limited}");
 }

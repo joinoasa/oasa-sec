@@ -50,6 +50,8 @@ pub type PeerEvents = Vec<(Option<PeerId>, Event)>;
 struct Shared {
     private: Zeroizing<[u8; 32]>,
     public: [u8; 32],
+    /// Key for checking `mac1` on handshake 1 packets sent to us.
+    mac1_key: [u8; 32],
     cfg: Config,
     rng: Box<dyn Entropy>,
     wall_base: Duration,
@@ -148,6 +150,7 @@ impl Endpoint {
             sh: Shared {
                 private: private_copy(identity),
                 public: *identity.public_key(),
+                mac1_key: packet::mac1_key(identity.public_key()),
                 cfg: config,
                 rng: entropy,
                 wall_base,
@@ -208,7 +211,7 @@ impl Endpoint {
         self.peers.get(id.0).and_then(Option::as_ref)
     }
 
-    fn live_indexes(&self) -> Vec<u16> {
+    pub(crate) fn live_indexes(&self) -> Vec<u16> {
         let mut v = Vec::new();
         for p in self.peers.iter().flatten() {
             v.extend(p.hs.iter().map(|h| h.local_index));
@@ -250,14 +253,12 @@ impl Endpoint {
             }
         };
         match parsed {
-            Packet::Handshake1 { sender, noise } => {
-                self.on_handshake1(now, sender, noise, &mut out)
-            }
-            Packet::Handshake2 {
-                sender,
-                receiver,
+            Packet::Handshake1 {
+                signed,
                 noise,
-            } => {
+                mac1,
+            } => self.on_handshake1(now, signed, mac1, noise, &mut out),
+            Packet::Handshake2 { receiver, noise } => {
                 let found = self.peers.iter().position(|p| {
                     p.as_ref()
                         .is_some_and(|p| p.hs.as_ref().is_some_and(|h| h.local_index == receiver))
@@ -266,7 +267,7 @@ impl Endpoint {
                     Some(i) => {
                         let mut ev = Vec::new();
                         let peer = self.peers[i].as_mut().expect("found above");
-                        peer.on_handshake2(&mut self.sh, now, sender, noise, &mut ev);
+                        peer.on_handshake2(&mut self.sh, now, noise, &mut ev);
                         out.extend(ev.into_iter().map(|e| (Some(PeerId(i)), e)));
                     }
                     None => self.drop_packet(DropReason::UnknownIndex, &mut out),
@@ -304,9 +305,22 @@ impl Endpoint {
         out
     }
 
-    fn on_handshake1(&mut self, now: Duration, sender: u16, noise: &[u8], out: &mut PeerEvents) {
-        // Cheap checks are done (header, size). Now the only expensive step,
-        // so the global limit comes first.
+    fn on_handshake1(
+        &mut self,
+        now: Duration,
+        signed: &[u8],
+        mac1: &[u8],
+        noise: &[u8],
+        out: &mut PeerEvents,
+    ) {
+        // Cheapest check first: random junk must not use up the handshake
+        // budget, so mac1 comes before the global limit.
+        if !packet::mac1_ok(&self.sh.mac1_key, signed, mac1) {
+            self.drop_packet(DropReason::BadHeader, out);
+            return;
+        }
+        // Next, the only expensive step is the X25519 read, so the global
+        // limit comes before it.
         if !self.sh.limiter.allow(now) {
             self.drop_packet(DropReason::RateLimited, out);
             return;
@@ -344,16 +358,15 @@ impl Endpoint {
             self.drop_packet(DropReason::UntrustedPeer, out);
             return;
         };
-        // Payload: 12-byte timestamp, then the initiator's index, which must
-        // be the one in the clear header. Checked before anything is recorded.
+        // Payload: 12-byte timestamp, then the initiator's index.
         let parsed = (n == Timestamp::LEN + 2)
             .then(|| Timestamp::from_bytes(&payload[..Timestamp::LEN]))
-            .flatten()
-            .filter(|_| u16::from_be_bytes([payload[12], payload[13]]) == sender);
+            .flatten();
         let Some(ts) = parsed else {
             self.drop_packet(DropReason::BadHeader, out);
             return;
         };
+        let sender = u16::from_be_bytes([payload[Timestamp::LEN], payload[Timestamp::LEN + 1]]);
         let taken = self.live_indexes();
         let mut ev = Vec::new();
         let peer = self.peers[i].as_mut().expect("found above");
@@ -469,7 +482,7 @@ impl PeerLink {
         next.sent = Some(ts);
         self.store.save(&next)?;
         self.stamps = next;
-        let packet = packet::encode_handshake1(index, &buf[..n]);
+        let packet = packet::encode_handshake1(&self.public, &buf[..n]);
         self.hs = Some(InFlight {
             state: hs,
             local_index: index,
@@ -553,7 +566,7 @@ impl PeerLink {
         // Replaces an older unconfirmed session, if any.
         self.pending = Some(Session::new(transport, index, remote_index, false, now));
         out.push(Event::Send {
-            packet: packet::encode_handshake2(index, remote_index, &buf[..n]),
+            packet: packet::encode_handshake2(remote_index, &buf[..n]),
             to: Dest::Source,
         });
     }
@@ -562,7 +575,6 @@ impl PeerLink {
         &mut self,
         sh: &mut Shared,
         now: Duration,
-        remote_index: u16,
         noise: &[u8],
         out: &mut Vec<Event>,
     ) {
@@ -573,17 +585,16 @@ impl PeerLink {
         };
         let mut payload = [0u8; 32];
         match f.state.read_message(noise, &mut payload) {
-            // Payload: the responder's index, then ours. Both must equal the
-            // ones in the clear header (the receiver index is what routed
-            // the packet here).
+            // Payload: the responder's index, then ours. The receiver index
+            // in the clear header only found this handshake; it must be the
+            // same one inside.
             Ok(4)
                 if f.state.is_handshake_finished()
-                    && u16::from_be_bytes([payload[0], payload[1]]) == remote_index
                     && u16::from_be_bytes([payload[2], payload[3]]) == f.local_index => {}
             Ok(_) => {
-                // Authentic Noise but the clear indexes were changed (or the
-                // payload is wrong). snow has used up this handshake, so the
-                // retry timer starts a new one; nothing was installed.
+                // Authentic Noise but a payload that is not what the spec says
+                // (cannot come from a correct peer). snow has used up this
+                // handshake, so the retry timer starts a new one.
                 self.hs = Some(f);
                 sh.stats.count_drop(DropReason::BadHeader);
                 out.push(Event::Dropped(DropReason::BadHeader));
@@ -606,6 +617,7 @@ impl PeerLink {
             }
         };
         sh.stats.handshakes_completed += 1;
+        let remote_index = u16::from_be_bytes([payload[0], payload[1]]);
         let session = Session::new(transport, f.local_index, remote_index, true, now);
         let rekey = self.install_current(session, now, true);
         out.push(Event::SessionEstablished {

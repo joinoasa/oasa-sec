@@ -15,13 +15,15 @@ pub const TAG_LEN: usize = 16;
 
 /// Noise message 1: 32 (e) + 48 (encrypted s) + 14 + 16 (encrypted timestamp and sender index).
 const NOISE1_LEN: usize = 110;
+/// The cheap pre-check at the end of handshake 1 (see [`mac1`]).
+pub const MAC1_LEN: usize = 8;
 /// Noise message 2: 32 (e) + 4 + 16 (encrypted sender and receiver index).
 const NOISE2_LEN: usize = 52;
 
-/// Handshake 1 on the wire: header, sender index, Noise message 1.
-pub const HANDSHAKE1_LEN: usize = 1 + 2 + NOISE1_LEN;
-/// Handshake 2 on the wire: header, two indexes, Noise message 2.
-pub const HANDSHAKE2_LEN: usize = 1 + 2 + 2 + NOISE2_LEN;
+/// Handshake 1 on the wire: header, Noise message 1, mac1.
+pub const HANDSHAKE1_LEN: usize = 1 + NOISE1_LEN + MAC1_LEN;
+/// Handshake 2 on the wire: header, receiver index, Noise message 2.
+pub const HANDSHAKE2_LEN: usize = 1 + 2 + NOISE2_LEN;
 
 /// How many low bytes of the 64-bit counter a data packet carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,11 +65,14 @@ pub fn data_overhead(len: CounterLen) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Packet<'a> {
     Handshake1 {
-        sender: u16,
+        /// Header byte and Noise message: what `mac1` covers.
+        signed: &'a [u8],
         noise: &'a [u8],
+        mac1: &'a [u8],
     },
     Handshake2 {
-        sender: u16,
+        /// Only used to find the handshake; the same index is inside the
+        /// encrypted payload and must match.
         receiver: u16,
         noise: &'a [u8],
     },
@@ -100,8 +105,9 @@ pub fn parse(buf: &[u8], mtu: usize) -> Result<Packet<'_>, DropReason> {
                 return Err(bad);
             }
             Ok(Packet::Handshake1 {
-                sender: u16::from_be_bytes([rest[0], rest[1]]),
-                noise: &rest[2..],
+                signed: &buf[..1 + NOISE1_LEN],
+                noise: &rest[..NOISE1_LEN],
+                mac1: &rest[NOISE1_LEN..],
             })
         }
         TYPE_HANDSHAKE2 => {
@@ -109,9 +115,8 @@ pub fn parse(buf: &[u8], mtu: usize) -> Result<Packet<'_>, DropReason> {
                 return Err(bad);
             }
             Ok(Packet::Handshake2 {
-                sender: u16::from_be_bytes([rest[0], rest[1]]),
-                receiver: u16::from_be_bytes([rest[2], rest[3]]),
-                noise: &rest[4..],
+                receiver: u16::from_be_bytes([rest[0], rest[1]]),
+                noise: &rest[2..],
             })
         }
         TYPE_DATA => {
@@ -142,23 +147,58 @@ fn header(kind: u8, long: bool) -> u8 {
     (kind << 4) | (u8::from(long) << 3) | VERSION
 }
 
-pub(crate) fn encode_handshake1(sender: u16, noise: &[u8]) -> Vec<u8> {
+/// Handshake 1 with its `mac1`, made for a responder with public key
+/// `responder_public`.
+pub(crate) fn encode_handshake1(responder_public: &[u8; 32], noise: &[u8]) -> Vec<u8> {
     debug_assert_eq!(noise.len(), NOISE1_LEN);
     let mut v = Vec::with_capacity(HANDSHAKE1_LEN);
     v.push(header(TYPE_HANDSHAKE1, false));
-    v.extend_from_slice(&sender.to_be_bytes());
+    v.extend_from_slice(noise);
+    let tag = mac1(&mac1_key(responder_public), &v);
+    v.extend_from_slice(&tag);
+    v
+}
+
+pub(crate) fn encode_handshake2(receiver: u16, noise: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(noise.len(), NOISE2_LEN);
+    let mut v = Vec::with_capacity(HANDSHAKE2_LEN);
+    v.push(header(TYPE_HANDSHAKE2, false));
+    v.extend_from_slice(&receiver.to_be_bytes());
     v.extend_from_slice(noise);
     v
 }
 
-pub(crate) fn encode_handshake2(sender: u16, receiver: u16, noise: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(noise.len(), NOISE2_LEN);
-    let mut v = Vec::with_capacity(HANDSHAKE2_LEN);
-    v.push(header(TYPE_HANDSHAKE2, false));
-    v.extend_from_slice(&sender.to_be_bytes());
-    v.extend_from_slice(&receiver.to_be_bytes());
-    v.extend_from_slice(noise);
-    v
+/// Key for `mac1`: BLAKE2s-256 of a label and the responder's public key.
+/// Anyone who knows the public key can make a valid `mac1`, so it proves
+/// nothing about the sender. It only lets a responder throw away random junk
+/// before spending any X25519 work or any of its handshake budget.
+pub(crate) fn mac1_key(responder_public: &[u8; 32]) -> [u8; 32] {
+    use blake2::{Blake2s256, Digest};
+    let mut h = Blake2s256::new();
+    h.update(b"OASA-SEC v0 mac1");
+    h.update(responder_public);
+    h.finalize().into()
+}
+
+/// First 8 bytes of keyed BLAKE2s over everything in handshake 1 before the
+/// `mac1` field. Truncating is fine here: the Noise tags inside stay full
+/// length, and this is a filter, not authentication.
+pub(crate) fn mac1(key: &[u8; 32], msg: &[u8]) -> [u8; MAC1_LEN] {
+    use blake2::Blake2sMac256;
+    use blake2::digest::{FixedOutput, Update};
+    let mut m = Blake2sMac256::new_with_salt_and_personal(Some(key), &[], &[])
+        .expect("32 bytes is a valid BLAKE2s key");
+    m.update(msg);
+    let full = m.finalize_fixed();
+    let mut out = [0u8; MAC1_LEN];
+    out.copy_from_slice(&full[..MAC1_LEN]);
+    out
+}
+
+/// Constant-time check of a received `mac1`.
+pub(crate) fn mac1_ok(key: &[u8; 32], msg: &[u8], got: &[u8]) -> bool {
+    let want = mac1(key, msg);
+    got.len() == MAC1_LEN && want.iter().zip(got).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
 }
 
 /// The start of a data packet: header, receiver index, low counter bytes.
@@ -179,8 +219,8 @@ mod tests {
 
     #[test]
     fn sizes_match_the_spec() {
-        assert_eq!(HANDSHAKE1_LEN, 113);
-        assert_eq!(HANDSHAKE2_LEN, 57);
+        assert_eq!(HANDSHAKE1_LEN, 119);
+        assert_eq!(HANDSHAKE2_LEN, 55);
         assert_eq!(data_overhead(CounterLen::Short), 21);
         assert_eq!(data_overhead(CounterLen::Long), 23);
     }
@@ -212,22 +252,33 @@ mod tests {
 
     #[test]
     fn handshakes_round_trip() {
-        let p = encode_handshake1(0x0102, &[9u8; NOISE1_LEN]);
-        assert_eq!(p.len(), 113);
-        assert_eq!(
-            parse(&p, MTU).unwrap(),
+        let key = [7u8; 32];
+        let p = encode_handshake1(&key, &[9u8; NOISE1_LEN]);
+        assert_eq!(p.len(), 119);
+        match parse(&p, MTU).unwrap() {
             Packet::Handshake1 {
-                sender: 0x0102,
-                noise: &[9u8; NOISE1_LEN]
+                signed,
+                noise,
+                mac1: m,
+            } => {
+                assert_eq!(noise, &[9u8; NOISE1_LEN]);
+                assert_eq!(signed, &p[..111]);
+                assert!(mac1_ok(&mac1_key(&key), signed, m));
+                // Wrong responder key, or any changed byte, fails the check.
+                assert!(!mac1_ok(&mac1_key(&[8u8; 32]), signed, m));
+                let mut other = signed.to_vec();
+                other[5] ^= 1;
+                assert!(!mac1_ok(&mac1_key(&key), &other, m));
+                assert!(!mac1_ok(&mac1_key(&key), signed, &m[..7]));
             }
-        );
-        let p = encode_handshake2(1, 2, &[5u8; NOISE2_LEN]);
-        assert_eq!(p.len(), 57);
+            other => panic!("{other:?}"),
+        }
+        let p = encode_handshake2(0x0102, &[5u8; NOISE2_LEN]);
+        assert_eq!(p.len(), 55);
         assert_eq!(
             parse(&p, MTU).unwrap(),
             Packet::Handshake2 {
-                sender: 1,
-                receiver: 2,
+                receiver: 0x0102,
                 noise: &[5u8; NOISE2_LEN]
             }
         );
@@ -255,13 +306,13 @@ mod tests {
             p.extend_from_slice(&[0u8; 120]);
             assert!(parse(&p, MTU).is_err());
         }
-        let mut hs1 = encode_handshake1(1, &[0; NOISE1_LEN]);
+        let mut hs1 = encode_handshake1(&[1; 32], &[0; NOISE1_LEN]);
         hs1[0] |= 0x08;
         assert!(parse(&hs1, MTU).is_err());
         // Wrong version on each type.
         for p in [
-            encode_handshake1(1, &[0; NOISE1_LEN]),
-            encode_handshake2(1, 2, &[0; NOISE2_LEN]),
+            encode_handshake1(&[1; 32], &[0; NOISE1_LEN]),
+            encode_handshake2(2, &[0; NOISE2_LEN]),
             ok.clone(),
         ] {
             for v in 1..8u8 {
@@ -275,8 +326,8 @@ mod tests {
     #[test]
     fn short_long_and_oversized_packets_are_rejected() {
         assert!(parse(&[], MTU).is_err());
-        let hs1 = encode_handshake1(1, &[0; NOISE1_LEN]);
-        let hs2 = encode_handshake2(1, 2, &[0; NOISE2_LEN]);
+        let hs1 = encode_handshake1(&[1; 32], &[0; NOISE1_LEN]);
+        let hs2 = encode_handshake2(2, &[0; NOISE2_LEN]);
         for n in 0..hs1.len() {
             assert!(parse(&hs1[..n], MTU).is_err(), "hs1 cut to {n}");
         }

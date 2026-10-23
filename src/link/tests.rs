@@ -104,10 +104,10 @@ pub(super) fn established(cfg: Config) -> (Pair, Duration) {
     let now = ms(10);
     let ev = p.a.start_handshake(now).unwrap();
     let hs1 = sends(&ev).remove(0);
-    assert_eq!(hs1.len(), 113);
+    assert_eq!(hs1.len(), 119);
     let ev = p.b.handle_packet(now, &hs1);
     let hs2 = sends(&ev).remove(0);
-    assert_eq!(hs2.len(), 57);
+    assert_eq!(hs2.len(), 55);
     let ev = p.a.handle_packet(now, &hs2);
     assert!(ev.contains(&Event::SessionEstablished {
         initiator: true,
@@ -545,7 +545,7 @@ fn only_the_initiator_rekeys_and_only_when_due() {
         retry: false,
         rekey: true
     }));
-    assert_eq!(sends(&ev)[0].len(), 113);
+    assert_eq!(sends(&ev)[0].len(), 119);
 }
 
 #[test]
@@ -891,12 +891,12 @@ fn indexes_never_collide_with_live_ones() {
     let b = g
         .add_peer([2; 32], Box::new(MemoryTimestampStore::default()))
         .unwrap();
-    let ev1 = g.start_handshake(a, ms(1)).unwrap();
-    let ev2 = g.start_handshake(b, ms(1)).unwrap();
-    let i1 = u16::from_be_bytes([sends(&ev1)[0][1], sends(&ev1)[0][2]]);
-    let i2 = u16::from_be_bytes([sends(&ev2)[0][1], sends(&ev2)[0][2]]);
-    assert_eq!(i1, 7);
-    assert_ne!(i2, 7);
+    g.start_handshake(a, ms(1)).unwrap();
+    assert_eq!(g.live_indexes(), vec![7]);
+    g.start_handshake(b, ms(1)).unwrap();
+    let live = g.live_indexes();
+    assert_eq!(live.len(), 2);
+    assert_ne!(live[0], live[1]);
 }
 
 #[test]
@@ -965,72 +965,107 @@ fn ciphertext_does_not_contain_the_plaintext() {
 }
 
 #[test]
-fn changed_handshake_indexes_are_refused_without_side_effects() {
-    // Handshake 1: the clear sender index must equal the encrypted one.
+fn a_changed_or_raced_handshake_2_never_spoils_the_real_one() {
+    // The clear receiver index only finds the handshake. Any change either
+    // misses it (unknown_index) or fails the Noise tag, and snow keeps the
+    // real handshake's state in both cases.
     let mut p = pair(Config::default());
     let hs1 = sends(&p.a.start_handshake(ms(0)).unwrap()).remove(0);
-    for byte in [1usize, 2] {
-        let mut bad = hs1.clone();
-        bad[byte] ^= 0x5A;
-        let ev = p.b.handle_packet(ms(0), &bad);
-        assert_eq!(drops(&ev), vec![DropReason::BadHeader]);
-        assert!(sends(&ev).is_empty());
+    let hs2 = sends(&p.b.handle_packet(ms(0), &hs1)).remove(0);
+    assert_eq!(hs2.len(), 55);
+    for byte in 1..hs2.len() {
+        for bit in 0..8 {
+            let mut bad = hs2.clone();
+            bad[byte] ^= 1 << bit;
+            let ev = p.a.handle_packet(ms(5), &bad);
+            let d = drops(&ev);
+            if byte <= 2 {
+                assert_eq!(d, vec![DropReason::UnknownIndex], "byte {byte} bit {bit}");
+            } else {
+                assert_eq!(d, vec![DropReason::BadTag], "byte {byte} bit {bit}");
+            }
+            assert!(sends(&ev).is_empty());
+            assert!(!p.a.can_send());
+        }
     }
-    // Nothing was recorded: the real one is still accepted at once (no
-    // stale timestamp, no per-peer allowance used).
-    let ev = p.b.handle_packet(ms(10), &hs1);
-    assert_eq!(sends(&ev).len(), 1);
-    assert_eq!(p.b.stats().dropped(DropReason::StaleHandshake), 0);
-    assert_eq!(p.b.stats().dropped(DropReason::RateLimited), 0);
-    let hs2 = sends(&ev).remove(0);
-
-    // Handshake 2: either clear index changed: dropped, no session.
-    for byte in [1usize, 2, 3, 4] {
-        let mut q = pair(Config::default());
-        let h1 = sends(&q.a.start_handshake(ms(0)).unwrap()).remove(0);
-        let mut h2 = sends(&q.b.handle_packet(ms(0), &h1)).remove(0);
-        h2[byte] ^= 0x5A;
-        let ev = q.a.handle_packet(ms(10), &h2);
-        let d = drops(&ev);
-        // A changed receiver index may also simply not match any handshake.
-        assert!(
-            d == vec![DropReason::BadHeader] || (byte >= 3 && d == vec![DropReason::UnknownIndex]),
-            "byte {byte}: {d:?}"
-        );
-        assert!(
-            !ev.iter()
-                .any(|e| matches!(e, Event::SessionEstablished { .. }))
-        );
-        assert!(sends(&ev).is_empty());
-        assert!(!q.a.can_send());
-    }
-    // The untouched hs2 still completes (with the first pair).
-    let ev = p.a.handle_packet(ms(20), &hs2);
+    // The genuine one, arriving after all that, still completes.
+    let ev = p.a.handle_packet(ms(10), &hs2);
     assert!(
         ev.iter()
+            .any(|e| matches!(e, Event::SessionEstablished { .. }))
+    );
+    // A header byte change is a bad header, not a spoiled handshake.
+    let mut q = pair(Config::default());
+    let h1 = sends(&q.a.start_handshake(ms(0)).unwrap()).remove(0);
+    let mut h2 = sends(&q.b.handle_packet(ms(0), &h1)).remove(0);
+    let good = h2.clone();
+    h2[0] ^= 0x01;
+    assert_eq!(
+        drops(&q.a.handle_packet(ms(1), &h2)),
+        vec![DropReason::BadHeader]
+    );
+    assert!(
+        q.a.handle_packet(ms(2), &good)
+            .iter()
             .any(|e| matches!(e, Event::SessionEstablished { .. }))
     );
 }
 
 #[test]
-fn a_changed_handshake_2_is_retried_by_the_timer() {
-    let mut p = pair(Config::default());
-    let hs1 = sends(&p.a.start_handshake(ms(0)).unwrap()).remove(0);
-    let mut hs2 = sends(&p.b.handle_packet(ms(0), &hs1)).remove(0);
-    hs2[1] ^= 0x55;
+fn a_handshake_2_routed_to_the_wrong_handshake_changes_nothing() {
+    // One endpoint with two peers and two handshakes in flight. A copy of
+    // peer 1's answer with its receiver index changed to peer 2's handshake
+    // is read by the wrong Noise state: it fails, and both stay usable.
+    let ground = Identity::generate().unwrap();
+    let (k1, k2) = (random_key(), random_key());
+    let mut g = Endpoint::new(
+        &ground,
+        Config::default(),
+        Box::new(TestRng(1)),
+        Duration::from_secs(1_000_000),
+    )
+    .unwrap();
+    let id1 = g
+        .add_peer(pub_of(&k1), Box::new(MemoryTimestampStore::default()))
+        .unwrap();
+    let id2 = g
+        .add_peer(pub_of(&k2), Box::new(MemoryTimestampStore::default()))
+        .unwrap();
+    let gpub = *ground.public_key();
+    let mk = |k: &[u8; 32], seed| {
+        link_from(
+            k,
+            gpub,
+            seed,
+            Box::new(MemoryTimestampStore::default()),
+            Duration::from_secs(1_000_000),
+        )
+    };
+    let (mut d1, mut d2) = (mk(&k1, 11), mk(&k2, 12));
+    let h_1 = sends(&g.start_handshake(id1, ms(0)).unwrap()).remove(0);
+    let before = g.live_indexes();
+    let h_2 = sends(&g.start_handshake(id2, ms(0)).unwrap()).remove(0);
+    let idx2 = *g
+        .live_indexes()
+        .iter()
+        .find(|i| !before.contains(i))
+        .unwrap();
+    let mut r1 = sends(&d1.handle_packet(ms(1), &h_1)).remove(0);
+    let r2 = sends(&d2.handle_packet(ms(1), &h_2)).remove(0);
+    let genuine1 = r1.clone();
+    r1[1..3].copy_from_slice(&idx2.to_be_bytes());
+    let ev = g.handle_packet(ms(2), &r1);
     assert_eq!(
-        drops(&p.a.handle_packet(ms(10), &hs2)),
-        vec![DropReason::BadHeader]
+        drops(&ev.into_iter().map(|(_, e)| e).collect::<Vec<_>>()),
+        vec![DropReason::BadTag]
     );
-    let hs1 = sends(&p.a.poll_timers(ms(5100))).remove(0);
-    let hs2 = sends(&p.b.handle_packet(ms(5200), &hs1)).remove(0);
-    let ka = sends(&p.a.handle_packet(ms(5300), &hs2)).remove(0);
-    p.b.handle_packet(ms(5300), &ka);
-    let data = p.a.send(ms(5400), b"through").unwrap();
-    assert_eq!(
-        delivered(&p.b.handle_packet(ms(5400), &data)),
-        vec![b"through".to_vec()]
-    );
+    for (r, id) in [(genuine1, id1), (r2, id2)] {
+        let ev = g.handle_packet(ms(3), &r);
+        assert!(
+            ev.iter()
+                .any(|(p, e)| *p == Some(id) && matches!(e, Event::SessionEstablished { .. }))
+        );
+    }
 }
 
 #[test]

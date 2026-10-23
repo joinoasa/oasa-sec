@@ -24,6 +24,7 @@ mod counter;
 mod endpoint;
 mod packet;
 mod session;
+mod source;
 mod stamp;
 #[cfg(test)]
 mod tests;
@@ -41,6 +42,7 @@ pub use endpoint::{Endpoint, PeerId};
 pub use packet::{
     CounterLen, HANDSHAKE1_LEN, HANDSHAKE2_LEN, Packet, TAG_LEN, VERSION, data_overhead, parse,
 };
+pub use source::{SourceLimiter, looks_like_handshake1};
 pub use stamp::{
     FileTimestampStore, MemoryTimestampStore, StoredStamps, Timestamp, TimestampStore,
 };
