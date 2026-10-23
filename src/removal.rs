@@ -347,7 +347,7 @@ fn remove_key_locked(
     if peer.as_ref().is_some_and(|p| p.role == Role::Operator)
         && fs::symlink_metadata(dir.join(AUTOPILOT_KEY_FILE)).is_ok()
     {
-        mark_rotation_pending(dir, &fp, unix)?;
+        mark_rotation_pending(dir, lock, &fp, unix)?;
     }
     Ok(RemoveOutcome {
         peer,
@@ -355,15 +355,10 @@ fn remove_key_locked(
     })
 }
 
-/// Ask for a signing-key rotation (phase B acts on this file). One line per
-/// removed operator; the lock is held by the caller.
-fn mark_rotation_pending(dir: &Path, operator_fp: &str, unix: u64) -> Result<()> {
-    let path = dir.join(ROTATION_PENDING_FILE);
-    let mut text: Vec<u8> = read_private_file_opt(&path)?
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
-    text.extend_from_slice(format!("{unix} operator-removed {operator_fp}\n").as_bytes());
-    write_private_file(&path, &text)
+/// Ask for a signing-key rotation (`oasa-pair signer` acts on this file). One
+/// line per removed operator; the lock is held by the caller.
+fn mark_rotation_pending(dir: &Path, lock: &DirLock, operator_fp: &str, unix: u64) -> Result<()> {
+    crate::rotation::request_locked(dir, lock, "operator-removed", operator_fp, unix)
 }
 
 /// `oasa-pair remove`: remove `target` on this device. A tombstone, then out
@@ -388,10 +383,19 @@ pub fn remove_local(
 /// record; the device is not trusted again until a person pairs or trusts it
 /// again. Entries already received for the key are not applied again; a newer
 /// one removes it again. Returns false if the key was not removed.
+///
+/// The key also leaves `trusted-peers.v1` (if a stale copy of the list put it
+/// back there), so lifting the tombstone never trusts anything by itself.
 pub fn restore(dir: &Path, key: &[u8; 32], unix: u64) -> Result<bool> {
     let lock = DirLock::acquire(dir)?;
     if !load_removed(dir)?.is_removed(key) {
         return Ok(false);
+    }
+    let mut listed = store::read_entries(dir)?;
+    let before = listed.len();
+    listed.retain(|p| &p.public != key);
+    if listed.len() != before {
+        store::write_entries(dir, &lock, &listed)?;
     }
     append_record(
         dir,

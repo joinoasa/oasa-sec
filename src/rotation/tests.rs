@@ -52,21 +52,23 @@ fn commit_switches_the_key_and_the_generation_and_keeps_newer_requests() {
     request(&dir, "requested", "-", 10).unwrap();
     request(&dir, "operator-removed", FP, 11).unwrap();
     let b = begin(&dir).unwrap();
-    assert_eq!(b.consumed, 2);
+    // Made after the rotation began: it needs a rotation of its own.
     request(&dir, "operator-removed", FP, 12).unwrap();
-    commit(&dir, b.generation, b.consumed).unwrap();
+    assert_eq!(pending_lines(&dir).unwrap(), 3);
+    commit(&dir, b.generation).unwrap();
     let keys = load_drone_keys(&dir).unwrap().unwrap();
     assert_eq!(keys.current, b.key);
     assert_eq!((keys.current_gen, keys.highest), (1, 1));
     assert!(keys.next.is_none());
     assert_eq!(pending_lines(&dir).unwrap(), 1);
     // Committing again (a restart that is not sure) is harmless.
-    commit(&dir, 1, 1).unwrap();
+    commit(&dir, 1).unwrap();
     assert_eq!(load_drone_keys(&dir).unwrap().unwrap().current, b.key);
+    assert_eq!(pending_lines(&dir).unwrap(), 1);
     // The wrong generation is refused.
     let c = begin(&dir).unwrap();
-    assert!(commit(&dir, c.generation + 1, 0).is_err());
-    assert!(commit(&dir, c.generation - 1, 0).is_err());
+    assert!(commit(&dir, c.generation + 1).is_err());
+    assert!(commit(&dir, c.generation - 1).is_err());
 }
 
 #[test]
@@ -77,9 +79,96 @@ fn a_commit_that_stopped_part_way_can_be_finished() {
     b.key.save(&dir.join(AUTOPILOT_KEY_FILE)).unwrap();
     let keys = load_drone_keys(&dir).unwrap().unwrap();
     assert_eq!(keys.current, keys.next.as_ref().unwrap().1);
-    commit(&dir, 1, 0).unwrap();
+    commit(&dir, 1).unwrap();
     let keys = load_drone_keys(&dir).unwrap().unwrap();
     assert_eq!((keys.current_gen, keys.next.is_none()), (1, true));
+}
+
+/// A drone with one request made before a rotation began, and one made
+/// while it ran. Returns the rotation, stopped before any commit step.
+fn rotation_with_two_requests() -> (PathBuf, Begun) {
+    let (dir, _) = drone();
+    request(&dir, "requested", "-", 10).unwrap();
+    let b = begin(&dir).unwrap();
+    request(&dir, "operator-removed", FP, 11).unwrap();
+    (dir, b)
+}
+
+/// Whatever step a crash stopped at, the folder loads, the key in use is the
+/// new one once `.bin` was written, and nothing guesses: a restart (the
+/// signer's tidy-up, or a repeat of the commit) ends in the same finished
+/// state with only the later request left.
+fn assert_finished(dir: &Path, b: &Begun) {
+    tidy(dir).unwrap();
+    let keys = load_drone_keys(dir).unwrap().unwrap();
+    assert_eq!(keys.current, b.key);
+    assert_eq!(
+        (keys.current_gen, keys.highest),
+        (b.generation, b.generation)
+    );
+    assert!(keys.next.is_none());
+    assert!(!dir.join(NEXT_KEY_FILE).exists(), ".next is cleaned up");
+    assert_eq!(pending_lines(dir).unwrap(), 1, "only the later request");
+    // A new rotation can start.
+    let c = begin(dir).unwrap();
+    assert_eq!(c.generation, b.generation + 1);
+}
+
+#[test]
+fn a_crash_at_every_step_of_commit_leaves_a_folder_that_loads_and_finishes() {
+    // Step 1 done: .bin replaced. .gen, .next and requests untouched.
+    let (dir, b) = rotation_with_two_requests();
+    b.key.save(&dir.join(AUTOPILOT_KEY_FILE)).unwrap();
+    assert!(load_drone_keys(&dir).is_ok());
+    commit(&dir, b.generation).unwrap();
+    assert_finished(&dir, &b);
+
+    // Step 2 done: .gen written too. (The reviewer's case: this used to be
+    // refused for good.)
+    let (dir, b) = rotation_with_two_requests();
+    b.key.save(&dir.join(AUTOPILOT_KEY_FILE)).unwrap();
+    write_gen(&dir.join(CURRENT_GEN_FILE), b.generation).unwrap();
+    let keys = load_drone_keys(&dir).unwrap().unwrap();
+    assert!(keys.next.is_none(), "a finished commit, not a pending key");
+    assert_eq!(pending_lines(&dir).unwrap(), 2);
+    commit(&dir, b.generation).unwrap();
+    assert_finished(&dir, &b);
+    // ... and a restart without a commit call ends the same way.
+    let (dir, b) = rotation_with_two_requests();
+    b.key.save(&dir.join(AUTOPILOT_KEY_FILE)).unwrap();
+    write_gen(&dir.join(CURRENT_GEN_FILE), b.generation).unwrap();
+    assert_finished(&dir, &b);
+
+    // Step 3 done: .next deleted. Only the request clean-up is left.
+    let (dir, b) = rotation_with_two_requests();
+    b.key.save(&dir.join(AUTOPILOT_KEY_FILE)).unwrap();
+    write_gen(&dir.join(CURRENT_GEN_FILE), b.generation).unwrap();
+    std::fs::remove_file(dir.join(NEXT_KEY_FILE)).unwrap();
+    assert_eq!(pending_lines(&dir).unwrap(), 2);
+    assert_finished(&dir, &b);
+}
+
+#[test]
+fn a_leftover_next_that_is_not_the_current_key_is_still_refused() {
+    let (dir, _) = drone();
+    let b = begin(&dir).unwrap();
+    // The generation says "finished" but the keys differ: not a commit.
+    write_gen(&dir.join(CURRENT_GEN_FILE), b.generation).unwrap();
+    assert!(load_drone_keys(&dir).is_err());
+}
+
+#[test]
+fn a_commit_after_an_abandon_is_refused_and_changes_nothing() {
+    let (dir, old) = drone();
+    let b = begin(&dir).unwrap();
+    abandon(&dir).unwrap();
+    assert!(commit(&dir, b.generation).is_err());
+    let keys = load_drone_keys(&dir).unwrap().unwrap();
+    assert_eq!((keys.current_gen, keys.current == old), (0, true));
+    // Nor does it clear a request.
+    request(&dir, "requested", "-", 1).unwrap();
+    assert!(commit(&dir, b.generation).is_err());
+    assert_eq!(pending_lines(&dir).unwrap(), 1);
 }
 
 #[test]
@@ -93,12 +182,29 @@ fn requests_are_counted_and_validated() {
 }
 
 #[test]
-fn lines_before_next_leaves_requests_from_the_same_second_or_later() {
+fn requests_name_the_generation_that_was_highest_not_a_time() {
     let (dir, _) = drone();
-    request(&dir, "requested", "-", 5).unwrap();
-    request(&dir, "requested", "-", u64::MAX / 2).unwrap();
-    let _ = begin(&dir).unwrap();
-    assert_eq!(lines_before_next(&dir).unwrap(), 1);
+    request(&dir, "requested", "-", u64::MAX / 2).unwrap(); // a wild clock
+    let b = begin(&dir).unwrap();
+    request(&dir, "requested", "-", 5).unwrap(); // an earlier "time"
+    commit(&dir, b.generation).unwrap();
+    // The first was made before the rotation began, whatever its time said.
+    assert_eq!(pending_lines(&dir).unwrap(), 1);
+    let text = std::fs::read_to_string(dir.join(PENDING_FILE)).unwrap();
+    assert_eq!(text, "5 requested - 1\n");
+    // Rotations since: that one is now answered by the next commit.
+    let c = begin(&dir).unwrap();
+    commit(&dir, c.generation).unwrap();
+    assert_eq!(pending_lines(&dir).unwrap(), 0);
+}
+
+#[test]
+fn a_second_signer_cannot_run_on_the_same_folder() {
+    let (dir, _) = drone();
+    let first = lock_signer(&dir).unwrap();
+    assert!(lock_signer(&dir).is_err());
+    drop(first);
+    assert!(lock_signer(&dir).is_ok());
 }
 
 #[test]

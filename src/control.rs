@@ -319,7 +319,7 @@ impl Note {
 pub enum Action {
     /// Send this control message with `Link::send_control`. If the link has
     /// no session right now, forget it: a resend is already scheduled.
-    Send(Vec<u8>),
+    Send(Zeroizing<Vec<u8>>),
     /// A message was dropped. Count it under this name: `bad_control` (not a
     /// message), `bad_role` (the peer may not send this) or `peer_removed`.
     Drop(&'static str),
@@ -428,8 +428,8 @@ impl Control {
     }
 
     fn outgoing(&mut self, now: Duration, msg: Message) -> (Outgoing, Action) {
-        let bytes = Zeroizing::new(msg.encode().to_vec());
-        let send = Action::Send(bytes.to_vec());
+        let bytes = msg.encode();
+        let send = Action::Send(bytes.clone());
         let out = Outgoing {
             id: msg.id(),
             bytes,
@@ -570,7 +570,7 @@ impl Control {
             }
             o.backoff = (o.backoff * 2).min(RETRY_MAX);
             o.next_try = now + o.backoff;
-            Some(Action::Send(o.bytes.to_vec()))
+            Some(Action::Send(o.bytes.clone()))
         };
         if let Some(a) = self.session.head.as_mut().and_then(due) {
             out.push(a);
@@ -590,10 +590,8 @@ impl Control {
         if restart {
             // Forget that the operator took the pending key; it is sent again.
             self.session.signing = None;
-            match rotation::read_acked(&self.dir, &self.peer_fp).and_then(|a| {
-                rotation::write_acked(&self.dir, &self.peer_fp, rotation::Acked { next: 0, ..a })
-            }) {
-                Ok(()) => out.extend(self.send_signing(now)),
+            match rotation::update_acked(&self.dir, &self.peer_fp, |a| a.next = 0) {
+                Ok(_) => out.extend(self.send_signing(now)),
                 Err(_) => out.push(Action::Note(Note::new("control_error"))),
             }
         }
@@ -658,18 +656,16 @@ impl Control {
     }
 
     fn ack(&self, id: RequestId, acked: u8) -> Action {
-        Action::Send(Message::Ack { id, acked }.encode().to_vec())
+        Action::Send(Message::Ack { id, acked }.encode())
     }
 
     fn on_head(&mut self, role: Role, id: RequestId, log_id: LogId, highest: u32) -> Vec<Action> {
         if role != Role::Admin {
             // We don't list this device as admin: tell it, so it stops.
-            return vec![Action::Send(Message::NotAdmin { id }.encode().to_vec())];
+            return vec![Action::Send(Message::NotAdmin { id }.encode())];
         }
         match removal::on_head(&self.dir, &self.peer_fp, &log_id, highest) {
-            Ok(held) => vec![Action::Send(
-                Message::RemoveHave { id, held }.encode().to_vec(),
-            )],
+            Ok(held) => vec![Action::Send(Message::RemoveHave { id, held }.encode())],
             Err(_) => vec![Action::Note(Note::new("control_error"))],
         }
     }
@@ -880,15 +876,11 @@ impl Control {
         }
         let kind = *kind;
         self.session.signing = None;
-        let mut a = match rotation::read_acked(&self.dir, &self.peer_fp) {
-            Ok(a) => a,
-            Err(_) => return vec![Action::Note(Note::new("control_error"))],
-        };
-        match kind {
+        let done = rotation::update_acked(&self.dir, &self.peer_fp, |a| match kind {
             SigningKind::Next(g) => a.next = g,
             SigningKind::Commit(g) => a.commit = g,
-        }
-        if rotation::write_acked(&self.dir, &self.peer_fp, a).is_err() {
+        });
+        if done.is_err() {
             return vec![Action::Note(Note::new("control_error"))];
         }
         let mut out = vec![Action::Note({

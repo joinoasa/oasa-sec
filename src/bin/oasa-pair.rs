@@ -96,7 +96,7 @@ USAGE:
             works out which key the autopilot has before it does anything (listens, then
             asks under each key for 75 s) and never deletes a key that might be in use.
             Prints one JSON line per event: rotation_waiting_armed, rotation_started,
-            rotation_done, rotation_rolled_back, rotation_stuck. Keep it running.
+            rotation_done, rotation_rolled_back, rotation_stuck, rotation_refused. Keep it running.
   rotate-signing
             Ask the signer to change the drone's signing key (it also does this by itself
             after an operator is removed). Writes rotation-pending.
@@ -249,12 +249,22 @@ fn trust(o: &Opts) -> R {
         other => other.to_string(),
     })?;
     match changed_from {
-        Some(old) => println!(
-            "Changed the role of {} {} from {old} to {}.",
-            peer.name,
-            peer.fingerprint(),
-            peer.role
-        ),
+        Some(old) => {
+            println!(
+                "Changed the role of {} {} from {old} to {}.",
+                peer.name,
+                peer.fingerprint(),
+                peer.role
+            );
+            if old == Role::Operator
+                && peer.role != Role::Operator
+                && dir.join(AUTOPILOT_KEY_FILE).exists()
+            {
+                println!(
+                    "It may hold this drone's signing key, so a new key was requested. `oasa-pair signer` changes it once the autopilot is disarmed."
+                );
+            }
+        }
         None => println!(
             "Trusted {} {} as {}\nCheck that this fingerprint matches the one shown on that device.",
             peer.name,
@@ -293,15 +303,34 @@ fn report_migration(dir: &Path) -> R {
         for p in &peers {
             eprintln!("  {}  {}  {}", p.fingerprint(), p.role, p.name);
         }
-        eprintln!(
-            "Every device became {} ({}). Fix any role with `oasa-pair trust --role admin|operator|peer` (same name).",
-            peers.first().map_or(Role::Peer, |p| p.role),
-            if on_drone {
-                "this device holds an autopilot key, so it is a drone"
-            } else {
-                "this device holds no autopilot key"
-            }
-        );
+        if on_drone {
+            eprintln!();
+            eprintln!(
+                "*** CHECK THIS: this is a drone, so every device above is now an OPERATOR. ***"
+            );
+            eprintln!(
+                "An operator is sent the drone's MAVLink signing key and can then command the autopilot."
+            );
+            eprintln!(
+                "For each device that should not command this drone, run (use its name from the list):"
+            );
+            eprintln!(
+                "  oasa-pair trust --role peer --name NAME --key PUBLIC_KEY --dir {}",
+                dir.display()
+            );
+            eprintln!(
+                "  (the key is in {}). Demoting an operator asks for a new signing key.",
+                store::TRUST_FILE
+            );
+            eprintln!(
+                "Admins: `trust --role admin` for the devices that may remove others. Roles: admin, operator, peer."
+            );
+        } else {
+            eprintln!(
+                "Every device became {} (this device holds no autopilot key). Fix any role with `oasa-pair trust --role admin|operator|peer` (same name).",
+                peers.first().map_or(Role::Peer, |p| p.role)
+            );
+        }
     }
     if dir.join(store::OLD_TRUST_FILE).exists() && dir.join(store::TRUST_FILE).exists() {
         eprintln!(
@@ -708,6 +737,8 @@ fn signer(o: &Opts) -> R {
     if !dir.join(AUTOPILOT_KEY_FILE).exists() {
         return Err("this device holds no autopilot signing key; pair first".into());
     }
+    // One signer per folder: two could each run a rotation on one autopilot.
+    let _one = oasa_sec::rotation::lock_signer(&dir)?;
     let port = UdpPort::connect(o.req("autopilot")?, sys, link_id)?;
     let mut s = signer::Signer::new(&dir, port, signer::Config { sys, comp });
     s.on_event(|e| println!("{}", json_event(e)));

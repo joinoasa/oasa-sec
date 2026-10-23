@@ -22,10 +22,11 @@ use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
     SendError, SourceLimiter, looks_like_handshake1,
 };
-use oasa_sec::mavguard::{Block, Guard, max_signed_timestamp};
+use oasa_sec::mavguard::{Block, Guard, max_verified_timestamp};
 use oasa_sec::removal::{LOG_FILE, REMOVED_FILE};
 use oasa_sec::rotation::{CURRENT_GEN_FILE, NEXT_KEY_FILE, write_seen_ts};
-use oasa_sec::signing::AUTOPILOT_KEY_FILE;
+use oasa_sec::signer::TS_AHEAD;
+use oasa_sec::signing::{AUTOPILOT_KEY_FILE, SigningKey, mavlink_timestamp_now};
 use oasa_sec::store::{self, TRUST_FILE};
 
 const USAGE: &str = "\
@@ -625,6 +626,10 @@ struct SeenTs {
     best: u64,
     saved: u64,
     last_save: Instant,
+    /// The drone's current autopilot key, read again every 10 s (a rotation
+    /// changes it). Only frames signed with it count.
+    key: Option<SigningKey>,
+    key_read: Option<Instant>,
 }
 
 impl SeenTs {
@@ -632,7 +637,21 @@ impl SeenTs {
         if !self.drone {
             return;
         }
-        self.best = self.best.max(max_signed_timestamp(datagram));
+        if self
+            .key_read
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+        {
+            self.key = SigningKey::load(&self.dir.join(AUTOPILOT_KEY_FILE)).ok();
+            self.key_read = Some(Instant::now());
+        }
+        if let Some(k) = &self.key {
+            self.best = self.best.max(max_verified_timestamp(
+                datagram,
+                k.as_bytes(),
+                mavlink_timestamp_now(),
+                TS_AHEAD,
+            ));
+        }
         if self.best > self.saved && self.last_save.elapsed() >= Duration::from_secs(10) {
             // A failed save only means a lower floor; the signer has its own clock.
             if write_seen_ts(&self.dir, self.best).is_ok() {
@@ -941,6 +960,8 @@ fn run(args: &[String]) -> R<u8> {
             best: 0,
             saved: 0,
             last_save: Instant::now(),
+            key: None,
+            key_read: None,
         },
     };
 

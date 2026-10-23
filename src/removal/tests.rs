@@ -141,7 +141,7 @@ fn a_drone_removing_an_operator_asks_for_a_rotation_and_a_peer_does_not() {
     );
     remove_local(&d, &OWN, &OP, 3).unwrap();
     let text = std::fs::read_to_string(d.join(ROTATION_PENDING_FILE)).unwrap();
-    assert_eq!(text, format!("3 operator-removed {}\n", fingerprint(&OP)));
+    assert_eq!(text, format!("3 operator-removed {} 0\n", fingerprint(&OP)));
     // The same through an admin's entry.
     let d = device();
     write_private_file(&d.join(AUTOPILOT_KEY_FILE), &[7u8; 40]).unwrap();
@@ -188,6 +188,21 @@ fn restore_lifts_the_tombstone_but_trusts_nothing_by_itself() {
     assert!(listed(&d, &PEER));
     // The tombstone history stays in the file.
     assert_eq!(load_removed(&d).unwrap().records().len(), 2);
+}
+
+#[test]
+fn restore_also_drops_a_stale_listing_so_it_never_trusts_by_itself() {
+    let d = device();
+    let stale = std::fs::read(d.join(store::TRUST_FILE)).unwrap();
+    remove_local(&d, &OWN, &PEER, 1).unwrap();
+    // A backup of the old list comes back, with the key in it again.
+    write_private_file(&d.join(store::TRUST_FILE), &stale).unwrap();
+    assert!(restore(&d, &PEER, 2).unwrap());
+    assert!(!listed(&d, &PEER), "the stale listing is gone");
+    assert!(
+        listed(&d, &OP) && listed(&d, &A1),
+        "the others are untouched"
+    );
 }
 
 #[test]

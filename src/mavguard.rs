@@ -622,29 +622,36 @@ pub fn is_signing_param(name: &[u8]) -> bool {
     false
 }
 
-/// The highest signature timestamp (MAVLink units) in the signed MAVLink 2
-/// frames of a datagram, or 0. Meant for a datagram the guard already passed;
-/// it reads only lengths and the 6 timestamp bytes and stops at anything odd.
-/// The signature is not checked here (the autopilot does that); the number is
-/// only a floor for the next `SETUP_SIGNING` initial timestamp, so a forged
-/// high one can at worst make that timestamp larger.
-pub fn max_signed_timestamp(datagram: &[u8]) -> u64 {
+/// The highest signature timestamp (MAVLink units) among the signed MAVLink 2
+/// frames of a datagram **whose signature verifies under `key`**, or 0, never
+/// above `clock + ahead`. Meant for a datagram the guard already passed; it
+/// reads lengths and the timestamp and stops at anything odd. It is only a
+/// floor for the next `SETUP_SIGNING` initial timestamp: a frame that does
+/// not verify is not believed (anyone on the link can write any number in
+/// it), and one that does can raise the floor no further than the cap.
+pub fn max_verified_timestamp(datagram: &[u8], key: &[u8; 32], clock: u64, ahead: u64) -> u64 {
+    use mavlink::{MAVLinkV2MessageRaw, consts};
+    let cap = clock.saturating_add(ahead);
     let (mut pos, mut best) = (0usize, 0u64);
     while pos + 12 <= datagram.len() {
-        if datagram[pos] != 0xFD {
+        if datagram[pos] != V2_START {
             break;
         }
         let len = datagram[pos + 1] as usize;
-        let signed = datagram[pos + 2] & 0x01 != 0;
-        let end = pos + 10 + len + 2 + if signed { 13 } else { 0 };
+        let signed = datagram[pos + 2] & INCOMPAT_SIGNED != 0;
+        let end = pos + 10 + len + 2 + if signed { SIGNATURE_LEN } else { 0 };
         if end > datagram.len() {
             break;
         }
         if signed {
-            let ts = pos + 10 + len + 2 + 1;
-            let mut b = [0u8; 8];
-            b[..6].copy_from_slice(&datagram[ts..ts + 6]);
-            best = best.max(u64::from_le_bytes(b));
+            let mut raw = MAVLinkV2MessageRaw::new();
+            raw.as_mut_slice()[..end - pos].copy_from_slice(&datagram[pos..end]);
+            let mut sig = [0u8; consts::v2::SIGNATURE_VALUE_SIZE];
+            raw.calculate_signature(key, &mut sig);
+            // Not constant-time: the signature is public on the wire.
+            if sig == raw.signature_value() {
+                best = best.max(raw.signature_timestamp().min(cap));
+            }
         }
         pos = end;
     }
@@ -1591,31 +1598,45 @@ mod tests {
         }
     }
 
+    /// A signed HEARTBEAT frame with a real signature under `key`.
+    fn signed_frame(key: &[u8; 32], ts: u64) -> Vec<u8> {
+        use mavlink::{MAVLinkV2MessageRaw, consts};
+        let mut f = v2(0, &[0; 9], true);
+        let n = f.len();
+        f[n - SIGNATURE_LEN] = 3; // link id
+        f[n - SIGNATURE_LEN + 1..n - 6].copy_from_slice(&ts.to_le_bytes()[..6]);
+        let mut raw = MAVLinkV2MessageRaw::new();
+        raw.as_mut_slice()[..n].copy_from_slice(&f);
+        let mut sig = [0u8; consts::v2::SIGNATURE_VALUE_SIZE];
+        raw.calculate_signature(key, &mut sig);
+        f[n - 6..].copy_from_slice(&sig);
+        f
+    }
+
     #[test]
-    fn the_highest_signed_timestamp_is_read_from_signed_frames_only() {
-        // A signed HEARTBEAT-sized frame: 9-byte payload.
-        let frame = |ts: u64, signed: bool| {
-            let mut f = vec![0xFD, 9, u8::from(signed), 0, 0, 1, 1, 0, 0, 0];
-            f.extend_from_slice(&[0; 9]);
-            f.extend_from_slice(&[0, 0]);
-            if signed {
-                f.push(3);
-                f.extend_from_slice(&ts.to_le_bytes()[..6]);
-                f.extend_from_slice(&[0; 6]);
-            }
-            f
-        };
-        assert_eq!(max_signed_timestamp(&frame(1234, true)), 1234);
-        assert_eq!(max_signed_timestamp(&frame(1234, false)), 0);
-        let mut two = frame(10, true);
-        two.extend(frame(99, true));
-        two.extend(frame(5, false));
-        assert_eq!(max_signed_timestamp(&two), 99);
+    fn the_highest_timestamp_comes_only_from_frames_that_verify_and_is_capped() {
+        const K: [u8; 32] = [7; 32];
+        let (clock, ahead) = (1_000_000u64, 6_000_000u64);
+        let max = |d: &[u8]| max_verified_timestamp(d, &K, clock, ahead);
+        assert_eq!(max(&signed_frame(&K, 1234)), 1234);
+        // Signed under another key, or with a made-up signature: not believed.
+        assert_eq!(max(&signed_frame(&[8; 32], 1234)), 0);
+        assert_eq!(max(&v2(0, &[0; 9], true)), 0);
+        // Not signed: nothing.
+        assert_eq!(max(&v2(0, &[0; 9], false)), 0);
+        // Several frames: the highest verified one.
+        let mut many = signed_frame(&K, 10);
+        many.extend(signed_frame(&K, 99));
+        many.extend(signed_frame(&[8; 32], 5_000));
+        many.extend(v2(0, &[0; 9], false));
+        assert_eq!(max(&many), 99);
+        // A genuine signature far ahead of the clock only raises it to the cap.
+        assert_eq!(max(&signed_frame(&K, (1 << 48) - 1)), clock + ahead);
         // Cut short, garbage, empty: nothing, no panic.
-        let f = frame(77, true);
-        assert_eq!(max_signed_timestamp(&f[..f.len() - 1]), 0);
-        assert_eq!(max_signed_timestamp(&[0xFD; 3]), 0);
-        assert_eq!(max_signed_timestamp(&[]), 0);
-        assert_eq!(max_signed_timestamp(&[0x55; 40]), 0);
+        let f = signed_frame(&K, 77);
+        assert_eq!(max(&f[..f.len() - 1]), 0);
+        assert_eq!(max(&[0xFD; 3]), 0);
+        assert_eq!(max(&[]), 0);
+        assert_eq!(max(&[0x55; 40]), 0);
     }
 }

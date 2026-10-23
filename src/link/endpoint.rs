@@ -833,7 +833,7 @@ impl PeerLink {
             }
             Some((&CONTENT_CONTROL, body)) if !body.is_empty() => {
                 sh.stats.control_received += 1;
-                out.push(Event::Control(body.to_vec()));
+                out.push(Event::Control(Zeroizing::new(body.to_vec())));
             }
             Some(_) => {
                 sh.stats.count_drop(DropReason::BadContent);

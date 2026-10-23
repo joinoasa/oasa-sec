@@ -2,6 +2,7 @@
 //! replay window for what we receive.
 
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 use snow::StatelessTransportState;
 
@@ -73,7 +74,8 @@ impl Session {
         cfg: &Config,
         content: Option<(u8, &[u8])>,
     ) -> Result<Vec<u8>, SendError> {
-        let mut plaintext = Vec::new();
+        // May hold a signing key (a control message): wiped when dropped.
+        let mut plaintext = Zeroizing::new(Vec::new());
         if let Some((kind, body)) = content {
             plaintext.reserve(1 + body.len());
             plaintext.push(kind);
@@ -110,7 +112,7 @@ impl Session {
         counter_len: CounterLen,
         low: u64,
         ciphertext: &[u8],
-    ) -> Result<Vec<u8>, DropReason> {
+    ) -> Result<Zeroizing<Vec<u8>>, DropReason> {
         if self.expired(now, cfg) {
             return Err(DropReason::UnknownIndex);
         }
@@ -122,7 +124,7 @@ impl Session {
         if self.recv.is_too_old(counter) {
             return Err(DropReason::TooOld);
         }
-        let mut out = vec![0u8; ciphertext.len().saturating_sub(TAG_LEN)];
+        let mut out = Zeroizing::new(vec![0u8; ciphertext.len().saturating_sub(TAG_LEN)]);
         let n = self
             .transport
             .read_message(counter, ciphertext, &mut out)

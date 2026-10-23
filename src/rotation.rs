@@ -96,13 +96,18 @@ pub fn load_drone_keys(dir: &Path) -> Result<Option<DroneKeys>> {
     let next_path = dir.join(NEXT_KEY_FILE);
     let next = if fs::symlink_metadata(&next_path).is_ok() {
         let k = SigningKey::load(&next_path)?;
-        if issued <= current_gen {
+        if issued > current_gen {
+            Some((issued, k))
+        } else if issued == current_gen && k == current {
+            // A commit that stopped after saving the generation and before
+            // deleting `.next`: finished, only the clean-up is left.
+            None
+        } else {
             return Err(bad(
                 "a pending signing key exists but its generation was not saved; \
                  refusing to guess (keep both key files and ask for help)",
             ));
         }
-        Some((issued, k))
     } else {
         None
     };
@@ -118,8 +123,25 @@ pub fn load_drone_keys(dir: &Path) -> Result<Option<DroneKeys>> {
 pub struct Begun {
     pub generation: u32,
     pub key: SigningKey,
-    /// How many lines of `rotation-pending` this rotation answers.
-    pub consumed: usize,
+}
+
+/// Clean up after a crash, under the lock: delete a `.next` left over from a
+/// commit that had already switched, and drop the requests that the current
+/// key's generation answers.
+fn tidy_locked(dir: &Path, lock: &DirLock) -> Result<()> {
+    let Some(keys) = load_drone_keys(dir)? else {
+        return Ok(());
+    };
+    if keys.next.is_none() {
+        remove_if_exists(&dir.join(NEXT_KEY_FILE))?;
+    }
+    clear_answered_locked(dir, lock, keys.current_gen)
+}
+
+/// Public form of the clean-up, for the signer's start.
+pub fn tidy(dir: &Path) -> Result<()> {
+    let lock = DirLock::acquire(dir)?;
+    tidy_locked(dir, &lock)
 }
 
 /// Step 2: issue the next generation and save the new key as `.next`, before
@@ -127,6 +149,7 @@ pub struct Begun {
 /// never reuses one. Refuses while a `.next` already exists.
 pub fn begin(dir: &Path) -> Result<Begun> {
     let lock = DirLock::acquire(dir)?;
+    tidy_locked(dir, &lock)?;
     let keys = load_drone_keys(dir)?.ok_or(Error::Link("this folder holds no autopilot key"))?;
     if keys.next.is_some() {
         return Err(Error::Link("a new signing key is already pending"));
@@ -138,42 +161,42 @@ pub fn begin(dir: &Path) -> Result<Begun> {
     let key = SigningKey::generate()?;
     write_gen(&dir.join(HIGHEST_GEN_FILE), generation)?;
     key.save(&dir.join(NEXT_KEY_FILE))?;
-    let consumed = pending_lines_locked(dir, &lock)?;
-    Ok(Begun {
-        generation,
-        key,
-        consumed,
-    })
+    Ok(Begun { generation, key })
 }
 
 /// Step 6: the autopilot answered under the new key. Replace the current key,
 /// then the generation, delete `.next`, and clear the requests this rotation
-/// answered (lines added since stay, so a removal that happened meanwhile
-/// still gets its own rotation). Safe to run again after a crash part-way:
-/// each step is atomic and the order lets a restart finish the job.
-pub fn commit(dir: &Path, generation: u32, consumed: usize) -> Result<()> {
+/// answered (a request names the generation that was highest when it was
+/// made; those below this one are answered, so a removal that happened
+/// meanwhile still gets its own rotation). Safe to run again after a crash
+/// part-way: each step is atomic and the order lets a restart finish the job.
+///
+/// With no `.next` it only finishes a switch that is already complete: the
+/// current key must be this generation. An abandoned generation is refused.
+pub fn commit(dir: &Path, generation: u32) -> Result<()> {
     let lock = DirLock::acquire(dir)?;
     let next_path = dir.join(NEXT_KEY_FILE);
-    if fs::symlink_metadata(&next_path).is_ok() {
-        let keys = load_drone_keys(dir)?.ok_or(Error::Link("no autopilot key"))?;
-        match keys.next {
-            Some((g, k)) if g == generation => k.save(&dir.join(AUTOPILOT_KEY_FILE))?,
-            _ => {
-                return Err(Error::Link(
-                    "the pending key is not the one being committed",
-                ));
-            }
+    let keys = load_drone_keys(dir)?.ok_or(Error::Link("no autopilot key"))?;
+    match keys.next {
+        Some((g, k)) if g == generation => {
+            k.save(&dir.join(AUTOPILOT_KEY_FILE))?;
+            write_gen(&dir.join(CURRENT_GEN_FILE), generation)?;
+            remove_if_exists(&next_path)?;
         }
-    } else {
-        // Already switched by an earlier run that stopped part-way.
-        let cur = read_gen(&dir.join(CURRENT_GEN_FILE))?.unwrap_or(0);
-        if cur != generation && read_gen(&dir.join(HIGHEST_GEN_FILE))? != Some(generation) {
-            return Err(Error::Link("no pending key to commit"));
+        Some(_) => {
+            return Err(Error::Link(
+                "the pending key is not the one being committed",
+            ));
+        }
+        None => {
+            // Already switched by an earlier run that stopped part-way.
+            if keys.current_gen != generation {
+                return Err(Error::Link("no pending key to commit"));
+            }
+            remove_if_exists(&next_path)?;
         }
     }
-    write_gen(&dir.join(CURRENT_GEN_FILE), generation)?;
-    remove_if_exists(&next_path)?;
-    clear_pending_locked(dir, &lock, consumed)
+    clear_answered_locked(dir, &lock, generation)
 }
 
 /// The autopilot kept the old key: forget the new one. The request stays, so
@@ -183,24 +206,56 @@ pub fn abandon(dir: &Path) -> Result<()> {
     remove_if_exists(&dir.join(NEXT_KEY_FILE))
 }
 
+/// Held by the one `oasa-pair signer` that runs on a folder.
+pub struct SignerLock {
+    _lock: DirLock,
+}
+
+/// Take the signer's single-instance lock (`.signer.lock`). Two signers on
+/// one folder could each run a rotation against the same autopilot.
+pub fn lock_signer(dir: &Path) -> Result<SignerLock> {
+    DirLock::try_acquire_named(dir, ".signer.lock")?
+        .map(|l| SignerLock { _lock: l })
+        .ok_or(Error::Link(
+            "another oasa-pair signer is already running for this folder",
+        ))
+}
+
 // ---- requests -------------------------------------------------------------------
 
-/// Ask for a rotation: add a line to `rotation-pending`. `who` is a
-/// fingerprint or `-`.
+/// Ask for a rotation: add a line to `rotation-pending`:
+/// `<unix> <reason> <who> <gen>`. `who` is a fingerprint or `-`; `gen` is the
+/// highest generation issued when the request was made. A rotation that
+/// commits generation `g` answers the requests with `gen < g` (it was begun
+/// after them) and leaves the rest. No clock is involved.
 pub fn request(dir: &Path, reason: &str, who: &str, unix: u64) -> Result<()> {
+    let lock = DirLock::acquire(dir)?;
+    request_locked(dir, &lock, reason, who, unix)
+}
+
+pub(crate) fn request_locked(
+    dir: &Path,
+    _lock: &DirLock,
+    reason: &str,
+    who: &str,
+    unix: u64,
+) -> Result<()> {
     if reason.is_empty()
         || reason.contains(char::is_whitespace)
+        || who.is_empty()
         || who.contains(char::is_whitespace)
     {
         return Err(Error::Link("bad rotation request"));
     }
-    let lock = DirLock::acquire(dir)?;
+    let current = read_gen(&dir.join(CURRENT_GEN_FILE))?.unwrap_or(0);
+    let tag = read_gen(&dir.join(HIGHEST_GEN_FILE))?
+        .unwrap_or(0)
+        .max(current);
     let path = dir.join(PENDING_FILE);
     let mut text: Vec<u8> = read_private_file_opt(&path)?
         .map(|b| b.to_vec())
         .unwrap_or_default();
-    let _ = &lock;
-    text.extend_from_slice(format!("{unix} {reason} {who}\n").as_bytes());
+    text.extend_from_slice(format!("{unix} {reason} {who} {tag}\n").as_bytes());
     write_private_file(&path, &text)
 }
 
@@ -217,7 +272,18 @@ pub fn pending_lines(dir: &Path) -> Result<usize> {
     pending_lines_locked(dir, &lock)
 }
 
-fn clear_pending_locked(dir: &Path, _lock: &DirLock, consumed: usize) -> Result<()> {
+/// The generation a request line was tagged with (a line without one, from
+/// an older file, counts as answered by any rotation).
+fn line_tag(line: &[u8]) -> u32 {
+    line.split(|c| *c == b' ')
+        .nth(3)
+        .and_then(|t| std::str::from_utf8(t).ok())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Drop the requests a committed generation answers (tag below it).
+fn clear_answered_locked(dir: &Path, _lock: &DirLock, committed: u32) -> Result<()> {
     let path = dir.join(PENDING_FILE);
     let Some(bytes) = read_private_file_opt(&path)? else {
         return Ok(());
@@ -226,43 +292,22 @@ fn clear_pending_locked(dir: &Path, _lock: &DirLock, consumed: usize) -> Result<
         .split(|c| *c == b'\n')
         .filter(|l| !l.is_empty())
         .collect();
-    if lines.len() <= consumed {
-        return remove_if_exists(&path);
-    }
     let mut keep = Vec::new();
-    for l in &lines[consumed..] {
-        keep.extend_from_slice(l);
-        keep.push(b'\n');
-    }
-    write_private_file(&path, &keep)
-}
-
-/// How many requests are older than the pending key (a crash recovery does
-/// not know how many it answered; this counts those dated before `.next`
-/// was written, and leaves a request from the same second or later).
-pub fn lines_before_next(dir: &Path) -> Result<usize> {
-    let _lock = DirLock::acquire(dir)?;
-    let made = fs::metadata(dir.join(NEXT_KEY_FILE))?
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let Some(bytes) = read_private_file_opt(&dir.join(PENDING_FILE))? else {
-        return Ok(0);
-    };
-    let mut n = 0;
-    for line in bytes.split(|c| *c == b'\n').filter(|l| !l.is_empty()) {
-        let first = line.split(|c| *c == b' ').next().unwrap_or(&[]);
-        let unix: u64 = std::str::from_utf8(first)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(u64::MAX);
-        if unix < made {
-            n += 1;
-        } else {
-            break;
+    let mut kept = 0;
+    for l in &lines {
+        if line_tag(l) >= committed {
+            keep.extend_from_slice(l);
+            keep.push(b'\n');
+            kept += 1;
         }
     }
-    Ok(n)
+    if kept == lines.len() {
+        return Ok(());
+    }
+    if kept == 0 {
+        return remove_if_exists(&path);
+    }
+    write_private_file(&path, &keep)
 }
 
 /// The highest signature timestamp `oasa-link` saw on signed MAVLink going
@@ -314,6 +359,24 @@ pub fn read_acked(dir: &Path, fp: &str) -> Result<Acked> {
         next: n.parse().map_err(|_| bad("bad number in signing-acked"))?,
         commit: c.parse().map_err(|_| bad("bad number in signing-acked"))?,
     })
+}
+
+/// Read, change and write what an operator has acked, all under the folder
+/// lock (two links to one operator, or a rotation, cannot lose an update).
+/// Returns the new value.
+pub fn update_acked(dir: &Path, fp: &str, f: impl FnOnce(&mut Acked)) -> Result<Acked> {
+    if !crate::pairing::looks_like_fingerprint(fp) {
+        return Err(Error::Link("bad fingerprint"));
+    }
+    let _lock = DirLock::acquire(dir)?;
+    let mut a = read_acked(dir, fp)?;
+    f(&mut a);
+    crate::files::ensure_private_dir(&dir.join(ACKED_DIR))?;
+    write_private_file(
+        &acked_path(dir, fp),
+        format!("{} {}\n", a.next, a.commit).as_bytes(),
+    )?;
+    Ok(a)
 }
 
 pub fn write_acked(dir: &Path, fp: &str, a: Acked) -> Result<()> {

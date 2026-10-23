@@ -1691,7 +1691,7 @@ impl Pair {
     }
 
     fn commit(&mut self, g: u32) {
-        oasa_sec::rotation::commit(&self.drone, g, 0).unwrap();
+        oasa_sec::rotation::commit(&self.drone, g).unwrap();
         self.tell_drone();
     }
 

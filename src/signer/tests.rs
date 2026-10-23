@@ -41,6 +41,10 @@ struct Frame {
     msg: MavMessage,
     /// The key the frame is signed with, and its timestamp.
     signed: Option<([u8; 32], u64)>,
+    /// The component that sent it (the autopilot is `COMP`).
+    comp: u8,
+    /// Who a `COMMAND_ACK` answers.
+    ack_to: (u8, u8),
 }
 
 /// The autopilot. Signing rules as PX4 and ArduPilot have them: keyless, it
@@ -73,6 +77,19 @@ struct Ap {
     deaf_after_setup: Duration,
     /// Called when a `SETUP_SIGNING` is applied.
     on_setup: Option<Box<dyn FnMut()>>,
+    /// Answer requests to somebody else instead of to the signer.
+    ack_to: Option<(u8, u8)>,
+}
+
+impl Ap {
+    /// Queue a frame, keeping the queue in time order.
+    fn push(&mut self, f: Frame) {
+        let at = self.queue.iter().position(|q| q.at > f.at);
+        match at {
+            Some(i) => self.queue.insert(i, f),
+            None => self.queue.push_back(f),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -136,13 +153,16 @@ impl Port for FakePort {
                     } else {
                         let at = ap.t + Duration::from_millis(50);
                         let signed = ap.key.map(|k| (k, 5_000));
-                        ap.queue.push_back(Frame {
+                        let ack_to = ap.ack_to.unwrap_or((SYS, SIGNER_COMP));
+                        ap.push(Frame {
                             at,
                             msg: MavMessage::COMMAND_ACK(COMMAND_ACK_DATA {
                                 command: MavCmd::MAV_CMD_REQUEST_MESSAGE,
                                 result: MavResult::MAV_RESULT_ACCEPTED,
                             }),
                             signed,
+                            comp: COMP,
+                            ack_to,
                         });
                     }
                 }
@@ -176,6 +196,8 @@ impl Port for FakePort {
                 at: ap.t,
                 msg: heartbeat(ap.armed),
                 signed: ap.sign_own.then_some(()).and(ap.key).map(|k| (k, ts)),
+                comp: COMP,
+                ack_to: (0, 0),
             }
         };
         let sig = frame.signed.map(|(k, ts)| Sig {
@@ -185,9 +207,10 @@ impl Port for FakePort {
         Ok(Some(Inbound {
             header: MavHeader {
                 system_id: SYS,
-                component_id: COMP,
+                component_id: frame.comp,
                 sequence: 0,
             },
+            ack_target: matches!(frame.msg, MavMessage::COMMAND_ACK(_)).then_some(frame.ack_to),
             msg: frame.msg,
             sig,
         }))
@@ -207,6 +230,8 @@ fn rig(tag: &str) -> Rig {
     old.save(&dir.join(AUTOPILOT_KEY_FILE)).unwrap();
     let ap = Rc::new(RefCell::new(Ap {
         key: Some(*old.as_bytes()),
+        // A keyed autopilot signs everything it sends.
+        sign_own: true,
         ..Ap::default()
     }));
     let signer = Signer::new(&dir, FakePort(ap.clone()), cfg());
@@ -343,6 +368,8 @@ fn a_reboot_window_is_waited_out_by_the_probe() {
     r.want();
     // After applying the key the autopilot ignores signed commands for 60 s.
     r.ap.borrow_mut().deaf_after_setup = Duration::from_secs(60);
+    // (Quiet while it restarts: no signed frames to settle it by listening.)
+    r.ap.borrow_mut().sign_own = false;
     let ev = r.run(3);
     assert_eq!(ev, vec![Event::Issued(1), Event::Rotated(1)]);
     assert!(r.ap.borrow().t >= Duration::from_secs(60));
@@ -361,10 +388,15 @@ fn a_silent_autopilot_leaves_both_keys_and_reports_stuck_until_asked_again() {
     // Nothing changes while it stays silent and nobody asks.
     r.ap.borrow_mut().silent = false;
     assert!(r.run(5).is_empty());
-    // Asked again: it looks, and the autopilot has the new key.
+    // Asked again: it looks, and the autopilot has the new key. The new
+    // request came after the key was issued, so it gets a rotation of its own.
+    r.ap.borrow_mut().mute_after_setup = false;
     rotation::request(&r.dir, "requested", "-", 1000).unwrap();
-    let ev = r.run(2);
-    assert_eq!(ev, vec![Event::Rotated(1)]);
+    let ev = r.run(3);
+    assert_eq!(
+        ev,
+        vec![Event::Rotated(1), Event::Issued(2), Event::Rotated(2)]
+    );
     assert!(!r.files(rotation::PENDING_FILE));
 }
 
@@ -424,8 +456,10 @@ fn a_keyed_autopilot_that_signs_its_frames_settles_it_by_listening() {
     assert!(r.signer.tick().is_err());
     r.restart();
     let sent = r.ap.borrow().sends.len();
+    // Old-key frames alone prove nothing: it asks, and the autopilot's
+    // answer under the old key (meant for us) lets it go back.
     assert_eq!(r.run(2), vec![Event::RolledBack(1)]);
-    assert_eq!(r.ap.borrow().sends.len(), sent);
+    assert!(r.ap.borrow().sends.len() > sent);
 }
 
 #[test]
@@ -496,34 +530,237 @@ fn a_request_that_arrives_during_a_rotation_gets_its_own_rotation() {
 }
 
 #[test]
-fn the_initial_timestamp_is_above_everything_seen() {
+fn the_initial_timestamp_is_above_what_is_seen_but_a_peer_cannot_push_it_out_of_reach() {
+    let clock = 40_000_000_000_000u64;
+    // Close to the clock: above everything.
+    assert_eq!(initial_timestamp(clock, clock + 5, 0, 0), Some(clock + 6));
+    assert_eq!(initial_timestamp(clock, 0, clock + 9, 0), Some(clock + 10));
+    assert_eq!(initial_timestamp(clock, 0, 0, clock + 3), Some(clock + 4));
+    assert_eq!(initial_timestamp(clock, 0, 0, 0), Some(clock + 1));
+    // Far ahead (2^48 - 1 from a hostile peer, or a bad floor file): capped
+    // at the clock plus 60 s.
+    let cap = clock + TS_AHEAD + 1;
+    assert_eq!(initial_timestamp(clock, TS_LIMIT - 1, 0, 0), Some(cap));
+    assert_eq!(initial_timestamp(clock, 0, TS_LIMIT - 1, 0), Some(cap));
+    assert_eq!(initial_timestamp(clock, u64::MAX, u64::MAX, 0), Some(cap));
+    // No room left in 48 bits: refuse.
+    assert_eq!(initial_timestamp(TS_LIMIT - 1, 0, 0, 0), None);
+    assert_eq!(initial_timestamp(TS_LIMIT, 0, 0, 0), None);
+}
+
+#[test]
+fn only_signatures_that_verify_count_for_the_timestamp_and_the_cap_applies() {
+    let now = crate::signing::mavlink_timestamp_now();
+    // A verified heartbeat a little ahead is respected.
     let mut r = rig("sg-ts");
     r.want();
-    let far = crate::signing::mavlink_timestamp_now() + 50_000_000_000;
-    {
-        let mut a = r.ap.borrow_mut();
-        a.sign_own = true;
-        a.hb_ts = far;
-    }
-    // The autopilot signs its heartbeats under the key in use, which is the
-    // current one; the signer reads their timestamps while it watches.
-    r.run(3);
-    let ap = r.ap.borrow();
-    let Sent::Setup { initial, .. } = ap.sends[0] else {
-        panic!()
-    };
-    assert!(initial > far, "{initial} must be above {far}");
-    drop(ap);
-    // And a floor left by oasa-link (timestamps seen through the tunnel) counts.
-    let mut r = rig("sg-ts2");
-    r.want();
-    let floor = crate::signing::mavlink_timestamp_now() + 90_000_000_000;
-    rotation::write_seen_ts(&r.dir, floor).unwrap();
+    let near = now + 1_000_000;
+    r.ap.borrow_mut().hb_ts = near;
     r.run(3);
     let Sent::Setup { initial, .. } = r.ap.borrow().sends[0] else {
         panic!()
     };
-    assert!(initial > floor);
+    assert!(initial > near, "{initial} must be above {near}");
+
+    // One signed far ahead is capped.
+    let mut r = rig("sg-ts-far");
+    r.want();
+    r.ap.borrow_mut().hb_ts = (1 << 48) - 1;
+    r.run(3);
+    let Sent::Setup { initial, .. } = r.ap.borrow().sends[0] else {
+        panic!()
+    };
+    assert!(initial <= now + TS_AHEAD + 10_000_000, "{initial}");
+
+    // One signed with a key we do not hold is not read at all.
+    let mut r = rig("sg-ts-forged");
+    r.want();
+    {
+        let mut a = r.ap.borrow_mut();
+        a.sign_own = true;
+        a.hb_ts = now + 5_000_000; // within the cap, so only verification excludes it
+        a.key = Some([9; 32]); // signs under a key the signer does not have
+    }
+    r.run(3);
+    assert_eq!(r.signer.max_ts, 0);
+
+    // A floor file (timestamps seen through the tunnel) counts, capped too.
+    let mut r = rig("sg-ts-file");
+    r.want();
+    rotation::write_seen_ts(&r.dir, (1 << 48) - 1).unwrap();
+    r.run(3);
+    let Sent::Setup { initial, .. } = r.ap.borrow().sends[0] else {
+        panic!()
+    };
+    assert!(initial <= now + TS_AHEAD + 10_000_000, "{initial}");
+}
+
+/// A pending key that the autopilot may or may not have: power was lost right
+/// after the key change was sent.
+fn crashed_rig(tag: &str, autopilot_took_it: bool) -> Rig {
+    let mut r = rig(tag);
+    r.want();
+    {
+        let mut a = r.ap.borrow_mut();
+        a.ignore_setup = !autopilot_took_it;
+        a.crash_at_send = Some(2);
+    }
+    assert!(r.signer.tick().is_err());
+    r.ap.borrow_mut().crash_at_send = None;
+    r.restart();
+    r
+}
+
+fn frame(r: &Rig, comp: u8, msg: MavMessage, key: Option<[u8; 32]>) -> Frame {
+    let at = r.ap.borrow().t + Duration::from_millis(100);
+    Frame {
+        at,
+        msg,
+        signed: key.map(|k| (k, 5_000)),
+        comp,
+        ack_to: (SYS, SIGNER_COMP),
+    }
+}
+
+fn ack() -> MavMessage {
+    MavMessage::COMMAND_ACK(COMMAND_ACK_DATA {
+        command: MavCmd::MAV_CMD_REQUEST_MESSAGE,
+        result: MavResult::MAV_RESULT_ACCEPTED,
+    })
+}
+
+#[test]
+fn frames_from_other_components_prove_nothing() {
+    // The autopilot is silent. Another component on the system, holding or
+    // routing old-key frames, answers our requests: that is not the autopilot.
+    let mut r = crashed_rig("sg-othercomp", false);
+    r.ap.borrow_mut().silent = true;
+    let old = *r.old.as_bytes();
+    // `silent` stops the fake's own queue, so feed it through a second fake:
+    // a long-lived stream of old-key frames from component 2.
+    r.ap.borrow_mut().silent = false;
+    r.ap.borrow_mut().drop_acks = u32::MAX;
+    for i in 0..80u64 {
+        let mut f = frame(&r, 2, ack(), Some(old));
+        f.at += Duration::from_secs(i);
+        r.ap.borrow_mut().push(f);
+        let mut f = frame(&r, 2, heartbeat(false), Some(old));
+        f.at += Duration::from_secs(i);
+        r.ap.borrow_mut().push(f);
+    }
+    let ev = r.run(1);
+    assert_eq!(ev, vec![Event::Stuck], "it must not roll the key back");
+    assert!(r.keys().next.is_some(), "both keys are kept");
+}
+
+#[test]
+fn an_old_key_ack_meant_for_somebody_else_does_not_roll_back() {
+    let mut r = crashed_rig("sg-otherdest", false);
+    r.ap.borrow_mut().ack_to = Some((SYS, 200));
+    let ev = r.run(1);
+    assert_eq!(ev, vec![Event::Stuck]);
+    assert!(r.keys().next.is_some());
+    // The same autopilot answering us is believed.
+    let mut r = crashed_rig("sg-ourdest", false);
+    assert_eq!(r.run(1), vec![Event::RolledBack(1)]);
+}
+
+#[test]
+fn evidence_for_both_keys_is_stuck_not_a_guess() {
+    let mut r = crashed_rig("sg-mixed", false);
+    let next = *r.keys().next.unwrap().1.as_bytes();
+    // The autopilot answers under the old key; 2 s later a frame from it
+    // verifies under the new key.
+    let mut f = frame(&r, COMP, heartbeat(false), Some(next));
+    f.at += Duration::from_secs(5);
+    r.ap.borrow_mut().push(f);
+    r.ap.borrow_mut().sign_own = false;
+    let ev = r.run(1);
+    assert_eq!(ev, vec![Event::Stuck]);
+    assert!(r.keys().next.is_some() && r.files(rotation::PENDING_FILE));
+}
+
+#[test]
+fn a_new_key_frame_from_the_autopilot_settles_it() {
+    let mut r = crashed_rig("sg-newframe", true);
+    // Quiet autopilot, deaf to requests, but its heartbeat is under the new key.
+    let ev = r.run(1);
+    assert_eq!(ev, vec![Event::Rotated(1)]);
+    // A new-key frame from another component is not enough.
+    let mut r = crashed_rig("sg-newframe-other", true);
+    {
+        let mut a = r.ap.borrow_mut();
+        a.silent = true;
+    }
+    let next = *r.keys().next.unwrap().1.as_bytes();
+    r.ap.borrow_mut().silent = false;
+    r.ap.borrow_mut().sign_own = false;
+    r.ap.borrow_mut().drop_acks = u32::MAX;
+    for i in 0..80u64 {
+        let mut f = frame(&r, 2, heartbeat(false), Some(next));
+        f.at += Duration::from_secs(i);
+        r.ap.borrow_mut().push(f);
+    }
+    assert_eq!(r.run(1), vec![Event::Stuck]);
+}
+
+#[test]
+fn a_stuck_rotation_is_asked_again_every_five_minutes_and_reported_each_time() {
+    let mut r = rig("sg-reprobe");
+    r.want();
+    r.ap.borrow_mut().mute_after_setup = true;
+    let mut ev = r.run(2);
+    assert_eq!(ev, vec![Event::Issued(1), Event::Stuck]);
+    // Still silent: it asks again later, without anybody asking it to, and
+    // says so each time.
+    ev = r.run(900);
+    let stuck = ev.iter().filter(|e| **e == Event::Stuck).count();
+    assert!(stuck >= 2, "{ev:?}");
+    assert!(r.keys().next.is_some());
+    // The autopilot comes back with the new key: found without a new request.
+    {
+        let mut a = r.ap.borrow_mut();
+        a.silent = false;
+        a.mute_after_setup = false;
+    }
+    let ev = r.run(500);
+    assert_eq!(ev, vec![Event::Rotated(1)]);
+    assert!(!r.files(rotation::PENDING_FILE));
+}
+
+#[test]
+fn once_the_autopilot_signs_only_signed_heartbeats_say_it_is_disarmed() {
+    let mut r = rig("sg-unsigned-hb");
+    r.want();
+    r.ap.borrow_mut().armed = true;
+    assert_eq!(r.run(4), vec![Event::WaitingArmed]);
+    // Somebody on the link feeds "disarmed" heartbeats with no signature.
+    for i in 0..30u64 {
+        let mut f = frame(&r, COMP, heartbeat(false), None);
+        f.at += Duration::from_millis(100 * i);
+        r.ap.borrow_mut().push(f);
+    }
+    let ev = r.run(10);
+    assert!(ev.is_empty(), "{ev:?}");
+    assert!(r.ap.borrow().sends.is_empty(), "nothing was sent");
+    // The real, signed heartbeat saying disarmed is believed.
+    r.ap.borrow_mut().armed = false;
+    assert_eq!(r.run(3), vec![Event::Issued(1), Event::Rotated(1)]);
+}
+
+#[test]
+fn an_autopilot_that_never_signs_is_read_from_its_plain_heartbeats() {
+    let dir = tempdir("sg-plain");
+    let old = SigningKey::generate().unwrap();
+    old.save(&dir.join(AUTOPILOT_KEY_FILE)).unwrap();
+    let ap = Rc::new(RefCell::new(Ap {
+        key: None,
+        ..Ap::default()
+    }));
+    let mut s = Signer::new(&dir, FakePort(ap.clone()), cfg());
+    rotation::request(&dir, "requested", "-", 1).unwrap();
+    ap.borrow_mut().armed = true;
+    assert_eq!(s.tick().unwrap(), vec![Event::WaitingArmed]);
 }
 
 #[test]

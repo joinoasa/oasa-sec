@@ -399,3 +399,118 @@ fn many_processes_changing_one_folder_lose_nothing() {
     }
     assert_eq!(ok(&["peers", "--dir", s(&b)]).lines().count(), n);
 }
+
+fn make_drone(tag: &str) -> PathBuf {
+    let (d, _, _) = make(tag);
+    oasa_sec::signing::SigningKey::generate()
+        .unwrap()
+        .save(&d.join("mavlink-signing-key.bin"))
+        .unwrap();
+    d
+}
+
+#[test]
+fn demoting_an_operator_on_a_drone_asks_for_a_new_signing_key_and_says_so() {
+    let drone = make_drone("demote");
+    let (_, kb, _) = make("demote-b");
+    let t = |role: &str| {
+        pair(&[
+            "trust",
+            "--dir",
+            s(&drone),
+            "--name",
+            "b",
+            "--key",
+            &kb,
+            "--role",
+            role,
+        ])
+    };
+    for role in ["peer", "operator"] {
+        assert!(t(role).status.success());
+    }
+    // peer -> operator asked for nothing; operator -> peer does.
+    assert!(!drone.join("rotation-pending").exists());
+    let out = t("peer");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("new key was requested"), "{text}");
+    let pending = std::fs::read_to_string(drone.join("rotation-pending")).unwrap();
+    assert!(pending.contains("operator-role-changed"), "{pending}");
+}
+
+#[test]
+fn migrating_on_a_drone_makes_everyone_an_operator_and_says_so_loudly() {
+    let a = make_drone("migdrone");
+    let key = data_encoding::BASE32_NOPAD.encode(&[9u8; 32]);
+    let old = a.join("trusted-peers");
+    std::fs::write(
+        &old,
+        format!("# OASA-SEC v0 trusted peers: <public key> <name>\n{key} friend\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let o = pair(&["peers", "--dir", s(&a)]);
+    assert!(o.status.success());
+    let se = String::from_utf8_lossy(&o.stderr);
+    assert!(se.contains("CHECK THIS") && se.contains("OPERATOR"), "{se}");
+    assert!(se.contains("trust --role peer"), "{se}");
+}
+
+#[test]
+fn a_second_signer_on_one_folder_is_refused() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let d = make_drone("onesigner");
+    let mut first = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+        .args([
+            "signer",
+            "--dir",
+            s(&d),
+            "--autopilot",
+            "udpout:127.0.0.1:14999",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(first.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("signer_started"), "{line}");
+    let e = err(&[
+        "signer",
+        "--dir",
+        s(&d),
+        "--autopilot",
+        "udpout:127.0.0.1:14998",
+    ]);
+    assert!(e.contains("already running"), "{e}");
+    first.kill().unwrap();
+    first.wait().unwrap();
+    // Once the first is gone, the folder is free again.
+    let mut second = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+        .args([
+            "signer",
+            "--dir",
+            s(&d),
+            "--autopilot",
+            "udpout:127.0.0.1:14999",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(second.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("signer_started"), "{line}");
+    second.kill().unwrap();
+    second.wait().unwrap();
+}

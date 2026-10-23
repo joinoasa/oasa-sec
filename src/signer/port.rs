@@ -18,9 +18,13 @@ use mavlink::{
     consts,
 };
 
+use zeroize::Zeroize;
+
 use super::{Inbound, Port, Sig};
 use crate::signing::{SigningKey, mavlink_timestamp_now};
 use crate::{Error, Result};
+
+const COMMAND_ACK_ID: u32 = 77;
 
 type Conn = mavlink::Connection<MavMessage>;
 
@@ -71,7 +75,7 @@ impl UdpPort {
             start: Instant::now(),
             header: MavHeader {
                 system_id: sys,
-                component_id: 191, // MAV_COMP_ID_ONBOARD_COMPUTER
+                component_id: super::SIGNER_COMP, // MAV_COMP_ID_ONBOARD_COMPUTER
                 sequence: 0,
             },
             link_id,
@@ -117,9 +121,14 @@ impl Port for UdpPort {
                 ts
             }
         };
-        self.conn
-            .send_raw(&MAVLinkMessageRaw::V2(raw))
-            .map_err(io)?;
+        // The frame may carry a signing key (SETUP_SIGNING): wipe our copy
+        // once it is sent.
+        let raw = MAVLinkMessageRaw::V2(raw);
+        let sent = self.conn.send_raw(&raw);
+        if let MAVLinkMessageRaw::V2(mut r) = raw {
+            r.as_mut_slice().zeroize();
+        }
+        sent.map_err(io)?;
         Ok(used)
     }
 
@@ -136,6 +145,16 @@ impl Port for UdpPort {
             timestamp: raw.signature_timestamp(),
             verified_by: keys.iter().position(|k| signature_ok(&raw, k)),
         });
+        // `MavMessage` has no extension fields, so read a COMMAND_ACK's
+        // target_system and target_component (bytes 8 and 9; a MAVLink 2
+        // payload drops trailing zeros) from the raw payload.
+        let ack_target = (raw.message_id() == COMMAND_ACK_ID).then(|| {
+            let p = raw.payload();
+            (
+                p.get(8).copied().unwrap_or(0),
+                p.get(9).copied().unwrap_or(0),
+            )
+        });
         Ok(Some(Inbound {
             header: MavHeader {
                 system_id: raw.system_id(),
@@ -144,6 +163,7 @@ impl Port for UdpPort {
             },
             msg,
             sig,
+            ack_target,
         }))
     }
 }

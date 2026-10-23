@@ -365,7 +365,7 @@ pub enum Event {
     /// A control message arrived, authenticated and not replayed: its bytes
     /// (type, request id, body) without the content type byte. Never goes to
     /// the application side; hand it to [`crate::control::Control`].
-    Control(Vec<u8>),
+    Control(Zeroizing<Vec<u8>>),
     /// A data packet (or keepalive) passed every check. The caller may
     /// update the peer's address to where it came from. Always comes before
     /// the `Send` and `Deliver` it causes.

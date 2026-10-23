@@ -21,10 +21,60 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mavlink::dialects::common::{
-    COMMAND_ACK_DATA, HEARTBEAT_DATA, MavAutopilot, MavMessage, MavModeFlag, MavResult, MavState,
-    MavType,
+    HEARTBEAT_DATA, MavAutopilot, MavMessage, MavModeFlag, MavState, MavType,
 };
-use mavlink::{MavConnection, MavHeader, SigningConfig};
+use mavlink::{
+    MAVLinkMessageRaw, MAVLinkV2MessageRaw, MavConnection, MavHeader, Message, SigningConfig,
+    consts,
+};
+
+/// A signed (or, with no key, unsigned) `COMMAND_ACK` that names who it
+/// answers, as real autopilots do. The library's message type has no
+/// extension fields, so the frame is built by hand.
+fn ack_frame(
+    me: MavHeader,
+    command: u16,
+    to: (u8, u8),
+    key: Option<[u8; 32]>,
+    ts: u64,
+) -> MAVLinkV2MessageRaw {
+    let mut raw = MAVLinkV2MessageRaw::new();
+    let buf = raw.as_mut_slice();
+    buf.fill(0);
+    let mut payload = [0u8; 10];
+    payload[..2].copy_from_slice(&command.to_le_bytes());
+    // result 0 = ACCEPTED; progress, result_param2 stay 0.
+    payload[8] = to.0;
+    payload[9] = to.1;
+    buf[0] = 0xFD;
+    buf[1] = 10;
+    buf[2] = if key.is_some() { 1 } else { 0 }; // IFLAG_SIGNED
+    buf[4] = me.sequence;
+    buf[5] = me.system_id;
+    buf[6] = me.component_id;
+    buf[7..10].copy_from_slice(&77u32.to_le_bytes()[..3]);
+    buf[10..20].copy_from_slice(&payload);
+    let extra = <MavMessage as Message>::extra_crc(77);
+    let crc = mavlink::calculate_crc(&buf[1..20], extra);
+    buf[20..22].copy_from_slice(&crc.to_le_bytes());
+    if let Some(k) = key {
+        raw.signature_link_id_mut().clone_from(&0);
+        raw.signature_timestamp_bytes_mut()
+            .copy_from_slice(&ts.to_le_bytes()[..consts::v2::SIGNATURE_TIMESTAMP_SIZE]);
+        let mut sig = [0u8; consts::v2::SIGNATURE_VALUE_SIZE];
+        raw.calculate_signature(&k, &mut sig);
+        raw.signature_value_mut().copy_from_slice(&sig);
+    }
+    raw
+}
+
+/// MAVLink signature time: 10 microsecond units since 2015-01-01.
+fn mavlink_ts_now() -> u64 {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64);
+    (unix / 10).saturating_sub(1_420_070_400_000_000 / 10)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -57,6 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sequence: 0,
     };
     let mut has_key = false;
+    let mut key_bytes = None::<[u8; 32]>;
+    let mut seq = 0u8;
+    let mut last_ts = 0u64;
     if let Some(key) = state_file
         .as_ref()
         .and_then(|p| std::fs::read(p).ok())
@@ -64,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         conn.setup_signing(Some(SigningConfig::new(key, 0, true, false)));
         has_key = true;
+        key_bytes = Some(key);
     }
     println!(
         "fake autopilot listening on {addr} ({} signing key yet)",
@@ -116,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if s.secret_key == [0u8; 32] {
                     conn.setup_signing(None);
                     has_key = false;
+                    key_bytes = None;
                     if let Some(p) = &state_file {
                         let _ = std::fs::remove_file(p);
                     }
@@ -132,6 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         hdr.component_id
                     );
                     has_key = true;
+                    key_bytes = Some(s.secret_key);
                 }
             }
             MavMessage::COMMAND_LONG(c) if c.target_system == me.system_id => {
@@ -143,11 +199,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("dropping the COMMAND_ACK");
                     continue;
                 }
-                let ack = MavMessage::COMMAND_ACK(COMMAND_ACK_DATA {
-                    command: c.command,
-                    result: MavResult::MAV_RESULT_ACCEPTED,
-                });
-                conn.send(&me, &ack)?;
+                seq = seq.wrapping_add(1);
+                last_ts = mavlink_ts_now().max(last_ts + 1);
+                let raw = ack_frame(
+                    MavHeader {
+                        sequence: seq,
+                        ..me
+                    },
+                    c.command as u16,
+                    (hdr.system_id, hdr.component_id),
+                    key_bytes,
+                    last_ts,
+                );
+                conn.send_raw(&MAVLinkMessageRaw::V2(raw))?;
             }
             _ => {}
         }

@@ -284,13 +284,30 @@ impl DirLock {
     /// Only for tests of the lock itself: take it if it is free.
     #[cfg(test)]
     pub(crate) fn try_acquire(dir: &Path) -> Result<Option<Self>> {
+        Self::try_acquire_named(dir, LOCK_FILE)
+    }
+
+    /// Take the lock on the private file `name` in `dir` if it is free
+    /// (`None` if another process holds it). For one-instance-only programs.
+    pub(crate) fn try_acquire_named(dir: &Path, name: &str) -> Result<Option<Self>> {
         ensure_private_dir(dir)?;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(LOCK_FILE))?;
+        let path = dir.join(name);
+        if let Ok(m) = fs::symlink_metadata(&path)
+            && m.file_type().is_symlink()
+        {
+            return Err(Error::BadKeyFile(format!(
+                "{} is a symlink; refusing",
+                path.display()
+            )));
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),

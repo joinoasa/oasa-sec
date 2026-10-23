@@ -1561,7 +1561,7 @@ fn controls(events: &[Event]) -> Vec<Vec<u8>> {
     events
         .iter()
         .filter_map(|e| match e {
-            Event::Control(p) => Some(p.clone()),
+            Event::Control(p) => Some(p.to_vec()),
             _ => None,
         })
         .collect()

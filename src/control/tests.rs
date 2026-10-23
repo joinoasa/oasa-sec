@@ -59,7 +59,7 @@ fn sends(actions: &[Action]) -> Vec<Vec<u8>> {
     actions
         .iter()
         .filter_map(|a| match a {
-            Action::Send(b) => Some(b.clone()),
+            Action::Send(b) => Some(b.to_vec()),
             _ => None,
         })
         .collect()
@@ -251,7 +251,7 @@ fn a_signing_key_never_shows_in_debug_output() {
         generation: 1,
         key: SecretKey::new([0xEE; 32]),
     };
-    let shown = format!("{m:?} {:?}", Action::Send(m.encode().to_vec()));
+    let shown = format!("{m:?} {:?}", Action::Send(m.encode()));
     assert!(
         !shown.contains("238") && !shown.to_lowercase().contains("ee, ee"),
         "{shown}"
@@ -570,7 +570,7 @@ fn a_drone_sends_next_then_commit_and_remembers_what_was_acked() {
     assert!(sends(&out).is_empty());
     assert_eq!(rotation::read_acked(&dir, &fp).unwrap().next, 1);
     // The autopilot took it: the commit.
-    rotation::commit(&dir, 1, 0).unwrap();
+    rotation::commit(&dir, 1).unwrap();
     let Message::SigningKeyCommit { id, generation } = only_send(&d.signing_changed(secs(2)))
     else {
         panic!()
@@ -619,7 +619,7 @@ fn a_drone_and_an_operator_talk_through_a_rotation_even_with_a_lost_message() {
         1
     );
     // The autopilot took it.
-    rotation::commit(&ddir, b.generation, 0).unwrap();
+    rotation::commit(&ddir, b.generation).unwrap();
     let out = d.signing_changed(secs(4));
     pump(&mut d, &mut o, out, secs(4));
     assert_eq!(
@@ -656,7 +656,7 @@ fn a_reconnecting_operator_that_missed_a_rotation_catches_up() {
     for g in 1..=2 {
         let b = rotation::begin(&ddir).unwrap();
         assert_eq!(b.generation, g);
-        rotation::commit(&ddir, g, 0).unwrap();
+        rotation::commit(&ddir, g).unwrap();
     }
     // It comes back: NEXT(2) for the current key, then COMMIT(2).
     let start = d.session_started(secs(10));
@@ -708,7 +708,7 @@ fn an_unacked_commit_starts_over_with_next_and_retries_back_off() {
         }
         .encode(),
     );
-    rotation::commit(&dir, b.generation, 0).unwrap();
+    rotation::commit(&dir, b.generation).unwrap();
     assert!(matches!(
         only_send(&d.signing_changed(secs(1))),
         Message::SigningKeyCommit { .. }

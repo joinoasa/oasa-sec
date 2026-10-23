@@ -16,10 +16,13 @@
 //!    signed `MAV_CMD_REQUEST_MESSAGE` and a signed matching `COMMAND_ACK`,
 //!    and commit.
 //!
-//! Which key the autopilot has is never guessed. A keyed autopilot signs what
-//! it sends: if its frames verify under one key, that key is in use. Else we
-//! ask under each key, for 75 s. If neither answers, both files stay and the
-//! rotation is reported `rotation_stuck`.
+//! Which key the autopilot has is never guessed. Only frames from the
+//! autopilot itself (its system and component id) count. A frame that
+//! verifies under the new key means the new key is in use. The old key is
+//! kept only after a `COMMAND_ACK` signed with it that answers our own request
+//! (it names us as its target) and no frame under the new key shows up
+//! meanwhile. Evidence for both, or for neither, is `rotation_stuck`: both
+//! files stay, and the probe runs again every five minutes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,6 +32,8 @@ use mavlink::dialects::common::{
     COMMAND_LONG_DATA, HEARTBEAT_DATA, MavAutopilot, MavCmd, MavMessage, MavModeFlag, MavState,
     MavType, SETUP_SIGNING_DATA,
 };
+
+use zeroize::Zeroize;
 
 use crate::rotation;
 use crate::signing::{SigningKey, mavlink_timestamp_now};
@@ -47,6 +52,17 @@ pub const LISTEN: Duration = Duration::from_secs(4);
 pub const PROBE_TOTAL: Duration = Duration::from_secs(75);
 /// After a rotation fails, wait this long before the next try.
 pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(30);
+/// After a stuck probe, ask again this often.
+pub const STUCK_REPROBE: Duration = Duration::from_secs(300);
+/// After an old-key answer, keep listening this long for a new-key frame.
+pub const SETTLE: Duration = Duration::from_secs(3);
+/// The component id we speak as (the onboard computer).
+pub const SIGNER_COMP: u8 = 191;
+/// A signature timestamp may be this far ahead of our clock (60 s, in
+/// MAVLink units of 10 microseconds) before it is ignored as a floor.
+pub const TS_AHEAD: u64 = 6_000_000;
+/// MAVLink signature timestamps are 48 bits.
+pub const TS_LIMIT: u64 = 1 << 48;
 /// How long one tick watches the autopilot.
 pub const TICK: Duration = Duration::from_secs(1);
 
@@ -65,6 +81,9 @@ pub struct Inbound {
     pub msg: MavMessage,
     /// `None`: not signed.
     pub sig: Option<Sig>,
+    /// For a `COMMAND_ACK`: who it answers (its extension fields
+    /// `target_system`, `target_component`).
+    pub ack_target: Option<(u8, u8)>,
 }
 
 /// The dedicated autopilot link.
@@ -111,8 +130,11 @@ pub enum Event {
     /// The autopilot kept the old key; the new one was dropped. A new try
     /// will use a new generation.
     RolledBack(u32),
-    /// Neither key answered. Both files are kept.
+    /// Neither key answered, or the evidence disagreed. Both files are kept.
     Stuck,
+    /// No safe signature timestamp exists (the clock is at the 48-bit limit).
+    /// Nothing was issued.
+    Refused,
 }
 
 impl Event {
@@ -124,6 +146,7 @@ impl Event {
             Event::Rotated(_) => "rotation_done",
             Event::RolledBack(_) => "rotation_rolled_back",
             Event::Stuck => "rotation_stuck",
+            Event::Refused => "rotation_refused",
         }
     }
 
@@ -151,6 +174,12 @@ pub struct Signer<P: Port> {
     probe_due: bool,
     /// Requests waiting when the last probe got no answer.
     stuck_with: Option<usize>,
+    /// When to ask again after a stuck probe.
+    stuck_retry_at: Option<Duration>,
+    /// The autopilot has been seen signing under a key we hold: from now on
+    /// only signed heartbeats say whether it is armed.
+    keyed: bool,
+    tidied: bool,
     retry_at: Duration,
     last_wait: Option<Event>,
     /// Told of each event as it happens (a tick can take 80 s).
@@ -168,6 +197,9 @@ impl<P: Port> Signer<P> {
             next_ts: 0,
             probe_due: true,
             stuck_with: None,
+            stuck_retry_at: None,
+            keyed: false,
+            tidied: false,
             retry_at: Duration::ZERO,
             last_wait: None,
             on_event: None,
@@ -191,29 +223,45 @@ impl<P: Port> Signer<P> {
     }
 
     /// Watch the autopilot for `wait`: note heartbeats and signature times.
-    fn observe(&mut self, wait: Duration) -> Result<()> {
+    /// Signatures are checked against `key`.
+    fn observe(&mut self, wait: Duration, key: &SigningKey) -> Result<()> {
         let end = self.port.now() + wait;
         loop {
             let left = end.saturating_sub(self.port.now());
             if left.is_zero() {
                 return Ok(());
             }
-            match self.port.recv(left, &[])? {
+            match self.port.recv(left, &[key])? {
                 Some(f) => self.note(&f),
                 None => return Ok(()),
             }
         }
     }
 
+    fn sent_by_autopilot(&self, f: &Inbound) -> bool {
+        f.header.system_id == self.cfg.sys && f.header.component_id == self.cfg.comp
+    }
+
+    /// Take in a frame. Signature times count only when the signature
+    /// verifies under a key we hold (anyone can write a time on a frame).
+    /// Arming state comes from the autopilot's own heartbeat: signed and
+    /// verified, or, until we have seen it sign anything, unsigned.
     fn note(&mut self, f: &Inbound) {
         if f.header.system_id != self.cfg.sys {
             return;
         }
-        if let Some(s) = f.sig {
+        let verified = f.sig.is_some_and(|s| s.verified_by.is_some());
+        if let Some(s) = f.sig
+            && verified
+        {
             self.max_ts = self.max_ts.max(s.timestamp);
+            if self.sent_by_autopilot(f) {
+                self.keyed = true;
+            }
         }
-        if f.header.component_id == self.cfg.comp
+        if self.sent_by_autopilot(f)
             && let MavMessage::HEARTBEAT(h) = &f.msg
+            && (verified || (f.sig.is_none() && !self.keyed))
         {
             let armed = h.base_mode.bits() & MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED.bits() != 0;
             let now = self.port.now();
@@ -243,11 +291,12 @@ impl<P: Port> Signer<P> {
         Ok(())
     }
 
-    /// Is this frame the autopilot's answer to our request?
+    /// Is this frame the autopilot's answer to our own request (it names us
+    /// as the one it answers)?
     fn is_answer(&self, f: &Inbound) -> bool {
-        f.header.system_id == self.cfg.sys
-            && f.header.component_id == self.cfg.comp
+        self.sent_by_autopilot(f)
             && matches!(&f.msg, MavMessage::COMMAND_ACK(a) if a.command == MavCmd::MAV_CMD_REQUEST_MESSAGE)
+            && f.ack_target == Some((self.cfg.sys, SIGNER_COMP))
     }
 
     /// Step 5: ask under `key` once a second for up to `wait`; true when a
@@ -290,20 +339,28 @@ impl<P: Port> Signer<P> {
         // A companion computer says hello once a second, signed with the
         // current key: the autopilot learns where to send its frames (some only
         // answer the last address that spoke), and we hear its heartbeats.
+        if !self.tidied {
+            rotation::tidy(&self.dir)?;
+            self.tidied = true;
+        }
         self.send(&keys.current, &companion_heartbeat())?;
-        self.observe(TICK)?;
+        self.observe(TICK, &keys.current)?;
         let lines = rotation::pending_lines(&self.dir)?;
         if keys.next.is_some() {
-            let again = self.stuck_with.is_some_and(|n| n != lines);
+            let now = self.port.now();
+            let again = self.stuck_with.is_some_and(|n| n != lines)
+                || self.stuck_retry_at.is_some_and(|t| now >= t);
             if self.probe_due || again {
                 self.probe_due = false;
                 self.stuck_with = None;
+                self.stuck_retry_at = None;
                 return self.resolve();
             }
             return Ok(Vec::new());
         }
         self.probe_due = false;
         self.stuck_with = None;
+        self.stuck_retry_at = None;
         if lines == 0 {
             self.last_wait = None;
             return Ok(Vec::new());
@@ -334,29 +391,37 @@ impl<P: Port> Signer<P> {
 
     /// Steps 2 to 6.
     fn rotate(&mut self, current: SigningKey) -> Result<Vec<Event>> {
+        // Step 4, worked out first so a refusal burns no generation: the
+        // initial timestamp is one more than the latest of our clock and the
+        // signed timestamps we have seen, which count only up to a minute
+        // ahead of our clock (a peer cannot push it out of reach).
+        let seen = rotation::read_seen_ts(&self.dir).unwrap_or(0);
+        let Some(initial) =
+            initial_timestamp(mavlink_timestamp_now(), self.max_ts, seen, self.next_ts)
+        else {
+            self.retry_at = self.port.now() + RETRY_AFTER_FAILURE;
+            return Ok(vec![self.emit(Event::Refused)]);
+        };
         let begun = rotation::begin(&self.dir)?;
         let g = begun.generation;
         let mut events = vec![self.emit(Event::Issued(g))];
-        // Step 4: the initial timestamp is one more than the latest of our
-        // clock and every signed timestamp we have seen.
-        let seen = rotation::read_seen_ts(&self.dir).unwrap_or(0);
-        let initial = mavlink_timestamp_now()
-            .max(self.max_ts)
-            .max(self.next_ts)
-            .max(seen)
-            .saturating_add(1);
-        let setup = MavMessage::SETUP_SIGNING(SETUP_SIGNING_DATA {
+        let mut setup = MavMessage::SETUP_SIGNING(SETUP_SIGNING_DATA {
             initial_timestamp: initial,
             target_system: self.cfg.sys,
             target_component: self.cfg.comp,
             secret_key: *begun.key.as_bytes(),
         });
         self.next_ts = self.next_ts.max(initial);
-        self.send(&current, &setup)?;
+        let sent = self.send(&current, &setup);
+        // The message holds the new key: wipe it whether or not it went.
+        if let MavMessage::SETUP_SIGNING(s) = &mut setup {
+            s.secret_key.zeroize();
+        }
+        sent?;
         // Step 5: the autopilot needs a moment to switch.
-        self.observe(Duration::from_millis(200))?;
+        self.observe(Duration::from_millis(200), &begun.key)?;
         if self.prove(&begun.key, PROVE_WAIT)? {
-            rotation::commit(&self.dir, g, begun.consumed)?;
+            rotation::commit(&self.dir, g)?;
             events.push(self.emit(Event::Rotated(g)));
             return Ok(events);
         }
@@ -379,33 +444,41 @@ impl<P: Port> Signer<P> {
             return Ok(vec![self.emit(Event::Rotated(g))]);
         }
         match self.which_key(&current, &next)? {
-            Some(1) => {
+            Probe::Next => {
                 self.finish(g)?;
                 Ok(vec![self.emit(Event::Rotated(g))])
             }
-            Some(_) => {
+            Probe::Current => {
                 rotation::abandon(&self.dir)?;
                 self.retry_at = self.port.now() + RETRY_AFTER_FAILURE;
                 Ok(vec![self.emit(Event::RolledBack(g))])
             }
-            None => {
+            Probe::Neither | Probe::Mixed => {
                 self.stuck_with = Some(rotation::pending_lines(&self.dir)?);
+                self.stuck_retry_at = Some(self.port.now() + STUCK_REPROBE);
                 Ok(vec![self.emit(Event::Stuck)])
             }
         }
     }
 
-    /// Commit after the fact (a restart found the new key in use). Requests
-    /// older than the pending key are answered by it; newer ones stay.
+    /// Commit after the fact (a restart found the new key in use).
     fn finish(&mut self, g: u32) -> Result<()> {
-        let consumed = rotation::lines_before_next(&self.dir)?;
-        rotation::commit(&self.dir, g, consumed)
+        rotation::commit(&self.dir, g)
     }
 
-    /// Which key (index into `[current, next]`) does the autopilot use?
-    /// `None`: neither answered. Never deletes anything.
-    fn which_key(&mut self, current: &SigningKey, next: &SigningKey) -> Result<Option<usize>> {
+    /// Which key does the autopilot use? Only its own frames count (not
+    /// other components', and not routed copies of old frames).
+    ///
+    /// - A frame from the autopilot that verifies under the new key: `Next`.
+    /// - An old-key `COMMAND_ACK` answering our request, and no new-key frame
+    ///   for [`SETTLE`] after it: `Current`. A bare old-key frame proves
+    ///   nothing (anyone who ever held the old key can write one).
+    /// - Both kinds of evidence: `Mixed`. None in 79 s: `Neither`.
+    ///
+    /// Never deletes anything.
+    fn which_key(&mut self, current: &SigningKey, next: &SigningKey) -> Result<Probe> {
         let both = [current, next];
+        let new_key = |f: &Inbound| f.sig.and_then(|s| s.verified_by) == Some(1);
         // 1. Listen: a keyed autopilot signs what it sends.
         let end = self.port.now() + LISTEN;
         while self.port.now() < end {
@@ -414,18 +487,25 @@ impl<P: Port> Signer<P> {
                 break;
             };
             self.note(&f);
-            if f.header.system_id == self.cfg.sys
-                && let Some(i) = f.sig.and_then(|s| s.verified_by)
-            {
-                return Ok(Some(i));
+            if self.sent_by_autopilot(&f) && new_key(&f) {
+                return Ok(Probe::Next);
             }
         }
         // 2. Ask under each key, once a second, for 75 s.
         let end = self.port.now() + PROBE_TOTAL;
         let req = self.request();
-        while self.port.now() < end {
-            self.send(next, &req)?;
-            self.send(current, &req)?;
+        let mut old_answer: Option<Duration> = None;
+        loop {
+            let now = self.port.now();
+            match old_answer {
+                Some(t) if now >= t + SETTLE => return Ok(Probe::Current),
+                None if now >= end => return Ok(Probe::Neither),
+                _ => {}
+            }
+            if old_answer.is_none() {
+                self.send(next, &req)?;
+                self.send(current, &req)?;
+            }
             let second = self.port.now() + Duration::from_secs(1);
             while self.port.now() < second {
                 let left = second.saturating_sub(self.port.now());
@@ -433,15 +513,48 @@ impl<P: Port> Signer<P> {
                     break;
                 };
                 self.note(&f);
-                if f.header.system_id == self.cfg.sys
-                    && let Some(i) = f.sig.and_then(|s| s.verified_by)
+                if !self.sent_by_autopilot(&f) {
+                    continue;
+                }
+                if new_key(&f) {
+                    return Ok(if old_answer.is_some() {
+                        Probe::Mixed
+                    } else {
+                        Probe::Next
+                    });
+                }
+                if old_answer.is_none()
+                    && self.is_answer(&f)
+                    && f.sig.and_then(|s| s.verified_by) == Some(0)
                 {
-                    return Ok(Some(i));
+                    old_answer = Some(self.port.now());
                 }
             }
         }
-        Ok(None)
     }
+}
+
+/// The initial timestamp for `SETUP_SIGNING`: one more than the latest of our
+/// clock, our own last timestamp and the signed timestamps seen (`seen_ts`
+/// from verified frames, `file_ts` from the tunnel's floor file), where the
+/// seen ones count only up to [`TS_AHEAD`] past the clock. A peer cannot push
+/// it out of reach. `None` if the result would not fit 48 bits.
+pub fn initial_timestamp(clock: u64, seen_ts: u64, file_ts: u64, own_next: u64) -> Option<u64> {
+    let ceiling = clock.saturating_add(TS_AHEAD);
+    let initial = clock
+        .max(seen_ts.min(ceiling))
+        .max(file_ts.min(ceiling))
+        .max(own_next)
+        .saturating_add(1);
+    (initial < TS_LIMIT).then_some(initial)
+}
+
+/// What the probe found.
+enum Probe {
+    Next,
+    Current,
+    Neither,
+    Mixed,
 }
 
 #[cfg(test)]

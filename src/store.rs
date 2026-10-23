@@ -280,9 +280,28 @@ pub fn add(dir: &Path, peer: &Peer) -> Result<()> {
         return Err(Error::Removed);
     }
     let mut peers = read_entries(dir)?;
+    let before = peers.iter().find(|p| p.public == peer.public).cloned();
     peers.retain(|p| p.public != peer.public);
     peers.push(peer.clone());
-    write_entries(dir, &lock, &peers)
+    write_entries(dir, &lock, &peers)?;
+    // An operator that is no longer one has held the drone's signing key and
+    // may hold a pending one: the key must change, as for a removal.
+    if before.is_some_and(|b| b.role == Role::Operator)
+        && peer.role != Role::Operator
+        && std::fs::symlink_metadata(dir.join(crate::signing::AUTOPILOT_KEY_FILE)).is_ok()
+    {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        crate::rotation::request_locked(
+            dir,
+            &lock,
+            "operator-role-changed",
+            &peer.fingerprint(),
+            unix,
+        )?;
+    }
+    Ok(())
 }
 
 /// Refuse a removed key. For pairing, before anything is shared with it.
@@ -331,6 +350,31 @@ mod tests {
             name: name.into(),
             role,
         }
+    }
+
+    #[test]
+    fn changing_an_operator_to_another_role_on_a_drone_asks_for_a_new_signing_key() {
+        let pending = |d: &Path| crate::rotation::pending_lines(d).unwrap();
+        let drone = tempdir("store-rotate");
+        crate::signing::SigningKey::generate()
+            .unwrap()
+            .save(&drone.join(crate::signing::AUTOPILOT_KEY_FILE))
+            .unwrap();
+        add(&drone, &peer(1, "a", Role::Peer)).unwrap();
+        add(&drone, &peer(1, "a", Role::Operator)).unwrap();
+        add(&drone, &peer(1, "a", Role::Operator)).unwrap();
+        add(&drone, &peer(2, "b", Role::Admin)).unwrap();
+        add(&drone, &peer(2, "b", Role::Peer)).unwrap();
+        assert_eq!(pending(&drone), 0, "none of those held a signing key");
+        add(&drone, &peer(1, "a", Role::Peer)).unwrap();
+        assert_eq!(pending(&drone), 1);
+        let text = std::fs::read_to_string(drone.join(crate::rotation::PENDING_FILE)).unwrap();
+        assert!(text.contains(" operator-role-changed "), "{text}");
+        // A ground station has no signing key of its own to rotate.
+        let ground = tempdir("store-rotate-g");
+        add(&ground, &peer(1, "a", Role::Operator)).unwrap();
+        add(&ground, &peer(1, "a", Role::Peer)).unwrap();
+        assert!(!ground.join(crate::rotation::PENDING_FILE).exists());
     }
 
     #[test]
