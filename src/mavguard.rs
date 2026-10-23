@@ -1382,6 +1382,16 @@ mod tests {
                 "{name} by id"
             );
         }
+        // The flag opens those two and nothing else.
+        let g = guard().allow_rtk();
+        assert_eq!(
+            g.check(&v2(33, &[1], false)).unwrap_err().why,
+            Why::MsgNotAllowed
+        );
+        assert_eq!(
+            g.check(&v2(24, &[1], false)).unwrap_err().why,
+            Why::MsgNotAllowed
+        );
         assert!(DEFAULT_MESSAGES.iter().all(|m| m.0 != 123 && m.0 != 233));
     }
 
