@@ -641,7 +641,7 @@ fn removed(o: &Opts) -> R {
             .records()
             .iter()
             .rev()
-            .find_map(|rec| match (&rec.key == &k, &rec.kind) {
+            .find_map(|rec| match (rec.key == k, &rec.kind) {
                 (true, removal::RecordKind::Removed(removal::Source::Local)) => {
                     Some("by hand".to_string())
                 }
