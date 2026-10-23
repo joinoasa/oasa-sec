@@ -28,6 +28,8 @@ $PYTHON -I -c 'from pymavlink import mavutil' 2>/dev/null \
   || { echo "pymavlink is not importable by $PYTHON (pip install pymavlink)"; exit 2; }
 
 T=$(mktemp -d); mkdir "$T/sitl"
+# No auto-disarm: the armed checks keep the vehicle armed on the ground for as long as they need.
+echo "DISARM_DELAY 0" > "$T/extra.parm"
 SITL_PID=; DRONE_PID=
 PASS=0; FAILS=0
 cleanup() {
@@ -51,7 +53,7 @@ oack() { ack "$OASA" command --dir "$T/gcs" --to "tcpout:127.0.0.1:$1" --wait "$
 # --serial0 tcp:PORT matters: without it SERIAL0 waits for a client and SITL blocks at boot.
 start_sitl() {
   ( cd "$T/sitl" && exec "$SITL_BIN" --model + --speedup 1 --serial0 tcp:$P0 \
-      --defaults "$ARDUPILOT_DIR/Tools/autotest/default_params/copter.parm" -I$INST --sysid 1 \
+      --defaults "$ARDUPILOT_DIR/Tools/autotest/default_params/copter.parm,$T/extra.parm" -I$INST --sysid 1 \
       >> "$T/sitl.log" 2>&1 ) &
   SITL_PID=$!
   for _ in $(seq 100); do (exec 3<> /dev/tcp/127.0.0.1/$P1) 2> /dev/null && break; sleep 0.3; done
@@ -151,6 +153,113 @@ check e2-rotated-key-dead no-ACK "$(ack $PROBE cmd $P1 "$T/new.bin")"
 stop_sitl; start_sitl; sleep 5
 for _ in $(seq 20); do [ "$(ack $PROBE cmd $P1 "$T/att.bin")" = ACK ] && break; sleep 4; done
 check e2-attacker-key-persists-after-restart ACK "$(ack $PROBE cmd $P1 "$T/att.bin")"
+
+
+# ---- Signing-key rotation (R-SEC2 phase B) ----------------------------------
+# A fresh simulator (empty storage). The signer owns SERIAL1; the test clients use SERIAL2, so they
+# do not take the signer's link away. Delivery of each new key to the remaining operator goes
+# through a real oasa-link pair.
+echo "== rotation: fresh simulator, two operators"
+stop_sitl; rm -f "$T/sitl/eeprom.bin"; start_sitl
+LINK=$ROOT/target/debug/oasa-link
+R=$T/rot; mkdir "$R"
+for d in drone gcs1 gcs2; do "$OASA" init --dir "$R/$d" > /dev/null; done
+pair_op() { # gcs dir name
+  "$OASA" drone --dir "$R/drone" --name drone-1 --listen 127.0.0.1:$LISTEN --wait 60 \
+    --autopilot tcpout:127.0.0.1:$P1 --target 1:1 > "$R/pair-$2.log" 2>&1 &
+  DRONE_PID=$!
+  for _ in $(seq 50); do grep -q 'OASA1-' "$R/pair-$2.log" && break; sleep 0.1; done
+  local code; code=$(grep -o 'OASA1-[A-Z2-7]*' "$R/pair-$2.log")
+  echo "$code" | "$OASA" ground --dir "$1" --name "$2" --connect 127.0.0.1:$LISTEN --code - > /dev/null 2>&1
+  wait "$DRONE_PID"; DRONE_PID=
+}
+pair_op "$R/gcs1" gcs-1; pair_op "$R/gcs2" gcs-2
+DK=$R/drone/mavlink-signing-key.bin
+DFP=$(basename "$(ls "$R"/gcs1/signing-keys/*.bin | head -n1)" .bin)
+cp "$R/gcs1/signing-keys/$DFP.bin" "$R/gcs1-old.bin"
+check rot-both-operators-paired yes "$([ -f "$R/gcs1/signing-keys/$DFP.bin" ] && [ -f "$R/gcs2/signing-keys/$DFP.bin" ] && echo yes || echo no)"
+
+"$LINK" --dir "$R/drone" --peer gcs-2 --bind 127.0.0.1:7601 --plain-listen 127.0.0.1:7611 --plain-send 127.0.0.1:7612 \
+  --duration 3000 > "$R/dlink.log" 2>&1 &
+DLINK=$!
+"$LINK" --dir "$R/gcs2" --peer drone-1 --bind 127.0.0.1:7602 --remote 127.0.0.1:7601 --initiate \
+  --plain-listen 127.0.0.1:7621 --plain-send 127.0.0.1:7622 --duration 3000 > "$R/glink.log" 2>&1 &
+GLINK=$!
+trap 'kill $DLINK $GLINK $SIGNER 2> /dev/null; cleanup' EXIT
+
+cnt() { grep -c -- "$1" "$2" 2> /dev/null; }
+wait_n() { local i; for i in $(seq $(($1 * 10))); do [ "$(cnt "$2" "$3")" -ge "$4" ] && return 0; sleep 0.1; done; return 1; }
+settle() {
+  local i
+  for i in $(seq 1800); do
+    [ ! -e "$R/drone/mavlink-signing-key.next" ] && [ ! -s "$R/drone/rotation-pending" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+same_key() { cmp -s <(head -c32 "$1") <(head -c32 "$2"); }
+op2_has() { local i; for i in $(seq 300); do same_key "$DK" "$R/gcs2/signing-keys/$DFP.bin" \
+  && [ "$(cat "$R/gcs2/signing-keys/$DFP.gen" 2> /dev/null)" = "$1" ] && return 0; sleep 0.1; done; return 1; }
+# A command on SERIAL2 with a key file; the window after a key change can refuse new streams for a while.
+works() { # keyfile secs
+  local i; for i in $(seq 1 $(($2 / 4 + 1))); do
+    [ "$(ack $PROBE cmd $P2 "$1")" = ACK ] && return 0; sleep 3
+  done; return 1
+}
+wait_n 20 session_established "$R/dlink.log" 1 || check rot-link-session yes no
+start_signer() { "$OASA" signer --dir "$R/drone" --autopilot tcpout:127.0.0.1:$P1 --target 1:1 > "$1" 2>&1 & SIGNER=$!; }
+
+# 1. Armed: the signer waits; operator 1 is removed meanwhile; after disarm the key changes.
+$PYTHON -I "$HELP/arm.py" "$R/gcs1-old.bin" 127.0.0.1 $P2 arm tcp > /dev/null
+check rot-armed yes "$([ $? = 0 ] && echo yes || echo no)"
+start_signer "$R/signer1.log"
+sleep 3
+"$OASA" remove --dir "$R/drone" gcs-1 > /dev/null
+wait_n 30 rotation_waiting_armed "$R/signer1.log" 1
+check rot-armed-signer-waits yes "$([ $? = 0 ] && echo yes || echo no)"
+sleep 6
+check rot-armed-nothing-sent yes "$(! grep -q rotation_started "$R/signer1.log" && echo yes || echo no)"
+check rot-armed-old-key-still-works ACK "$(ack $PROBE cmd $P2 "$R/gcs1-old.bin")"
+$PYTHON -I "$HELP/arm.py" "$R/gcs1-old.bin" 127.0.0.1 $P2 disarm tcp > /dev/null
+wait_n 90 rotation_done "$R/signer1.log" 1
+check rot-after-disarm-rotated yes "$([ $? = 0 ] && echo yes || echo no)"
+check rot-drone-key-works ACK "$(works "$DK" 80 && echo ACK || echo no-ACK)"
+check rot-removed-operator-old-key-dead no-ACK "$(ack $PROBE cmd $P2 "$R/gcs1-old.bin")"
+op2_has 1; check rot-operator2-got-new-key-from-link yes "$([ $? = 0 ] && echo yes || echo no)"
+check rot-operator2-new-key-works ACK "$(ack "$OASA" command --dir "$R/gcs2" --to tcpout:127.0.0.1:$P2 --wait 30)"
+
+# 2. Power loss between SETUP_SIGNING and the commit: kill the signer right after it started.
+settle
+S0=$(cnt rotation_started "$R/signer1.log")
+"$OASA" rotate-signing --dir "$R/drone" > /dev/null
+# ArduPilot answers in well under a second, so kill the moment the rotation is announced (the key
+# is on disk as .next; SETUP_SIGNING may or may not have gone out: either way the restart must cope).
+for _ in $(seq 3000); do [ "$(cnt rotation_started "$R/signer1.log")" -gt "$S0" ] && break; sleep 0.01; done
+kill -9 "$SIGNER"; wait "$SIGNER" 2> /dev/null
+check rot-killed-pending-key-on-disk yes "$([ -e "$R/drone/mavlink-signing-key.next" ] && echo yes || echo no)"
+start_signer "$R/signer2.log"
+wait_n 200 rotation_done "$R/signer2.log" 1
+echo "     after the kill: $(grep -o 'rotation_[a-z_]*' "$R/signer2.log" | tr '\n' ' ')"
+check rot-restart-settled yes "$([ $? = 0 ] && echo yes || echo no)"
+settle
+check rot-after-restart-drone-key-works ACK "$(works "$DK" 80 && echo ACK || echo no-ACK)"
+check rot-after-restart-no-pending-key yes "$([ ! -e "$R/drone/mavlink-signing-key.next" ] && echo yes || echo no)"
+op2_has "$(cat "$R/drone/mavlink-signing-key.gen")"; check rot-operator2-caught-up yes "$([ $? = 0 ] && echo yes || echo no)"
+
+# 3. Another change right away, with the old key from before the power loss no longer valid.
+D0=$(cnt rotation_done "$R/signer2.log")
+"$OASA" rotate-signing --dir "$R/drone" > /dev/null
+wait_n 150 rotation_done "$R/signer2.log" $((D0 + 1))
+check rot-third-rotation yes "$([ $? = 0 ] && echo yes || echo no)"
+settle
+check rot-third-drone-key-works ACK "$(works "$DK" 80 && echo ACK || echo no-ACK)"
+
+# 4. Generations: each number issued once, in order, and the saved highest matches.
+gens=$(grep -h rotation_started "$R"/signer1.log "$R"/signer2.log | sed -E 's/.*"generation":([0-9]+).*/\1/')
+sorted=$(printf '%s\n' $gens | sort -n | uniq)
+check rot-generations-never-reused yes "$([ "$gens" = "$sorted" ] && [ "$(tail -n1 <<< "$gens")" = "$(cat "$R/drone/mavlink-signing-gen")" ] && echo yes || echo no)"
+echo "     generations: $(echo $gens | tr '\n' ' ')"
+kill $SIGNER $DLINK $GLINK 2> /dev/null
 
 echo "$PASS passed, $FAILS failed"
 [ "$FAILS" = 0 ]

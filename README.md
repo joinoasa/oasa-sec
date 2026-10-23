@@ -86,7 +86,7 @@ Run `oasa-pair --help` for every command.
 
 Choices follow OASA's [adoption standard](https://joinoasa.org/docs/adopting-software/) and are recorded in the [software register](https://joinoasa.org/docs/software-register/).
 
-## Roles and device removal (R-SEC2, phase A)
+## Roles and device removal (R-SEC2)
 
 Every trusted peer has a role: **admin** (its removal log is obeyed, 1 to 3 owner devices), **operator** (flies the drone) or **peer** (link traffic only). Pairing sets them (the drone saves the ground station as operator; the ground station saves the drone as peer); `oasa-pair trust --role` sets them by hand. An old `trusted-peers` is converted on first use and kept as `trusted-peers.v0-migrated`.
 
@@ -94,12 +94,22 @@ Every trusted peer has a role: **admin** (its removal log is obeyed, 1 to 3 owne
 - `oasa-pair revoke PEER` also adds it to this device's removal log. Devices that list this one as admin pick it up over the link, with retries; removing an admin there needs two admins. The rules are in [docs/oasa-sec-v0-rotation.md](docs/oasa-sec-v0-rotation.md).
 - Files are changed under an exclusive lock on `.lock` and swapped in atomically, so several programs can share one folder.
 
+## Signing-key rotation (R-SEC2)
+
+When an operator is removed from a drone (or on request), the drone gets a new MAVLink signing key, so the removed operator's old key stops working.
+
+- `oasa-pair signer --dir DIR --autopilot tcpout:HOST:PORT` runs on the drone and owns a dedicated link to the autopilot (never a router endpoint). It waits until the autopilot is disarmed, issues a new generation and key, loads it with `SETUP_SIGNING` signed by the current key, proves it with a signed command and a signed acknowledgment, and commits. If it cannot tell which key the autopilot has (a crash, a lost reply) it listens and asks under both keys before it does anything, and never deletes a key that might be in use. It prints one JSON line per event (`rotation_waiting_armed`, `rotation_started`, `rotation_done`, `rotation_rolled_back`, `rotation_stuck`).
+- `oasa-pair rotate-signing --dir DIR` asks for a rotation. `oasa-pair remove` of an operator asks for one too.
+- The drone's `oasa-link` sends each operator the new key (`SIGNING_KEY_NEXT`) as soon as it exists, and the commit once the autopilot has it. Operators switch only on the commit; one that was away catches up when it reconnects; a removed operator is never sent anything.
+
+Generations (`mavlink-signing-gen`) are never reused. Details and what was checked against PX4 and ArduPilot SITL: [docs/oasa-sec-v0-rotation.md](docs/oasa-sec-v0-rotation.md), [docs/sitl.md](docs/sitl.md).
+
 ## Next
 
 - Test on real autopilot hardware (PX4 and ArduPilot SITL already pass: [docs/sitl.md](docs/sitl.md)).
 - An on-drone confirm button, and checking key file ownership.
 - R-COM2: radio adapters in [oasa-radio](https://github.com/joinoasa/oasa-radio) plug in where `oasa-link` uses UDP; handshakes for radios under 128 bytes; DoS cookies; group keys.
-- R-SEC2 phase B: signing-key rotation (spec section 4). Phase A is built, see below.
+- R-SEC2: a serial autopilot link for the signer (UDP and TCP now), and rekeying other MAVLink signers on the drone (a gimbal, a second computer).
 - Independent review.
 
 Licensed under [Apache-2.0](LICENSE).

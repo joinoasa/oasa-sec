@@ -1,11 +1,12 @@
 """Test tool only. Arm or disarm PX4 with a signed command (sent as a ground station).
-usage: arm.py KEYFILE HOST PORT arm|disarm   Exit 0 when the autopilot's heartbeat shows the state asked for, else 2."""
+usage: arm.py KEYFILE HOST PORT arm|disarm [tcp]  (udp by default; "tcp" for ArduPilot serial ports)   Exit 0 when the autopilot's heartbeat shows the state asked for, else 2."""
 import os, sys, time
 os.environ["MAVLINK20"] = "1"
 from pymavlink import mavutil
 key, host, port, what = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 want = what == "arm"
-c = mavutil.mavlink_connection(f"udpout:{host}:{port}", source_system=255, source_component=190, dialect="common")
+kind = sys.argv[5] if len(sys.argv) > 5 else "udpout"
+c = mavutil.mavlink_connection(f"{'tcp' if kind == 'tcp' else 'udpout'}:{host}:{port}", source_system=255, source_component=190, dialect="common")
 c.setup_signing(open(key, "rb").read()[:32], sign_outgoing=True, allow_unsigned_callback=lambda m, i: False)
 end = time.time() + 20
 while time.time() < end:

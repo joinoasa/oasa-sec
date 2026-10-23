@@ -48,7 +48,7 @@ It starts and stops its own PX4 in a temporary folder and takes about 2 minutes.
 | (e) After a PX4 restart: signed command | Acknowledged (key persisted) |
 | (e) After a PX4 restart: unsigned command | Ignored |
 
-Not tested: the armed case, signed key rotation, PX4's list of messages allowed unsigned.
+Rotation is below. Not tested: PX4's list of messages allowed unsigned.
 
 ## ArduPilot
 
@@ -105,11 +105,47 @@ It takes about 8 minutes: it restarts SITL several times, waits through ArduPilo
 | (g) Fresh drone pairs against an already-keyed autopilot | Fails safely; nothing saved; the error lists the likely causes |
 | (e2) Unsigned `SETUP_SIGNING` on **SERIAL0** | **Replaces the key**, and it persists across restart |
 
-**Timestamp window.** After a restart, ArduPilot sets its signing timestamp to the stored value plus 60 s and refuses a new signed stream until the clock catches up, up to about a minute. In an earlier run both `oasa-pair` and pymavlink were refused for 34 s after a restart. In the latest run the first command after the restart got through in 2 s, so the window varies with how long and how often the simulator ran before (the stored value is saved every 30 s and ratchets forward). `oasa-pair command` retries for `--wait` seconds (default 75) so it covers either case; the late-answer retry is also covered by `scripts/e2e.sh`. Not tested: the armed case, GPS time effects, UDP client links.
+**Timestamp window.** After a restart, ArduPilot sets its signing timestamp to the stored value plus 60 s and refuses a new signed stream until the clock catches up, up to about a minute. In an earlier run both `oasa-pair` and pymavlink were refused for 34 s after a restart. In the latest run the first command after the restart got through in 2 s, so the window varies with how long and how often the simulator ran before (the stored value is saved every 30 s and ratchets forward). `oasa-pair command` retries for `--wait` seconds (default 75) so it covers either case; the late-answer retry is also covered by `scripts/e2e.sh`. Rotation is below. Not tested: GPS time effects, UDP client links.
+
+## Signing-key rotation (R-SEC2 phase B)
+
+Both scripts now also run `oasa-pair signer` against the real autopilot: a rotation after removing an operator, the armed wait, power loss between the key change and the commit, and generations. Results from 2026-10-23, same builds as above (PX4 `d4d4c154`, ArduPilot `2badacc9a607`), `oasa-pair` at the commit that added them.
+
+### PX4 (39 of 39 checks pass: the 11 above and 28 new, about 12 minutes)
+
+The signer talks to PX4's onboard port (14580) through `tests/sitl/udp_gate.py`, a UDP go-between that can drop what PX4 says or the key change itself. Test clients use the GCS port (18570), because PX4 answers only the last address that spoke on a link.
+
+| Check | Result |
+|---|---|
+| PX4 armed with a signed command; operator 1 removed on the drone | Signer reports `rotation_waiting_armed`; nothing is sent for 5 s; PX4's key file is unchanged |
+| Disarmed | Rotation runs: PX4's key file equals the drone's new key; generation 1 saved |
+| Removed operator's old key | **Dead** on PX4 |
+| Operator 2 | Gets the new key from the drone's `oasa-link` and it works on PX4; the drone's own new key works |
+| Lost `COMMAND_ACK`s (gate drops datagrams holding one) | Recovered: PX4 signs its heartbeats, so the probe settles it by listening |
+| Everything PX4 says lost for 25 s after the key change | Probe asks under both keys, finds the new one, finishes |
+| Silent for the whole probe (about 85 s) | `rotation_stuck`; both key files kept; PX4 holds the pending key. Asked again, it works out the key and finishes |
+| Signer killed (`kill -9`) 2 s after the key change | PX4 has the new key, the drone still has the old key and `.next`; the restarted signer works out the key and finishes |
+| `SETUP_SIGNING` dropped on the way | Rolled back: old key kept and working, `.next` deleted; the retry (30 s later) used a new generation |
+| Generations over the whole run | 1 to 9, each once, in order; `mavlink-signing-gen` equals the last; operator 2 ends on the current one |
+
+PX4 took every signed key change and then signed its frames under the new key (the lost-acknowledgment case was settled by listening, which needs that).
+
+### ArduPilot (42 of 42 checks pass: the 24 above and 18 new, about 17 minutes)
+
+The signer owns SERIAL1 (`tcpout:127.0.0.1:5782`); test clients use SERIAL2. The simulator runs with `DISARM_DELAY 0` (otherwise ArduPilot disarms an idle vehicle after 10 s, which ends the armed check early).
+
+| Check | Result |
+|---|---|
+| Armed on SERIAL2; operator 1 removed | `rotation_waiting_armed`; nothing sent for 6 s; the old key still works |
+| Disarmed | Rotation runs; the drone's new key works; the removed operator's old key is **dead**; operator 2 got the new key from the link and it works |
+| Signer killed the moment a rotation is announced | `.next` is on disk; the restarted signer settles it (by listening: ArduPilot signs its frames) and finishes; no `.next` left; operator 2 catches up |
+| A further rotation | Works; generations over the run: 1, 2, 3, each once, in order |
+
+A signed `SETUP_SIGNING` from the signer changed the key without a restart, and the new key worked afterwards in every rotation. Not tested on ArduPilot: a lost `COMMAND_ACK` and a silent autopilot (the gate is UDP only; both are covered on PX4 and in unit tests), and a UDP link.
 
 ## Helpers
 
-Test tools only, in `tests/sitl/`: `px4_client.py` (send a signed or unsigned command), `px4_setup.py` (send `SETUP_SIGNING`), `approbe.py` (same for ArduPilot, plus a check that frames are signed).
+Test tools only, in `tests/sitl/`: `px4_client.py` (send a signed or unsigned command), `px4_setup.py` (send `SETUP_SIGNING`), `approbe.py` (same for ArduPilot, plus a check that frames are signed), `udp_gate.py` (a UDP go-between that drops PX4's replies or the key change on command), `arm.py` (arm or disarm with a signed command).
 
 ## What the autopilots do with key changes (2026-10-23)
 

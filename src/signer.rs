@@ -135,6 +135,8 @@ impl Event {
     }
 }
 
+type EventHook = Box<dyn FnMut(&Event)>;
+
 pub struct Signer<P: Port> {
     dir: PathBuf,
     port: P,
@@ -152,7 +154,7 @@ pub struct Signer<P: Port> {
     retry_at: Duration,
     last_wait: Option<Event>,
     /// Told of each event as it happens (a tick can take 80 s).
-    on_event: Option<Box<dyn FnMut(&Event)>>,
+    on_event: Option<EventHook>,
 }
 
 impl<P: Port> Signer<P> {

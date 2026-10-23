@@ -122,7 +122,7 @@ No answer, a crash or power loss can leave the drone not knowing which key the a
 
 An operator that reconnects with an older generation gets `SIGNING_KEY_NEXT` and `SIGNING_KEY_COMMIT` for the current one. Removed operators never get it. Other components on the drone that sign MAVLink (a gimbal, a second computer) need the new key too; v0 supports only the autopilot.
 
-**To verify in SITL before this leaves Draft:** signed key change on PX4; whether PX4 signs its own frames once keyed; PX4's signing parameter names and FTP access to the key file; both autopilots while armed.
+**Verified in SITL** (results in [sitl.md](sitl.md)): signed key change on PX4 and ArduPilot; both sign their own frames once keyed; PX4 has no signing parameters and its key file is open to FTP (the guard drops FTP); both refuse a key change while armed.
 
 ## 5. What it protects against
 
@@ -150,15 +150,27 @@ An operator that reconnects with an older generation gets `SIGNING_KEY_NEXT` and
 
 ### Status
 
-Phase A (sections 1 to 3, and the parts of 6 and 7 that belong to them) is built and tested. Phase B (section 4) is not built; `SIGNING_KEY_NEXT` and `SIGNING_KEY_COMMIT` are parsed and role-checked, then only noted.
+Phases A and B are built: sections 1 to 4, and the parts of 6 and 7 that belong to them. Lab and SITL results are in [sitl.md](sitl.md).
 
-Tested in phase A (unit tests, `tests/link_sim.rs`, `tests/pair_cli.rs`, `scripts/link-e2e.sh`):
-- Every control message, including malformed, wrong-role and replayed ones; the role matrix.
-- Union, two-admin, vote loss and log-id reset; removal sync through the lossy simulated channel (many seeds, restarts, an admin offline then catching up, a removed admin).
-- Migration from v0; tombstones beating a stale `trusted-peers`; restore; lock contention (threads and 24 processes).
-- `oasa-link` removal mid-run (exit code 3), reload on SIGHUP, and a revoke carried from an admin to a device.
+**As built in §4** (where the code is more exact than the text above):
+- **Files.** The drone keeps `mavlink-signing-key.gen` (the current key's generation, missing means 0, the key from pairing) next to `mavlink-signing-gen` (highest issued). While `.next` exists, its generation is the number in `mavlink-signing-gen`; a `.next` with no saved number is an error, not a guess. `signing-acked/<fp>` holds two numbers: the last `NEXT` and the last `COMMIT` generation the operator acked.
+- **Order of writes.** Step 6 replaces `mavlink-signing-key.bin`, then `mavlink-signing-key.gen`, then deletes `.next`, then clears the requests it answered. A crash anywhere in that is finished by the next start (the probe sees the new key in use).
+- **Requests.** `rotation-pending` lines present when a rotation began are cleared by its commit; lines added meanwhile (an operator removed during the rotation, who may already hold the new key) stay and get their own rotation. After a crash the count is unknown, so only requests dated before `.next` was written are cleared; one from the same second stays, which can cost one extra rotation and never skips one.
+- **Heartbeats.** The signer sends a signed `HEARTBEAT` every second (as a companion computer does), so an autopilot that answers only the last address that spoke keeps answering the signer. It treats the autopilot as disarmed only on a heartbeat younger than 10 s that says so; with none it waits (`rotation_waiting_heartbeat`).
+- **Proof.** Step 5 accepts any signed `COMMAND_ACK` for `MAV_CMD_REQUEST_MESSAGE` from the autopilot that verifies under the new key (whatever its result): the signature is the proof. It retries the request once a second for 5 s; failing that, the probe decides.
+- **Probe.** It listens 4 s, then asks under both keys once a second for 75 s. Any frame from the autopilot that verifies under one key decides; if the old key is in use the new one is dropped and the next try, 30 s later, uses a new generation. After an I/O error the next round starts with the probe.
+- **Timestamps.** The initial timestamp is one more than the latest of the companion's clock, every signature time seen on the autopilot link, the last one the signer used, and `mavlink-signing-ts`. `oasa-link` on a drone saves the highest signature time it forwards from the tunnel to that file (at most every 10 s), unchecked: it is only a floor.
+- **Distribution.** A `NEXT` of any generation above the operator's current one replaces a pending key (the text says "newer"; a pending key from a dropped rotation can be higher than the current one an operator that was away still needs). A drone sends one message at a time to each operator: the pending key as soon as it exists, the commit only after the autopilot took it; an operator that never got the current key gets `NEXT` then `COMMIT`. A `COMMIT` that stays unacked for four resends makes the drone send `NEXT` for the current key again. The operator acks a `NEXT` once saved (also a repeat or an old one), and a `COMMIT` once switched; a `COMMIT` for a generation it holds no key for is noted (`signing_key_commit_unknown`) and not acked. A `NEXT` with an all-zero key, or the same generation with another key, is dropped as `bad_control`.
+- **Limits.** The signer's link is UDP or TCP (`udpout:`, `tcpout:`...), not a serial port: a serial autopilot needs a bridge for now. Only the autopilot is rekeyed.
 
-Not tested yet: everything in section 4 (SITL rotation), real radios, independent review.
+**Tested** (unit tests, `tests/link_sim.rs`, `tests/pair_cli.rs`, `scripts/e2e.sh`, `scripts/link-e2e.sh`):
+- Phase A: every control message, including malformed, wrong-role and replayed ones; the role matrix; union, two-admin, vote loss and log-id reset; removal sync through the lossy simulated channel (many seeds, restarts, an admin offline then catching up, a removed admin); migration from v0; tombstones beating a stale `trusted-peers`; restore; lock contention (threads and 24 processes); `oasa-link` removal mid-run (exit code 3), reload on SIGHUP, and a revoke carried from an admin to a device.
+- Phase B, signer state machine against a simulated autopilot in virtual time: the happy path; armed (waits, sends nothing); no heartbeat (waits); a refused change (rolled back, retried with a new generation); lost acknowledgments (settled by probing); a 60 s reboot window; a silent autopilot (`rotation_stuck`, both keys kept, resolved when asked again); power loss before and after the key change (restart works out the key, by listening or by asking); generations never reused across failures and burnt numbers; a request that arrives mid-rotation getting its own; the initial timestamp above every timestamp seen.
+- Phase B, files and messages: the operator's pending key, commit, replays, conflicts, zero key, interrupted switches; the drone's NEXT/COMMIT sequence, retries and restart-from-NEXT; reconnecting operators; removed operators and non-operators getting nothing; keys not in `Debug` output or on the wire; through the lossy simulated channel (8 seeds, with replays), a blackout over two rotations, and a replaced pending key.
+- Phase B, real processes with a stand-in autopilot (`scripts/e2e.sh`, `scripts/link-e2e.sh`): an armed autopilot left alone; a rotation after removing an operator, where the removed operator's old key stops working and the other operator gets the new key from the drone's link; a lost acknowledgment; a kill between the key change and the commit, then a restart; a refused change rolled back.
+- SITL: see [sitl.md](sitl.md).
+
+Not tested: real radios, the tunnel-timestamp floor against a real autopilot's replay rules beyond the SITL runs, a serial autopilot link, other components that sign MAVLink, and independent review.
 
 ## 8. Open questions
 
