@@ -15,7 +15,7 @@ Signing is only a second layer. The design is in [docs/oasa-sec-v0-pairing.md](d
 
 ## The encrypted link (R-COM2)
 
-One encrypted, authenticated link between two trusted devices, over any radio that can carry a packet. Modeled on WireGuard: Noise `IK`, 21 bytes of overhead, every packet stands alone (loss, reordering and duplicates never break it), and a device that is not in `trusted-peers` gets no reply at all. Design: [docs/oasa-sec-v0-link.md](docs/oasa-sec-v0-link.md).
+One encrypted, authenticated link between two trusted devices, over any radio that can carry a packet. Modeled on WireGuard: Noise `IK`, 21 bytes of overhead (handshakes 119 and 55 bytes), every packet stands alone (loss, reordering and duplicates never break it), and a device that is not in `trusted-peers` gets no reply at all. Design: [docs/oasa-sec-v0-link.md](docs/oasa-sec-v0-link.md).
 
 - **`oasa_sec::link`** is a library with no sockets, threads or clock inside: bytes and the time go in, events come out. `Link` is one peer; `Endpoint` serves several (one ground station, many drones).
 - **`oasa-link`** carries local UDP packets (for example MAVLink) over the link and logs one JSON line per event.
@@ -41,7 +41,7 @@ $B/oasa-link --dir /tmp/gcs --peer drone --bind 127.0.0.1:7002 --remote 127.0.0.
 echo hello | nc -u -q1 127.0.0.1 7021
 ```
 
-Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line.
+Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line. It reads `trusted-peers` once at startup, so restart it after `oasa-pair trust` or `remove`. `--plain-listen` must be a loopback address unless you pass `--allow-remote-plain`. If a peer's clock was wrong and its handshakes are now refused as stale, fix the clock and run `oasa-pair reset-stamp --dir DIR --peer NAME`. Set the same rekey limits on both sides.
 
 `cargo test` runs two endpoints through a seeded simulated channel (loss, reordering, duplicates, corruption, replays, an untrusted device, rekeys under 20% loss). `scripts/link-e2e.sh` runs real `oasa-link` processes over localhost UDP.
 
