@@ -33,7 +33,7 @@ jobs:
           cargo build --locked --bins --examples
           PYTHON="$RUNNER_TEMP/venv/bin/python" scripts/e2e.sh
       - name: Link end-to-end
-        run: scripts/link-e2e.sh
+        run: PYTHON="$RUNNER_TEMP/venv/bin/python" scripts/link-e2e.sh
 
   # The link through oasa-lab's simulated channel, with the lab's independent evidence checker.
   lab:

@@ -132,4 +132,78 @@ KEY=$(od -An -tx1 -v "$T/gcs/identity.key" | tr -d ' \n')
 grep -q "$KEY" "$T"/*.log && fail "a private key is in a log"
 pass "timestamp files are 600 and no private key is in any log"
 
+# --- 5. The MAVLink guard on a drone ------------------------------------
+# A device dir with mavlink-signing-key.bin is a drone: the guard is on by default.
+# (The file only has to exist here; its bytes are random and never printed.)
+grep -q '"event":"mavlink_guard","state":"off"' "$T/drone.log" || fail "a device without the autopilot key should start with the guard off"
+grep -q '"event":"hint".*mavlink-signing-key.bin' "$T/drone.log" || fail "no hint about the guard being off"
+for d in gcsg dronek; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+$B/oasa-pair trust --dir "$T/gcsg" --name dronek --key "$(pubkey "$T/dronek")" >/dev/null
+$B/oasa-pair trust --dir "$T/dronek" --name gcsg --key "$(pubkey "$T/gcsg")" >/dev/null
+head -c 40 /dev/urandom > "$T/dronek/mavlink-signing-key.bin"; chmod 600 "$T/dronek/mavlink-signing-key.bin"
+DK_ENC=7741; DK_IN=7751; DK_OUT=7752; GK_ENC=7742; GK_IN=7761; GK_OUT=7762
+
+guard_run() { # name mode [drone flags...]
+  local name=$1 mode=$2 want; shift 2
+  $B/oasa-link --dir "$T/dronek" --peer gcsg --bind 127.0.0.1:$DK_ENC \
+    --plain-listen 127.0.0.1:$DK_IN --plain-send 127.0.0.1:$DK_OUT --mtu 400 --duration 40 "$@" > "$T/$name-drone.log" 2>&1 & local DK=$!; PIDS+=($DK)
+  sleep 0.5
+  $B/oasa-link --dir "$T/gcsg" --peer dronek --bind 127.0.0.1:$GK_ENC --remote 127.0.0.1:$DK_ENC --initiate \
+    --plain-listen 127.0.0.1:$GK_IN --plain-send 127.0.0.1:$GK_OUT --mtu 400 --duration 40 > "$T/$name-gcs.log" 2>&1 & local GK=$!; PIDS+=($GK)
+  wait_for 15 session_established "$T/$name-gcs.log" || fail "$name: no session"
+  $CHECK guard $GK_IN $DK_OUT "$mode" $DK_IN > "$T/$name-guard.out" 2>&1 || { cat "$T/$name-guard.out"; [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=$name guard::$(tr "\n" "|" < "$T/$name-guard.out" | cut -c1-900)"; fail "$name: wrong datagrams reached the autopilot side"; }
+  cat "$T/$name-guard.out"
+  want=$(sed -n 's/^blocked //p' "$T/$name-guard.out")
+  kill -TERM "$DK" "$GK"; wait "$DK" "$GK" || fail "$name: a link did not exit 0"
+  $CHECK check "$T/$name-drone.log" || fail "$name: drone log lines are not the agreed JSON"
+  local got; got=$(jstat "$T/$name-drone.log" drops.mavlink_blocked 2>/dev/null || echo 0)
+  [ "$got" = "$want" ] || fail "$name: drops.mavlink_blocked is $got, expected $want"
+}
+
+guard_run guard default
+grep -q '"event":"mavlink_guard","state":"on","ftp":false' "$T/guard-drone.log" || fail "the guard did not start on for a drone"
+! grep -q '"warning"' "$T/guard-drone.log" || fail "the default guard printed a warning"
+grep -q '"reason":"mavlink_blocked","why":"setup_signing","msgid":256' "$T/guard-drone.log" || fail "no log line naming SETUP_SIGNING (256)"
+grep -q '"reason":"mavlink_blocked","why":"ftp","msgid":110' "$T/guard-drone.log" || fail "no log line naming FTP (110)"
+grep -q '"reason":"mavlink_blocked","why":"command_not_allowed","msgid":76,"command":246' "$T/guard-drone.log" || fail "no log line naming the refused command (246)"
+grep -q '"reason":"mavlink_blocked","why":"msg_not_allowed","msgid":33' "$T/guard-drone.log" || fail "no log line for a message not on the list"
+grep -q '"reason":"mavlink_blocked","why":"param_write","msgid":23' "$T/guard-drone.log" || fail "no log line for a parameter write"
+grep -q '"reason":"mavlink_blocked","why":"bad_crc"' "$T/guard-drone.log" || fail "no log line for a bad CRC"
+grep -q '"reason":"mavlink_blocked","why":"mission_type","msgid":45,"mission_type":1' "$T/guard-drone.log" || fail "no log line for a fence clear"
+grep -q '"reason":"mavlink_blocked","why":"mission_type","msgid":45,"mission_type":255' "$T/guard-drone.log" || fail "no log line for a clear of all types"
+grep -q '"reason":"mavlink_blocked","why":"msg_not_allowed","msgid":233' "$T/guard-drone.log" || fail "no log line for RTK data"
+grep -q '"reason":"mavlink_blocked","why":"malformed"' "$T/guard-drone.log" || fail "no log line for a malformed datagram"
+[ "$($CHECK drops "$T/guard-drone.log")" -le 20 ] || fail "guard drop lines are not rate limited with the others"
+pass "decrypted packets leave from the --plain-listen port, so replies come back through the tunnel"
+pass "guard on by default for a drone: only whole, CRC-valid, allowlisted frames pass (arm, takeoff, RTL, mission items, batches); SETUP_SIGNING, FTP, parameter writes, reboot commands, other messages, bad CRCs and junk are dropped with their ids logged"
+
+guard_run guardftp ftp --allow-mavlink-ftp
+grep -q '"event":"warning".*FILE_TRANSFER_PROTOCOL' "$T/guardftp-drone.log" || fail "--allow-mavlink-ftp printed no warning"
+pass "--allow-mavlink-ftp lets FTP through, logs a warning, and nothing else changes"
+
+guard_run guardwide wide --allow-msg 33 --allow-command 246 --allow-param mpc_xy_vel_max --allow-rtk --allow-fence-rally
+for w in "GPS_RTCM_DATA (233) are allowed" "geofence and rally mission messages" "message 33 is allowed" "command 246 is allowed" "writes to parameter MPC_XY_VEL_MAX are allowed"; do
+  grep -q "\"event\":\"warning\".*$w" "$T/guardwide-drone.log" || fail "no warning for: $w"
+done
+pass "--allow-msg, --allow-command and --allow-param each widen exactly one thing and each log a warning; signing parameters stay blocked"
+
+guard_run guardoff off --no-mavlink-guard
+grep -q '"event":"warning"' "$T/guardoff-drone.log" || fail "--no-mavlink-guard printed no warning"
+pass "--no-mavlink-guard prints a warning and lets everything through"
+
+for bad in "--no-mavlink-guard --allow-msg 33" "--allow-msg 256" "--allow-param MAV_SIGN_CFG" "--allow-command 99999" "--no-mavlink-guard --allow-rtk" "--no-mavlink-guard --allow-fence-rally"; do
+  if $B/oasa-link --dir "$T/dronek" --peer gcsg --bind 127.0.0.1:7791 --plain-listen 127.0.0.1:7792 \
+    --plain-send 127.0.0.1:7793 --duration 1 $bad >"$T/bad.log" 2>&1; then fail "oasa-link accepted: $bad"; fi
+done
+pass "widening flags that make no sense or ask for something that can never be allowed are refused"
+
+if $B/oasa-link --dir "$T/dronek" --peer gcsg --bind 127.0.0.1:7791 --plain-listen 127.0.0.1:7792 \
+  --plain-send 127.0.0.1:7793 --duration 1 --mavlink-guard --no-mavlink-guard >"$T/both.log" 2>&1; then fail "both guard flags were accepted"; fi
+pass "--mavlink-guard together with --no-mavlink-guard is refused"
+
+# --- 6. The guard against pymavlink -------------------------------------
+cargo build --release --example mavguard_check >/dev/null 2>&1 || fail "could not build examples/mavguard_check"
+$PYTHON -I tests/interop/mavguard_diff.py --n 3000 || fail "the guard and pymavlink disagree"
+pass "guard and pymavlink agree on frame boundaries, ids and CRCs for everything the guard passes"
+
 echo "All link end-to-end checks passed."
