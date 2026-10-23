@@ -6,19 +6,28 @@
 //! delivers them inside the encrypted pairing channel, and the drone then
 //! loads them into its autopilot over its own wired link.
 
-use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mavlink::dialects::common::{MavMessage, SETUP_SIGNING_DATA};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::identity::{check_private_permissions, write_private_file};
+use crate::files::{read_private_file, write_private_file};
 use crate::{Error, Result};
 
-/// File name for a saved signing key. Same 40-byte layout PX4 uses on its SD
-/// card: 32-byte key, then 8-byte little-endian timestamp.
-pub const SIGNING_KEY_FILE: &str = "mavlink-signing-key.bin";
+/// On a drone: the key its autopilot uses. Same 40-byte layout PX4 uses on
+/// its SD card: 32-byte key, then 8-byte little-endian timestamp.
+pub const AUTOPILOT_KEY_FILE: &str = "mavlink-signing-key.bin";
+
+/// On a ground station: one key file per paired drone, in this folder,
+/// named by the drone's fingerprint.
+pub const PEER_KEYS_DIR: &str = "signing-keys";
+
+/// Where a ground station keeps the signing key for the drone with this
+/// fingerprint.
+pub fn peer_key_path(dir: &Path, fingerprint: &str) -> std::path::PathBuf {
+    dir.join(PEER_KEYS_DIR).join(format!("{fingerprint}.bin"))
+}
 
 /// Seconds from the Unix epoch to 1 January 2015, where MAVLink time starts.
 const MAVLINK_EPOCH_UNIX_SECS: u64 = 1_420_070_400;
@@ -71,31 +80,27 @@ impl SigningKey {
         })
     }
 
-    /// Save in PX4's 40-byte format, readable only by the owner.
-    pub fn save(&self, dir: &Path) -> Result<()> {
-        let mut buf = [0u8; 40];
+    /// Save in PX4's 40-byte format, owner-only, atomically.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut buf = zeroize::Zeroizing::new([0u8; 40]);
         buf[..32].copy_from_slice(&self.0);
         buf[32..].copy_from_slice(&mavlink_timestamp_now().to_le_bytes());
-        let r = write_private_file(&dir.join(SIGNING_KEY_FILE), &buf);
-        buf.zeroize();
-        r
+        if let Some(parent) = path.parent() {
+            crate::files::ensure_private_dir(parent)?;
+        }
+        write_private_file(path, &buf[..])
     }
 
-    pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join(SIGNING_KEY_FILE);
-        check_private_permissions(&path)?;
-        let mut buf = fs::read(&path)?;
-        let r = if buf.len() == 40 {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&buf[..32]);
-            Self::from_bytes(k)
-        } else {
-            Err(Error::BadKeyFile(
+    pub fn load(path: &Path) -> Result<Self> {
+        let buf = read_private_file(path)?;
+        if buf.len() != 40 {
+            return Err(Error::BadKeyFile(
                 "signing key file must be 40 bytes".into(),
-            ))
-        };
-        buf.zeroize();
-        r
+            ));
+        }
+        let mut k = zeroize::Zeroizing::new([0u8; 32]);
+        k.copy_from_slice(&buf[..32]);
+        Self::from_bytes(*k)
     }
 }
 
@@ -118,6 +123,7 @@ pub fn mavlink_timestamp_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn keys_are_random_and_never_zero() {
@@ -129,13 +135,14 @@ mod tests {
 
     #[test]
     fn save_load_round_trip_in_px4_layout() {
-        let dir = crate::identity::tempdir("signing");
+        let dir = crate::files::tempdir("signing");
+        let path = peer_key_path(&dir, "ABCD-EFGH");
         let k = SigningKey::generate().unwrap();
-        k.save(&dir).unwrap();
-        let raw = fs::read(dir.join(SIGNING_KEY_FILE)).unwrap();
+        k.save(&path).unwrap();
+        let raw = fs::read(&path).unwrap();
         assert_eq!(raw.len(), 40);
         assert_eq!(&raw[..32], k.as_bytes());
-        assert_eq!(SigningKey::load(&dir).unwrap(), k);
+        assert_eq!(SigningKey::load(&path).unwrap(), k);
     }
 
     #[test]

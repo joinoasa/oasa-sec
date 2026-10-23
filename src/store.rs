@@ -3,10 +3,10 @@
 //! One line per peer: `<public key, base32> <name>`. The file is owner-only,
 //! because anyone who can add a line to it could make this device trust them.
 
-use std::fs;
 use std::path::Path;
 
-use crate::identity::{check_private_permissions, fingerprint, write_private_file};
+use crate::files::{read_private_file, write_private_file};
+use crate::identity::fingerprint;
 use crate::{Error, Result};
 
 pub const TRUST_FILE: &str = "trusted-peers";
@@ -29,8 +29,9 @@ pub fn load(dir: &Path) -> Result<Vec<Peer>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    check_private_permissions(&path)?;
-    let text = fs::read_to_string(&path)?;
+    let bytes = read_private_file(&path)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::BadKeyFile("trust file is not UTF-8".into()))?;
     text.lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         .map(|line| {
@@ -56,8 +57,50 @@ pub fn add(dir: &Path, peer: &Peer) -> Result<()> {
     let mut peers = load(dir)?;
     peers.retain(|p| p.public != peer.public);
     peers.push(peer.clone());
+    save(dir, &peers)
+}
+
+/// Remove a peer by fingerprint. Returns whether one was removed.
+///
+/// This edits the list only. To lock a lost device out, its signing key must
+/// also be rotated, which is the next node (R-SEC2).
+pub fn remove(dir: &Path, fingerprint_text: &str) -> Result<bool> {
+    let mut peers = load(dir)?;
+    let before = peers.len();
+    peers.retain(|p| p.fingerprint() != fingerprint_text);
+    if peers.len() == before {
+        return Ok(false);
+    }
+    save(dir, &peers)?;
+    Ok(true)
+}
+
+/// Find a peer by fingerprint or name. Errors if a name matches more than one.
+pub fn find(dir: &Path, fingerprint_or_name: &str) -> Result<Option<Peer>> {
+    let peers = load(dir)?;
+    if let Some(p) = peers
+        .iter()
+        .find(|p| p.fingerprint() == fingerprint_or_name)
+    {
+        return Ok(Some(p.clone()));
+    }
+    let named: Vec<&Peer> = peers
+        .iter()
+        .filter(|p| p.name == fingerprint_or_name)
+        .collect();
+    match named.len() {
+        0 => Ok(None),
+        1 => Ok(Some(named[0].clone())),
+        _ => Err(Error::BadKeyFile(format!(
+            "more than one device is named {fingerprint_or_name}; use its fingerprint"
+        ))),
+    }
+}
+
+/// Write the whole list atomically, so a crash never loses peers.
+fn save(dir: &Path, peers: &[Peer]) -> Result<()> {
     let mut text = String::from("# OASA-SEC v0 trusted peers: <public key> <name>\n");
-    for p in &peers {
+    for p in peers {
         text.push_str(&data_encoding::BASE32_NOPAD.encode(&p.public));
         text.push(' ');
         text.push_str(&p.name);
@@ -66,35 +109,13 @@ pub fn add(dir: &Path, peer: &Peer) -> Result<()> {
     write_private_file(&dir.join(TRUST_FILE), text.as_bytes())
 }
 
-/// Remove a peer by fingerprint. Returns whether one was removed.
-///
-/// Removing a peer only stops this device trusting it. To lock out a lost
-/// device fully, also rotate the signing key (R-SEC2 will automate this).
-pub fn remove(dir: &Path, fingerprint_text: &str) -> Result<bool> {
-    let mut peers = load(dir)?;
-    let before = peers.len();
-    peers.retain(|p| p.fingerprint() != fingerprint_text);
-    if peers.len() == before {
-        return Ok(false);
-    }
-    let path = dir.join(TRUST_FILE);
-    fs::remove_file(&path)?;
-    for p in &peers {
-        add(dir, p)?;
-    }
-    if peers.is_empty() {
-        write_private_file(&path, b"# OASA-SEC v0 trusted peers: <public key> <name>\n")?;
-    }
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn add_load_replace_remove() {
-        let dir = crate::identity::tempdir("store");
+        let dir = crate::files::tempdir("store");
         assert!(load(&dir).unwrap().is_empty());
         let a = Peer {
             public: [1; 32],
@@ -119,6 +140,9 @@ mod tests {
         assert!(peers.iter().any(|p| p.name == "gcs-a2"));
         assert!(remove(&dir, &a.fingerprint()).unwrap());
         assert!(!remove(&dir, &a.fingerprint()).unwrap());
-        assert_eq!(load(&dir).unwrap(), vec![b]);
+        assert_eq!(load(&dir).unwrap(), vec![b.clone()]);
+        assert_eq!(find(&dir, "gcs-b").unwrap(), Some(b.clone()));
+        assert_eq!(find(&dir, &b.fingerprint()).unwrap(), Some(b));
+        assert_eq!(find(&dir, "nobody").unwrap(), None);
     }
 }

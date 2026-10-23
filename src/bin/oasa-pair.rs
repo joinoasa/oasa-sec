@@ -2,18 +2,20 @@
 //!
 //! Prototype for OASA tech tree node R-SEC1. Do not fly with it.
 
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::io::{BufRead, IsTerminal};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use mavlink::dialects::common::{COMMAND_LONG_DATA, MavCmd, MavMessage};
+use mavlink::dialects::common::{COMMAND_LONG_DATA, MavCmd, MavMessage, MavResult};
 use mavlink::{MavConnection, MavHeader};
 use oasa_sec::code::PairingCode;
-use oasa_sec::identity::Identity;
-use oasa_sec::pairing::{check_name, pair_as_drone, pair_as_ground};
-use oasa_sec::signing::SigningKey;
-use oasa_sec::store::{self, Peer};
+use oasa_sec::identity::{Identity, fingerprint};
+use oasa_sec::pairing::{DeadlineStream, check_name, pair_as_drone, pair_as_ground};
+use oasa_sec::signing::{AUTOPILOT_KEY_FILE, SigningKey, peer_key_path};
+use oasa_sec::store;
 
 const USAGE: &str = "\
 oasa-pair: OASA-SEC v0 pairing prototype (R-SEC1). Do not fly with it.
@@ -22,27 +24,37 @@ USAGE:
   oasa-pair init     --dir DIR
   oasa-pair drone    --dir DIR --name NAME --listen HOST:PORT
                      [--autopilot MAVLINK_ADDR] [--target SYS:COMP] [--wait SECONDS]
-  oasa-pair ground   --dir DIR --name NAME --connect HOST:PORT --code CODE
+  oasa-pair ground   --dir DIR --name NAME --connect HOST:PORT
+                     [--code-file FILE | --code -] [--expect-drone FINGERPRINT]
   oasa-pair peers    --dir DIR
   oasa-pair remove   --dir DIR FINGERPRINT
-  oasa-pair command  --dir DIR --to MAVLINK_ADDR [--target SYS:COMP]
+  oasa-pair command  --dir DIR --to MAVLINK_ADDR [--peer NAME|FINGERPRINT]
+                     [--target SYS:COMP] [--link-id N]
 
   init      Make this device's identity (once per device) and print its fingerprint.
-  drone     Show a one-time pairing code (text and QR), wait for one ground station
-            to pair, save it as trusted, and save the signing key it sends. With
-            --autopilot, load the key into the autopilot with SETUP_SIGNING.
+  drone     Show a one-time pairing code (text and QR) and wait for a ground station
+            to pair. The first ground station sends a new signing key; with
+            --autopilot the drone loads it into the autopilot, checks that it works,
+            and only then saves it. Later ground stations receive the existing key.
             Use a wired or local link for --autopilot (e.g. udpout:127.0.0.1:14540).
-  ground    Pair with the drone that showed CODE. Makes a fresh signing key,
-            sends it inside the encrypted channel, and saves it.
-  peers     List trusted devices.
-  remove    Stop trusting a device. To lock it out fully, also re-pair to rotate
-            the signing key.
+  ground    Pair with the drone that showed the code. Reads the code from
+            --code-file, or from standard input (the default, or --code -), so it
+            doesn't show up in the process list or shell history. --expect-drone
+            refuses to pair unless the code names that drone (compare with the
+            fingerprint printed on the drone).
+  peers     List paired devices.
+  remove    Remove a device from the list. This does not lock it out: that needs
+            key rotation, which is the next node (R-SEC2).
   command   Send one signed test command (request AUTOPILOT_VERSION) and wait for
-            a signed acknowledgment. Proves signing works end to end.
+            a signed, matching acknowledgment. On a ground station, --peer picks
+            which drone's key to use (optional if only one is paired).
 
 MAVLINK_ADDR uses the rust-mavlink format: udpout:HOST:PORT, udpin:HOST:PORT,
 tcpout:HOST:PORT, serial:PORT:BAUD.
 ";
+
+/// Link IDs keep signed streams from different links apart (MAVLink spec).
+const COMPANION_LINK_ID: u8 = 1;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -55,7 +67,7 @@ fn main() -> ExitCode {
     }
 }
 
-type R = Result<(), Box<dyn std::error::Error>>;
+type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn run(args: &[String]) -> R {
     let Some(cmd) = args.first() else {
@@ -79,123 +91,186 @@ fn run(args: &[String]) -> R {
 }
 
 fn init(o: &Opts) -> R {
-    let dir = o.dir()?;
-    let (id, created) = Identity::load_or_create(&dir)?;
-    println!(
-        "{} identity {}",
-        if created { "Created" } else { "Existing" },
-        id.fingerprint()
-    );
+    let (id, created) = Identity::load_or_create(&o.dir()?)?;
+    let word = if created { "Created" } else { "Existing" };
+    println!("{word} identity {}", id.fingerprint());
     Ok(())
 }
 
 fn drone(o: &Opts) -> R {
     let dir = o.dir()?;
     let name = o.name()?;
-    let listen = o.req("listen")?;
-    let wait = Duration::from_secs(o.get("wait").map(|s| s.parse()).transpose()?.unwrap_or(300));
+    let window = Duration::from_secs(o.get("wait").map(str::parse).transpose()?.unwrap_or(300));
     let (me, _) = Identity::load_or_create(&dir)?;
+    let key_path = dir.join(AUTOPILOT_KEY_FILE);
+    let current_key = if key_path.exists() {
+        Some(SigningKey::load(&key_path)?)
+    } else {
+        None
+    };
+    if current_key.is_none() && o.get("autopilot").is_none() {
+        eprintln!(
+            "warning: no --autopilot given; the new key will be saved but not loaded into an autopilot"
+        );
+    }
 
+    // Listen before showing the code, so nobody can race to the port.
+    let listener = TcpListener::bind(o.req("listen")?)?;
+    listener.set_nonblocking(true)?;
     let code = PairingCode::new(*me.public_key())?;
     println!(
         "Drone {name} ({}) is in pairing mode for {}s.",
         me.fingerprint(),
-        wait.as_secs()
+        window.as_secs()
     );
     println!("Scan this with the ground station, or copy the code below.\n");
     println!("{}", code.qr_text());
-    println!("{}\n", code.encode());
+    println!("{}\n", *zeroize::Zeroizing::new(code.encode()));
     println!("Anyone who sees this code can pair once. Close pairing mode when done.");
 
-    let listener = TcpListener::bind(listen)?;
-    listener.set_nonblocking(true)?;
-    let deadline = Instant::now() + wait;
-    let mut failures = 0;
+    let deadline = Instant::now() + window;
     let result = loop {
-        if Instant::now() > deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             return Err("pairing window closed with no ground station".into());
         }
-        let stream = match listener.accept() {
-            Ok((s, addr)) => {
-                eprintln!("Pairing attempt from {addr}");
-                s
-            }
+        let (stream, addr) = match listener.accept() {
+            Ok(x) => x,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
             Err(e) => return Err(e.into()),
         };
-        let mut stream = prepare(stream)?;
-        match pair_as_drone(&mut stream, &me, &name, &code) {
+        eprintln!("Pairing attempt from {addr}");
+        // Each attempt gets at most 15 s, and never past the window.
+        let mut stream = DeadlineStream::new(stream, left.min(Duration::from_secs(15)))?;
+        let install = |key: &SigningKey| install_key(o, key, &key_path);
+        match pair_as_drone(
+            &mut stream,
+            &me,
+            &name,
+            &code,
+            current_key.as_ref(),
+            install,
+        ) {
             Ok(r) => break r,
             Err(e) => {
-                failures += 1;
                 eprintln!("Pairing attempt failed: {e}");
-                if failures >= 5 {
-                    return Err(
-                        "too many failed pairing attempts; start pairing mode again for a new code"
-                            .into(),
-                    );
-                }
+                // Failed attempts can't guess a 256-bit secret, so there's no
+                // lockout; just slow repeated attempts down.
+                std::thread::sleep(Duration::from_secs(1));
             }
         }
     };
     drop(code); // one-time: this code can't be used again
 
     store::add(&dir, &result.ground)?;
-    let old_key = SigningKey::load(&dir).ok();
-    result.signing_key.save(&dir)?;
+    let how = if result.new_key {
+        "new signing key loaded"
+    } else {
+        "shared the existing signing key"
+    };
     println!(
-        "Paired with ground station {} ({}).",
+        "Paired with ground station {} ({}); {how}.",
         result.ground.name,
         result.ground.fingerprint()
     );
-
-    if let Some(addr) = o.get("autopilot") {
-        let (sys, comp) = o.target()?;
-        let mut conn = mavlink::connect::<MavMessage>(addr)?;
-        conn.set_protocol_version(mavlink::MavlinkVersion::V2);
-        if let Some(old) = &old_key {
-            // Changing a key the autopilot already has: PX4 and ArduPilot
-            // only accept it if signed with the current key.
-            conn.setup_signing(Some(old.mavlink_config(0)));
-        }
-        let msg = result.signing_key.setup_signing_message(sys, comp);
-        conn.send(&companion_header(sys), &msg)?;
-        println!("Sent SETUP_SIGNING to autopilot {sys}:{comp} at {addr}.");
-    }
     Ok(())
+}
+
+/// Load a brand-new key into the autopilot, prove it works with a signed
+/// round trip, and only then save it. If anything fails, nothing is saved.
+fn install_key(o: &Opts, key: &SigningKey, key_path: &Path) -> oasa_sec::Result<()> {
+    let to_err = |e: Box<dyn std::error::Error>| {
+        eprintln!("Loading the key into the autopilot failed: {e}");
+        oasa_sec::Error::Protocol("autopilot did not accept the new key")
+    };
+    if let Some(addr) = o.get("autopilot") {
+        let (sys, comp) = o.target().map_err(|e| to_err(e.into()))?;
+        (|| -> R {
+            let mut conn = mavlink::connect::<MavMessage>(addr)?;
+            conn.set_protocol_version(mavlink::MavlinkVersion::V2);
+            let msg = key.setup_signing_message(sys, comp);
+            conn.send(&companion_header(sys), &msg)?;
+            conn.setup_signing(Some(key.mavlink_config(COMPANION_LINK_ID)));
+            // The autopilot needs a moment to switch; then prove the key works.
+            std::thread::sleep(Duration::from_millis(200));
+            signed_round_trip(conn, companion_header(sys), sys, comp)?;
+            Ok(())
+        })()
+        .map_err(to_err)?;
+        println!(
+            "Autopilot {sys}:{comp} at {addr} accepted the new key (checked with a signed command)."
+        );
+    }
+    key.save(key_path)
 }
 
 fn ground(o: &Opts) -> R {
     let dir = o.dir()?;
     let name = o.name()?;
     let addr = o.req("connect")?;
-    let code = PairingCode::decode(o.req("code")?)?;
+    let code = PairingCode::decode(&read_code(o)?)?;
+    let drone_fp = fingerprint(&code.responder_public);
+    if let Some(expected) = o.get("expect-drone")
+        && expected != drone_fp
+    {
+        return Err(
+            format!("code is for drone {drone_fp}, not {expected}; refusing to pair").into(),
+        );
+    }
     let (me, _) = Identity::load_or_create(&dir)?;
-    let key = SigningKey::generate()?;
 
     println!(
-        "Pairing with drone {} at {addr}...",
-        oasa_sec::identity::fingerprint(&code.responder_public)
+        "Pairing with drone {drone_fp} at {addr}. Check this matches the drone's screen or label."
     );
-    let mut stream = prepare(TcpStream::connect(addr)?)?;
-    let r = pair_as_ground(&mut stream, &me, &name, &code, &key)?;
+    let stream = std::net::TcpStream::connect(addr)?;
+    let mut stream = DeadlineStream::new(stream, Duration::from_secs(30))?;
+    let r = pair_as_ground(&mut stream, &me, &name, &code, SigningKey::generate)?;
+    r.signing_key
+        .save(&peer_key_path(&dir, &r.drone.fingerprint()))?;
     store::add(&dir, &r.drone)?;
-    key.save(&dir)?;
+    let how = if r.new_key {
+        "made a new signing key"
+    } else {
+        "received the drone's signing key"
+    };
     println!(
-        "Paired with drone {} ({}). Signing key saved.",
+        "Paired with drone {} ({}); {how}.",
         r.drone.name,
         r.drone.fingerprint()
     );
     Ok(())
 }
 
+/// The pairing code is a secret, so don't take it on the command line.
+fn read_code(o: &Opts) -> R<zeroize::Zeroizing<String>> {
+    if let Some(path) = o.get("code-file") {
+        return Ok(zeroize::Zeroizing::new(std::fs::read_to_string(path)?));
+    }
+    match o.get("code") {
+        None | Some("-") => {}
+        Some(_) => {
+            return Err(
+                "don't put the pairing code on the command line (other users can see it); \
+                        use --code-file FILE or pipe it in with --code -"
+                    .into(),
+            );
+        }
+    }
+    if std::io::stdin().is_terminal() {
+        eprintln!("Paste or scan the pairing code, then press Enter:");
+    }
+    let mut line = zeroize::Zeroizing::new(String::new());
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
+}
+
 fn peers(o: &Opts) -> R {
-    let list: Vec<Peer> = store::load(&o.dir()?)?;
+    let list = store::load(&o.dir()?)?;
     if list.is_empty() {
-        println!("No trusted devices yet.");
+        println!("No paired devices yet.");
     }
     for p in list {
         println!("{}  {}", p.fingerprint(), p.name);
@@ -209,22 +284,58 @@ fn remove(o: &Opts) -> R {
         .first()
         .ok_or("give the fingerprint to remove")?;
     if store::remove(&o.dir()?, fp)? {
-        println!("Removed {fp}. Re-pair to rotate the signing key.");
+        println!(
+            "Removed {fp} from the list. It is not locked out until keys are rotated (R-SEC2)."
+        );
         Ok(())
     } else {
-        Err(format!("no trusted device {fp}").into())
+        Err(format!("no paired device {fp}").into())
     }
 }
 
 fn command(o: &Opts) -> R {
     let dir = o.dir()?;
-    let key = SigningKey::load(&dir)?;
-    let addr = o.req("to")?;
+    let key = command_key(o, &dir)?;
     let (sys, comp) = o.target()?;
-    let mut conn = mavlink::connect::<MavMessage>(addr)?;
+    let link_id: u8 = o.get("link-id").map(str::parse).transpose()?.unwrap_or(0);
+    let mut conn = mavlink::connect::<MavMessage>(o.req("to")?)?;
     conn.set_protocol_version(mavlink::MavlinkVersion::V2);
-    conn.setup_signing(Some(key.mavlink_config(0)));
+    conn.setup_signing(Some(key.mavlink_config(link_id)));
+    signed_round_trip(conn, gcs_header(), sys, comp)?;
+    println!("Signed acknowledgment received from {sys}:{comp}: MAV_CMD_REQUEST_MESSAGE accepted.");
+    Ok(())
+}
 
+/// Which key `command` uses: a drone's own autopilot key, or on a ground
+/// station the key for `--peer` (or the only paired drone).
+fn command_key(o: &Opts, dir: &Path) -> R<SigningKey> {
+    if let Some(p) = o.get("peer") {
+        let peer = store::find(dir, p)?.ok_or(format!("no paired device {p}"))?;
+        return Ok(SigningKey::load(&peer_key_path(dir, &peer.fingerprint()))?);
+    }
+    let autopilot = dir.join(AUTOPILOT_KEY_FILE);
+    if autopilot.exists() {
+        return Ok(SigningKey::load(&autopilot)?);
+    }
+    let with_keys: Vec<_> = store::load(dir)?
+        .into_iter()
+        .filter(|p| peer_key_path(dir, &p.fingerprint()).exists())
+        .collect();
+    match with_keys.as_slice() {
+        [only] => Ok(SigningKey::load(&peer_key_path(dir, &only.fingerprint()))?),
+        [] => Err("no signing key here; pair first".into()),
+        _ => Err("more than one drone is paired; choose one with --peer".into()),
+    }
+}
+
+/// Send a signed REQUEST_MESSAGE and wait for a signed COMMAND_ACK that
+/// matches it: same command, ACCEPTED, from the target.
+fn signed_round_trip(
+    conn: impl MavConnection<MavMessage> + 'static,
+    header: MavHeader,
+    sys: u8,
+    comp: u8,
+) -> R {
     let req = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
         param1: 148.0, // AUTOPILOT_VERSION message id
         param2: 0.0,
@@ -239,14 +350,19 @@ fn command(o: &Opts) -> R {
         confirmation: 0,
     });
     // recv() blocks; run it on a thread so we can give up after a timeout.
-    let conn = std::sync::Arc::new(conn);
+    // Only signed messages reach us: the connection drops anything else.
+    let conn = Arc::new(conn);
     let reader = conn.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         loop {
             match reader.recv() {
-                Ok((_, MavMessage::COMMAND_ACK(ack))) => {
-                    let _ = tx.send(Ok(ack));
+                Ok((h, MavMessage::COMMAND_ACK(ack)))
+                    if h.system_id == sys
+                        && h.component_id == comp
+                        && ack.command == MavCmd::MAV_CMD_REQUEST_MESSAGE =>
+                {
+                    let _ = tx.send(Ok(ack.result));
                     return;
                 }
                 Ok(_) => {}
@@ -258,21 +374,19 @@ fn command(o: &Opts) -> R {
         }
     });
     for _ in 0..5 {
-        conn.send(&gcs_header(), &req)?;
+        conn.send(&header, &req)?;
         if let Ok(r) = rx.recv_timeout(Duration::from_secs(1)) {
-            let ack = r?;
-            println!(
-                "Signed acknowledgment received: {:?} {:?}",
-                ack.command, ack.result
-            );
-            return Ok(());
+            return match r? {
+                MavResult::MAV_RESULT_ACCEPTED => Ok(()),
+                other => Err(format!("command was refused: {other:?}").into()),
+            };
         }
     }
     Err("no signed acknowledgment (wrong key, or autopilot not listening)".into())
 }
 
 fn gcs_header() -> MavHeader {
-    // 255 is the usual system id for a ground station; 190 is MAV_COMP_ID_MISSIONPLANNER.
+    // 255 is the usual ground station system id; 190 is MAV_COMP_ID_MISSIONPLANNER.
     MavHeader {
         system_id: 255,
         component_id: 190,
@@ -288,14 +402,6 @@ fn companion_header(system_id: u8) -> MavHeader {
         component_id: 191,
         sequence: 0,
     }
-}
-
-fn prepare(s: TcpStream) -> std::io::Result<TcpStream> {
-    s.set_nonblocking(false)?;
-    s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    s.set_write_timeout(Some(Duration::from_secs(10)))?;
-    s.set_nodelay(true)?;
-    Ok(s)
 }
 
 struct Opts {

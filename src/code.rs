@@ -70,11 +70,12 @@ impl PairingCode {
             .filter(|p| p.eq_ignore_ascii_case(PREFIX))
             .map(|_| &text[PREFIX.len()..])
             .ok_or(Error::BadCode("must start with OASA1-"))?;
-        let cleaned: String = rest
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '-')
-            .map(|c| c.to_ascii_uppercase())
-            .collect();
+        let cleaned: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+            rest.chars()
+                .filter(|c| !c.is_whitespace() && *c != '-')
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+        );
         let mut body = data_encoding::BASE32_NOPAD
             .decode(cleaned.as_bytes())
             .map_err(|_| Error::BadCode("not valid base32"))?;

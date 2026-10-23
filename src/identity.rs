@@ -1,11 +1,12 @@
 //! Device identity: one X25519 key pair per device, made on the device.
 
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use blake2::{Blake2s256, Digest};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::files::{read_private_file, write_new_private_file};
 
 use crate::{Error, PAIRING_NOISE, Result};
 
@@ -25,7 +26,8 @@ impl Identity {
     pub fn generate() -> Result<Self> {
         let params = PAIRING_NOISE.parse().expect("valid Noise name");
         let kp = snow::Builder::new(params).generate_keypair()?;
-        Self::from_private_bytes(&kp.private).inspect(|id| {
+        let private = Zeroizing::new(kp.private);
+        Self::from_private_bytes(&private).inspect(|id| {
             debug_assert_eq!(id.public[..], kp.public[..]);
         })
     }
@@ -53,29 +55,25 @@ impl Identity {
     }
 
     /// Load the identity in `dir`, or make and save a new one if none exists.
+    /// Never overwrites an existing identity, even if two processes race.
     pub fn load_or_create(dir: &Path) -> Result<(Self, bool)> {
         let path = dir.join(PRIVATE_KEY_FILE);
-        if path.exists() {
+        if fs::symlink_metadata(&path).is_ok() {
             return Ok((Self::load(dir)?, false));
         }
         let id = Self::generate()?;
-        id.save(dir)?;
-        Ok((id, true))
+        match write_new_private_file(&path, &id.private) {
+            Ok(()) => Ok((id, true)),
+            // Someone else made it first: use theirs.
+            Err(Error::BadKeyFile(_)) if path.exists() => Ok((Self::load(dir)?, false)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Load the identity saved in `dir`. Refuses key files others can read.
     pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join(PRIVATE_KEY_FILE);
-        check_private_permissions(&path)?;
-        let mut bytes = fs::read(&path)?;
-        let id = Self::from_private_bytes(&bytes);
-        bytes.zeroize();
-        id
-    }
-
-    /// Save the private key to `dir`, readable only by its owner.
-    pub fn save(&self, dir: &Path) -> Result<()> {
-        write_private_file(&dir.join(PRIVATE_KEY_FILE), &self.private)
+        let bytes = read_private_file(&dir.join(PRIVATE_KEY_FILE))?;
+        Self::from_private_bytes(&bytes)
     }
 }
 
@@ -98,65 +96,6 @@ pub fn fingerprint(public: &[u8; 32]) -> String {
 /// library the Noise implementation uses.
 fn x25519_public(private: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(curve25519_dalek::MontgomeryPoint::mul_base_clamped(*private).to_bytes())
-}
-
-/// Write secret bytes to a new file with mode 0600 (owner only).
-pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(())
-}
-
-/// Refuse secret files that anyone other than the owner can read or write.
-pub(crate) fn check_private_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(path)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(Error::BadKeyFile(format!(
-                "{} can be read by others (mode {:o}); run chmod 600 on it",
-                path.display(),
-                mode & 0o777
-            )));
-        }
-    }
-    let _ = path;
-    Ok(())
-}
-
-/// A fresh, empty temporary directory for tests.
-#[cfg(test)]
-pub(crate) fn tempdir(name: &str) -> std::path::PathBuf {
-    let mut r = [0u8; 8];
-    getrandom::fill(&mut r).unwrap();
-    let p = std::env::temp_dir().join(format!(
-        "oasa-sec-test-{name}-{}",
-        data_encoding::HEXLOWER.encode(&r)
-    ));
-    fs::create_dir_all(&p).unwrap();
-    p
 }
 
 #[cfg(test)]
@@ -185,7 +124,7 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip_with_owner_only_permissions() {
-        let dir = tempdir("identity");
+        let dir = crate::files::tempdir("identity");
         let (id, created) = Identity::load_or_create(&dir).unwrap();
         assert!(created);
         let (again, created) = Identity::load_or_create(&dir).unwrap();
@@ -206,7 +145,7 @@ mod tests {
     #[test]
     fn refuses_key_file_others_can_read() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir("perms");
+        let dir = crate::files::tempdir("perms");
         Identity::load_or_create(&dir).unwrap();
         let path = dir.join(PRIVATE_KEY_FILE);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();

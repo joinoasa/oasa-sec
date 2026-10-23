@@ -16,6 +16,7 @@
 
 pub mod code;
 pub mod error;
+mod files;
 pub mod identity;
 pub mod pairing;
 pub mod signing;

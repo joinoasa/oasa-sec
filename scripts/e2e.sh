@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end check for oasa-pair, with no hardware:
-# stand-in autopilot, drone, ground station, an attacker, and pymavlink.
-# Test tool only. Run from the repo root after `cargo build --bins --examples`.
+# End-to-end check for oasa-pair, with no hardware: a stand-in autopilot,
+# a drone, two ground stations, an attacker, and pymavlink as an independent
+# MAVLink implementation. Test tool only.
+# Run from the repo root after `cargo build --bins --examples`.
 set -euo pipefail
 
 B=target/debug
@@ -10,74 +11,108 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$T"; }
 trap cleanup EXIT
 pass() { echo "PASS  $1"; }
-fail() { echo "FAIL  $1"; exit 1; }
+fail() { echo "FAIL  $1"; for f in "$T"/*.log; do echo "--- $f"; cat "$f"; done; exit 1; }
 PY="python3 -I tests/interop/pymavlink_check.py"
+# Expect the pymavlink client to get no ACK: exit code 2, nothing else.
+expect_no_ack() { set +e; $PY client "$1" "$2" >/dev/null 2>&1; local rc=$?; set -e; [ "$rc" = 2 ]; }
+key32() { head -c 32 "$1" | od -An -tx1; }
+
+start_drone() { # dir name logfile [extra args...]
+  local dir=$1 name=$2 log=$3; shift 3
+  $B/oasa-pair drone --dir "$dir" --name "$name" --listen 127.0.0.1:7400 --wait 30 "$@" > "$log" 2>&1 &
+  DRONE=$!
+  for _ in $(seq 50); do grep -q 'OASA1-' "$log" && break; sleep 0.1; done
+  CODE=$(grep -o 'OASA1-[A-Z2-7]*' "$log") || fail "drone did not show a code"
+}
 
 $B/examples/fake_autopilot udpin:127.0.0.1:14540 > "$T/ap.log" 2>&1 & PIDS+=($!)
-$B/oasa-pair init --dir "$T/drone" >/dev/null
-$B/oasa-pair init --dir "$T/gcs" >/dev/null
-$B/oasa-pair init --dir "$T/attacker" >/dev/null
+for d in drone gcs gcs2 attacker; do $B/oasa-pair init --dir "$T/$d" >/dev/null; done
+DRONE_FP=$($B/oasa-pair init --dir "$T/drone" | awk '{print $3}')
 
-$B/oasa-pair drone --dir "$T/drone" --name drone-1 --listen 127.0.0.1:7400 \
-  --autopilot udpout:127.0.0.1:14540 --wait 30 > "$T/drone.log" 2>&1 & DRONE=$!
-for _ in $(seq 50); do grep -q 'OASA1-' "$T/drone.log" && break; sleep 0.1; done
-CODE=$(grep -o 'OASA1-[A-Z2-7]*' "$T/drone.log")
+# --- 1. First pairing, with an attacker trying first ---------------------
+start_drone "$T/drone" drone-1 "$T/drone.log" --autopilot udpout:127.0.0.1:14540
 
-# An attacker who knows the drone's public key but never saw the code.
+# The attacker knows the drone's public key (it's in the code) but guesses the secret.
 FAKE=$(python3 - "$CODE" <<'PY'
 import base64, os, sys, hashlib
-body = bytearray(base64.b32decode(sys.argv[1][6:] + "=" * (-len(sys.argv[1][6:]) % 8)))
-body[33:65] = os.urandom(32)  # guess the secret
-h = hashlib.blake2s(b"OASA-SEC v0 code checksum" + bytes(body[:65])).digest()[:4]
-body[65:] = h
+t = sys.argv[1][6:]
+body = bytearray(base64.b32decode(t + "=" * (-len(t) % 8)))
+body[33:65] = os.urandom(32)
+body[65:] = hashlib.blake2s(b"OASA-SEC v0 code checksum" + bytes(body[:65])).digest()[:4]
 print("OASA1-" + base64.b32encode(bytes(body)).decode().rstrip("="))
 PY
 )
-if $B/oasa-pair ground --dir "$T/attacker" --name evil --connect 127.0.0.1:7400 --code "$FAKE" >/dev/null 2>&1; then
-  fail "attacker without the code was able to pair"
-fi
-pass "attacker without the secret is rejected"
+echo "$FAKE" | $B/oasa-pair ground --dir "$T/attacker" --name evil --connect 127.0.0.1:7400 --code - >/dev/null 2>&1 \
+  && fail "attacker without the secret was able to pair"
+sleep 0.3
+grep -q "Pairing attempt failed: encryption or authentication failed" "$T/drone.log" \
+  || fail "drone did not reject the attacker for the right reason"
+pass "attacker without the secret is rejected by the handshake"
 
-$B/oasa-pair ground --dir "$T/gcs" --name gcs-1 --connect 127.0.0.1:7400 --code "$CODE" >/dev/null \
-  || fail "ground station could not pair"
+$B/oasa-pair ground --dir "$T/gcs" --name gcs-1 --connect 127.0.0.1:7400 --code "$CODE" >/dev/null 2>&1 \
+  && fail "accepted the pairing code on the command line"
+pass "pairing code on the command line is refused"
+
+echo "$CODE" | $B/oasa-pair ground --dir "$T/gcs" --name gcs-1 --connect 127.0.0.1:7400 --code - \
+  --expect-drone WRONG-WRON-GWRO-NGWR >/dev/null 2>&1 && fail "paired with an unexpected drone"
+pass "--expect-drone refuses a code for a different drone"
+
+echo "$CODE" | $B/oasa-pair ground --dir "$T/gcs" --name gcs-1 --connect 127.0.0.1:7400 --code - \
+  --expect-drone "$DRONE_FP" >/dev/null || fail "ground station could not pair"
 wait "$DRONE" || fail "drone pairing failed"
-pass "ground station pairs with the real code after a failed attack"
+grep -q "accepted the new key (checked with a signed command)" "$T/drone.log" \
+  || fail "drone did not verify the key with the autopilot"
+pass "first ground station pairs; drone loads and verifies the key in the autopilot"
 
-# Compare the 32-byte keys (the 8-byte timestamps after them differ).
-[ "$(head -c 32 "$T/gcs/mavlink-signing-key.bin" | od -An -tx1)" = "$(head -c 32 "$T/drone/mavlink-signing-key.bin" | od -An -tx1)" ] \
-  || fail "drone and ground station have different signing keys"
-pass "both sides hold the same signing key"
-
+GKEY="$T/gcs/signing-keys/$DRONE_FP.bin"
+[ "$(key32 "$GKEY")" = "$(key32 "$T/drone/mavlink-signing-key.bin")" ] || fail "keys differ"
 grep -q "gcs-1" "$T/drone/trusted-peers" || fail "drone did not save the ground station"
 grep -q "evil" "$T/drone/trusted-peers" && fail "drone saved the attacker"
-pass "drone trusts the ground station and not the attacker"
+pass "both sides hold the same key; only the real ground station is saved"
 
-sleep 0.5
-grep -q "signing key set" "$T/ap.log" || fail "autopilot did not get SETUP_SIGNING"
+# --- 2. Signed commands --------------------------------------------------
 $B/oasa-pair command --dir "$T/gcs" --to udpout:127.0.0.1:14540 >/dev/null || fail "signed command not acknowledged"
 pass "autopilot accepts a signed command"
-
-$PY client none 14540 >/dev/null && fail "autopilot accepted an unsigned command"
+expect_no_ack none 14540 || fail "autopilot accepted an unsigned command"
 pass "autopilot ignores an unsigned command (sent by pymavlink)"
-
-mkdir -p "$T/wrong" && head -c 40 /dev/urandom > "$T/wrong/mavlink-signing-key.bin" && chmod 600 "$T/wrong/mavlink-signing-key.bin"
-$PY client "$T/wrong/mavlink-signing-key.bin" 14540 >/dev/null && fail "autopilot accepted the wrong key"
+mkdir -p "$T/wrong" && chmod 700 "$T/wrong" && head -c 40 /dev/urandom > "$T/wrong/k.bin" && chmod 600 "$T/wrong/k.bin"
+expect_no_ack "$T/wrong/k.bin" 14540 || fail "autopilot accepted the wrong key"
 pass "autopilot ignores a command signed with the wrong key"
+$PY client "$GKEY" 14540 >/dev/null || fail "pymavlink-signed command not accepted"
+pass "Rust verifies pymavlink's signatures"
 
-$PY client "$T/gcs/mavlink-signing-key.bin" 14540 >/dev/null || fail "pymavlink-signed command not accepted"
-pass "pymavlink-signed command is accepted (Rust verifies pymavlink)"
-
-$PY autopilot "$T/drone/mavlink-signing-key.bin" 14541 > "$T/py.log" 2>&1 & PY_AP=$!
+$PY autopilot "$GKEY" 14541 > "$T/py.log" 2>&1 & PY_AP=$!
 sleep 1.5
 $B/oasa-pair command --dir "$T/gcs" --to udpout:127.0.0.1:14541 >/dev/null || fail "no signed ACK from pymavlink"
 wait "$PY_AP" || fail "pymavlink rejected our signature"
-pass "pymavlink accepts our signed command and we accept its signed ACK"
+pass "pymavlink verifies our signatures, and we verify its ACK"
 
-for f in identity.key mavlink-signing-key.bin trusted-peers; do
-  for d in drone gcs; do
-    [ "$(stat -c %a "$T/$d/$f")" = 600 ] || fail "$d/$f is not owner-only"
-  done
+# --- 3. A second ground station joins ------------------------------------
+start_drone "$T/drone" drone-1 "$T/drone2.log" --autopilot udpout:127.0.0.1:14540
+echo "$CODE" | $B/oasa-pair ground --dir "$T/gcs2" --name gcs-2 --connect 127.0.0.1:7400 --code - >/dev/null \
+  || fail "second ground station could not pair"
+wait "$DRONE" || fail "second pairing failed"
+[ "$(key32 "$T/gcs2/signing-keys/$DRONE_FP.bin")" = "$(key32 "$GKEY")" ] || fail "second ground station got a different key"
+$B/oasa-pair command --dir "$T/gcs" --to udpout:127.0.0.1:14540 >/dev/null || fail "first ground station was locked out"
+$B/oasa-pair command --dir "$T/gcs2" --to udpout:127.0.0.1:14540 >/dev/null || fail "second ground station can't command"
+pass "second ground station gets the same key; neither is locked out"
+
+# --- 4. If the autopilot doesn't take the key, nothing is saved ----------
+$B/oasa-pair init --dir "$T/drone-b" >/dev/null
+start_drone "$T/drone-b" drone-b "$T/drone-b.log" --autopilot udpout:127.0.0.1:14599  # nothing listening
+echo "$CODE" | $B/oasa-pair ground --dir "$T/gcs" --name gcs-1 --connect 127.0.0.1:7400 --code - >/dev/null 2>&1 \
+  && fail "ground station reported success though the autopilot never took the key"
+kill "$DRONE" 2>/dev/null || true; wait "$DRONE" 2>/dev/null || true
+[ -e "$T/drone-b/mavlink-signing-key.bin" ] && fail "drone saved a key the autopilot doesn't have"
+ls "$T/gcs/signing-keys" | grep -qv "$DRONE_FP" && fail "ground station saved a key for the failed drone"
+pass "a key the autopilot didn't accept is never saved on either side"
+
+# --- 5. File permissions -------------------------------------------------
+for f in "$T/drone/identity.key" "$T/drone/mavlink-signing-key.bin" "$T/drone/trusted-peers" \
+         "$T/gcs/identity.key" "$GKEY" "$T/gcs/trusted-peers"; do
+  [ "$(stat -c %a "$f")" = 600 ] || fail "$f is not owner-only"
 done
-pass "key files are owner-only (600)"
+[ "$(stat -c %a "$T/gcs/signing-keys")" = 700 ] || fail "key folder is not owner-only"
+pass "key files are 600 and the key folder is 700"
 
 echo "All end-to-end checks passed."

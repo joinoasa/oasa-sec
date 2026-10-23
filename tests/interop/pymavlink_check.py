@@ -8,7 +8,8 @@ Test tool only. Two modes:
                                Exits after the first accepted command.
   client KEYFILE|none PORT     Send a COMMAND_LONG (signed with KEYFILE, or
                                unsigned with "none") and wait 3 s for an ACK.
-                               Exit 0 if one arrived, 1 if not.
+                               Exit 0 if one arrived, 2 if not (any other
+                               exit code means the script itself failed).
 """
 
 import os
@@ -60,7 +61,7 @@ def client(key_path, port):
             print(f"ACK {ack.command} result {ack.result}", flush=True)
             return 0
     print("no ACK", flush=True)
-    return 1
+    return 2
 
 
 if __name__ == "__main__":
