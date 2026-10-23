@@ -121,6 +121,9 @@ pub(super) fn established(cfg: Config) -> (Pair, Duration) {
         initiator: false,
         rekey: false
     }));
+    // The responder's confirmation reaches the initiator.
+    let confirm = sends(&ev).remove(0);
+    p.a.handle_packet(now, &confirm);
     (p, now)
 }
 
@@ -966,4 +969,75 @@ fn ciphertext_does_not_contain_the_plaintext() {
     // The same plaintext twice gives different ciphertext (new counter).
     let pkt2 = p.a.send(now, marker).unwrap();
     assert_ne!(pkt[5..], pkt2[5..]);
+}
+
+#[test]
+fn a_changed_handshake_2_is_noticed_and_the_link_recovers() {
+    // The sender index in handshake 2 is not covered by the Noise tags. An
+    // attacker on the path can change it: the initiator then sends to an
+    // index the responder does not have. The initiator must notice that no
+    // packet ever comes back, and ask again.
+    let mut p = pair(Config::default());
+    let hs1 = sends(&p.a.start_handshake(ms(0)).unwrap()).remove(0);
+    let mut hs2 = sends(&p.b.handle_packet(ms(0), &hs1)).remove(0);
+    hs2[1] ^= 0x55; // the responder's index, as the initiator will use it
+    let ev = p.a.handle_packet(ms(10), &hs2);
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::SessionEstablished { .. }))
+    );
+    let ka = sends(&ev).remove(0);
+    // The responder drops everything the initiator sends on this session.
+    assert_eq!(
+        drops(&p.b.handle_packet(ms(10), &ka)),
+        vec![DropReason::UnknownIndex]
+    );
+    let data = p.a.send(ms(20), b"lost").unwrap();
+    assert_eq!(
+        drops(&p.b.handle_packet(ms(20), &data)),
+        vec![DropReason::UnknownIndex]
+    );
+    // Not yet: the initiator waits as long as a handshake retry would.
+    assert!(sends(&p.a.poll_timers(ms(4000))).is_empty());
+    // Then it starts over, and this time nothing is changed.
+    let ev = p.a.poll_timers(ms(5100));
+    let hs1 = sends(&ev).remove(0);
+    assert_eq!(hs1.len(), 111);
+    let hs2 = sends(&p.b.handle_packet(ms(5200), &hs1)).remove(0);
+    let ka = sends(&p.a.handle_packet(ms(5300), &hs2)).remove(0);
+    p.b.handle_packet(ms(5300), &ka);
+    let data = p.a.send(ms(5400), b"through").unwrap();
+    assert_eq!(
+        delivered(&p.b.handle_packet(ms(5400), &data)),
+        vec![b"through".to_vec()]
+    );
+    let back = p.b.send(ms(5500), b"back").unwrap();
+    assert_eq!(
+        delivered(&p.a.handle_packet(ms(5500), &back)),
+        vec![b"back".to_vec()]
+    );
+    // A confirmed session is left alone.
+    assert!(sends(&p.a.poll_timers(ms(60_000))).is_empty() || p.a.stats().handshakes_sent == 2);
+}
+
+#[test]
+fn an_unconfirmed_session_does_not_push_out_the_working_one() {
+    let (mut p, t0) = established(Config::default());
+    // Confirmed old session: b sends something so a has seen data on it.
+    let first = p.b.send(t0, b"hello").unwrap();
+    p.a.handle_packet(t0, &first);
+    let old_b = index_of(&first);
+    // A rekey whose handshake 2 is tampered with.
+    let t = t0 + Duration::from_secs(2);
+    let hs1 = sends(&p.a.start_handshake(t).unwrap()).remove(0);
+    let mut hs2 = sends(&p.b.handle_packet(t, &hs1)).remove(0);
+    hs2[1] ^= 0x55;
+    p.a.handle_packet(t, &hs2);
+    // b keeps sending on the old session; a must still read it.
+    let still = p.b.send(t + ms(100), b"still on old").unwrap();
+    assert_eq!(index_of(&still), old_b);
+    assert_eq!(
+        delivered(&p.a.handle_packet(t + ms(100), &still)),
+        vec![b"still on old".to_vec()]
+    );
 }

@@ -131,6 +131,8 @@ struct Sim {
     next_id: u32,
     /// While true the channel drops everything.
     blackout: bool,
+    /// Change the sender index in this many handshake 2 packets on the way.
+    tamper_hs2: u32,
 }
 
 fn pub_of(k: &[u8; 32]) -> [u8; 32] {
@@ -174,6 +176,7 @@ impl Sim {
             logs,
             next_id: 0,
             blackout: false,
+            tamper_hs2: 0,
         }
     }
 
@@ -185,7 +188,11 @@ impl Sim {
     }
 
     /// Put `bytes`, sent by `from`, on the channel towards the other side.
-    fn transmit(&mut self, from: Side, bytes: Vec<u8>) {
+    fn transmit(&mut self, from: Side, mut bytes: Vec<u8>) {
+        if self.tamper_hs2 > 0 && bytes[0] == 0x20 {
+            self.tamper_hs2 -= 1;
+            bytes[1] ^= 0x5A; // not covered by any tag
+        }
         self.wire.push((from.other(), bytes.clone()));
         if self.blackout || self.rng.chance(self.channel.loss) {
             return;
@@ -891,5 +898,41 @@ fn sizes_on_the_wire_match_the_spec() {
             "a keepalive is header + index + counter + tag"
         );
         assert!(sim.wire.iter().all(|(_, p)| p.len() <= 128));
+    }
+}
+
+#[test]
+fn a_handshake_2_changed_on_the_way_costs_seconds_not_minutes() {
+    // The responder's index in handshake 2 has no tag of its own. Changing it
+    // used to leave the initiator sending into the void until the next rekey.
+    for seed in 1..=3u64 {
+        let mut sim = Sim::new(seed, config(CounterLen::Short), Channel::clean());
+        sim.tamper_hs2 = 2; // the first two attempts (the second a retry)
+        sim.start();
+        sim.run(Duration::from_secs(90), ms(10), ms(100), |_| {});
+        sim.drain();
+        sim.check_delivery_integrity();
+        sim.check_accounting();
+        // Two bad sessions were noticed and replaced, and then it worked.
+        let first = sim.logs[&Side::B].established[0].0;
+        assert!(
+            first < Duration::from_secs(25),
+            "seed {seed}: first good session at {first:?}"
+        );
+        let gap = longest_gap(
+            &sim,
+            Side::B,
+            first + Duration::from_secs(1),
+            Duration::from_secs(90),
+        );
+        assert!(gap < 1.0, "seed {seed}: {gap}");
+        let gap = longest_gap(
+            &sim,
+            Side::A,
+            first + Duration::from_secs(1),
+            Duration::from_secs(90),
+        );
+        assert!(gap < 1.0, "seed {seed}: {gap}");
+        assert!(sim.stats(Side::B).dropped(DropReason::UnknownIndex) >= 1);
     }
 }

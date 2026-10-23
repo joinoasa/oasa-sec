@@ -14,6 +14,11 @@ pub(crate) struct Session {
     pub remote_index: u16,
     /// We started the handshake that made this session.
     pub initiator: bool,
+    /// The peer has proved it holds the session: a valid data packet arrived
+    /// on it. Until then an initiator cannot tell a working session from one
+    /// whose handshake 2 was changed on the way (the indexes in it are not
+    /// covered by the Noise tags).
+    pub confirmed: bool,
     pub created: Duration,
     transport: StatelessTransportState,
     send_counter: u64,
@@ -35,6 +40,7 @@ impl Session {
             local_index,
             remote_index,
             initiator,
+            confirmed: false,
             created: now,
             transport,
             send_counter: 0,
