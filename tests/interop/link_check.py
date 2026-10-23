@@ -63,52 +63,95 @@ def traffic(args):
     return 0 if ok else 2
 
 
-def mav(msgid, payload, signed=False, v1=False):
-    """A MAVLink frame with a made-up CRC: the guard checks shape, not CRC."""
+def _crc(data, extra):
+    from pymavlink import mavutil  # noqa: F401  (sets up the dialects)
+    from pymavlink.generator.mavcrc import x25crc
+    c = x25crc()
+    c.accumulate(data)
+    c.accumulate(bytes([extra]))
+    return c.crc.to_bytes(2, "little")
+
+
+def mav(msgid, payload, signed=False, v1=False, bad_crc=False):
+    """A MAVLink frame with the real CRC (CRC_EXTRA from pymavlink's common dialect)."""
+    from pymavlink.dialects.v20 import common
+    extra = common.mavlink_map[msgid].crc_extra
     if v1:
-        return bytes([0xFE, len(payload), 1, 255, 190, msgid]) + payload + b"\xaa\xbb"
-    head = bytes([0xFD, len(payload), 1 if signed else 0, 0, 1, 255, 190]) + msgid.to_bytes(3, "little")
-    return head + payload + b"\xaa\xbb" + (b"\x5a" * 13 if signed else b"")
+        body = bytes([len(payload), 1, 255, 190, msgid]) + payload
+        tail = b""
+    else:
+        body = bytes([len(payload), 1 if signed else 0, 0, 1, 255, 190]) + msgid.to_bytes(3, "little") + payload
+        tail = b"\x5a" * 13 if signed else b""
+    crc = _crc(body, extra)
+    if bad_crc:
+        crc = bytes([crc[0] ^ 1, crc[1]])
+    return bytes([0xFE if v1 else 0xFD]) + body + crc + tail
 
 
 def param_set(name):
     return bytes(4) + bytes([1, 1]) + name.encode().ljust(16, b"\0") + b"\x09"
 
 
+def command_long(cmd, signed=False):
+    # Seven floats, then the 16-bit command, target ids, confirmation.
+    return mav(76, bytes(28) + cmd.to_bytes(2, "little") + bytes([1, 1, 0]), signed=signed)
+
+
+def mission_item_int(cmd):
+    # Seven 4-byte values, seq, command, then target ids, frame, current, autocontinue.
+    return mav(73, bytes(28) + (0).to_bytes(2, "little") + cmd.to_bytes(2, "little") + bytes([1, 1, 3, 0, 1]))
+
+
 def guard(args):
     """guard IN_PORT OUT_PORT MODE: send MAVLink datagrams into the ground
     station's plaintext input and compare what comes out of the drone's
-    plaintext output. MODE: default (SETUP_SIGNING, FTP, signing parameters
-    and junk are stopped), ftp (FTP passes too), off (everything passes)."""
+    plaintext output with what the allowlist should let through. Prints
+    `blocked N` (how many the guard should have stopped). MODE: default,
+    ftp (--allow-mavlink-ftp), wide (--allow-msg 33 --allow-command 246
+    --allow-param MPC_XY_VEL_MAX) or off (no guard)."""
     a_in, b_out, mode = int(args[0]), int(args[1]), args[2]
-    b_in = int(args[3]) if len(args) > 3 else None
+    b_in_port = int(args[3]) if len(args) > 3 else None
     hb = mav(0, bytes(9))
-    blocked_always = {
+    ping = mav(4, bytes(14))
+    ftp = mav(110, bytes(251), signed=True)
+    gpi = mav(33, bytes(28), signed=True)
+    reboot = command_long(246, signed=True)
+    param_ok = mav(23, param_set("MPC_XY_VEL_MAX"), signed=True)
+    always_blocked = {
         "setup_signing": mav(256, bytes(range(42)), signed=True),
         "setup_signing_v2": mav(256, bytes(42)),
         "param_set_sign": mav(23, param_set("MAV_SIGN_CFG")),
         "param_set_opts": mav(23, param_set("MAV2_OPTIONS"), signed=True),
-        "batched": hb + mav(256, bytes(42)) + hb,
+        "mission_reboot": mission_item_int(246),
+        "bad_crc": mav(0, bytes(9), bad_crc=True),
+        "batched_with_setup_signing": hb + mav(256, bytes(42)) + hb,
         "junk": b"not mavlink at all",
         "cut_short": hb[:-3],
+        "stray_byte": hb + b"\x00",
     }
-    ftp = mav(110, bytes(251), signed=True)
+    by_default = {
+        "ftp": ftp,
+        "global_position_int": gpi,
+        "command_reboot": reboot,
+        "param_set_ok": param_ok,
+    }
     passing = {
         "heartbeat": hb,
-        "param_set_ok": mav(23, param_set("MPC_XY_VEL_MAX"), signed=True),
-        "batched_ok": hb + mav(24, bytes(30)) + mav(33, bytes(28), signed=True),
-        "v1": mav(30, bytes(28), v1=True),
+        "arm": command_long(400, signed=True),
+        "takeoff": command_long(22),
+        "mission_item": mission_item_int(16),
+        "batched_ok": hb + ping + command_long(20, signed=True),
+        "v1_ping": mav(4, bytes(14), v1=True),
     }
-    send = {**passing, **blocked_always, "ftp": ftp}
-    expect_pass = set(passing)
-    expect_blocked = set(blocked_always)
-    if mode == "ftp":
-        expect_pass.add("ftp")
-    elif mode == "off":
-        expect_pass |= set(blocked_always) | {"ftp"}
-        expect_blocked = set()
+    send = {**passing, **always_blocked, **by_default}
+    allowed_now = {"default": set(), "ftp": {"ftp"},
+                   "wide": {"global_position_int", "command_reboot", "mission_reboot", "param_set_ok"}}.get(mode, set())
+    if mode == "off":
+        expect_pass = set(send)
     else:
-        expect_blocked.add("ftp")
+        expect_pass = set(passing) | allowed_now
+    expect_blocked = set(send) - expect_pass
+    print(f"blocked {len(expect_blocked)}")
     got, froms, stop = [], [], threading.Event()
     rb = udp(b_out)
 
@@ -133,9 +176,8 @@ def guard(args):
     by_bytes = {v: k for k, v in send.items()}
     names = sorted(by_bytes.get(g, "?") for g in got)
     print(f"{mode}: delivered {names}")
-    print(f"blocked_expected {len(expect_blocked)}")
-    if b_in is not None and set(froms) != {b_in}:
-        print(f"packets came from ports {sorted(set(froms))}, expected only {b_in} (the --plain-listen port)")
+    if b_in_port is not None and set(froms) != {b_in_port}:
+        print(f"packets came from ports {sorted(set(froms))}, expected only {b_in_port} (the --plain-listen port)")
         return 3
     return 0 if names == sorted(expect_pass) else 2
 
