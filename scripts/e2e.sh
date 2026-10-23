@@ -104,8 +104,8 @@ pass "first ground station pairs; drone loads and verifies the key in the autopi
 
 GKEY="$T/gcs/signing-keys/$DRONE_FP.bin"
 [ "$(key32 "$GKEY")" = "$(key32 "$T/drone/mavlink-signing-key.bin")" ] || fail "keys differ"
-grep -q "gcs-1" "$T/drone/trusted-peers" || fail "drone did not save the ground station"
-grep -q "evil" "$T/drone/trusted-peers" && fail "drone saved the attacker"
+grep -q "gcs-1" "$T/drone/trusted-peers.v1" || fail "drone did not save the ground station"
+grep -q "evil" "$T/drone/trusted-peers.v1" && fail "drone saved the attacker"
 pass "both sides hold the same key; only the real ground station is saved"
 
 # --- 2. Signed commands --------------------------------------------------
@@ -157,8 +157,8 @@ grep -q "Likely causes" "$T/drone-b.log" || fail "the failure did not name its l
 pass "a key the autopilot didn't accept is never saved on either side"
 
 # --- 5. File permissions -------------------------------------------------
-for f in "$T/drone/identity.key" "$T/drone/mavlink-signing-key.bin" "$T/drone/trusted-peers" \
-         "$T/gcs/identity.key" "$GKEY" "$T/gcs/trusted-peers"; do
+for f in "$T/drone/identity.key" "$T/drone/mavlink-signing-key.bin" "$T/drone/trusted-peers.v1" \
+         "$T/gcs/identity.key" "$GKEY" "$T/gcs/trusted-peers.v1"; do
   [ "$(stat -c %a "$f")" = 600 ] || fail "$f is not owner-only"
 done
 [ "$(stat -c %a "$T/gcs/signing-keys")" = 700 ] || fail "key folder is not owner-only"
