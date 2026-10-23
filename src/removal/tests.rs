@@ -607,3 +607,87 @@ fn many_threads_removing_and_adding_lose_nothing() {
     assert_eq!(store::load(&d).unwrap().len(), 30);
     assert_eq!(load_removed(&d).unwrap().removed_keys().len(), 30);
 }
+
+fn fresh_key(i: u32) -> [u8; 32] {
+    let mut k = [0x55u8; 32];
+    k[..4].copy_from_slice(&i.to_be_bytes());
+    k[31] = 0x40;
+    k
+}
+
+/// Write tombstones straight into the removed file (fast set-up for caps).
+fn seed_removed(d: &Path, recs: impl Iterator<Item = Record>) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = d.join(REMOVED_FILE);
+    let mut bytes = std::fs::read(&path).unwrap_or_default();
+    for r in recs {
+        bytes.extend_from_slice(r.to_line().as_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn one_admin_cannot_fill_the_removed_file() {
+    let d = device();
+    let fp = fingerprint(&A1);
+    let n = MAX_ENTRIES_PER_ADMIN as u32;
+    seed_removed(
+        &d,
+        (1..n - 2).map(|i| Record {
+            key: fresh_key(i),
+            kind: RecordKind::Removed(Source::Admin {
+                fingerprint: fp.clone(),
+                log_id: [9; 4],
+                seq: i,
+            }),
+            time: 1,
+        }),
+    );
+    let mut results = Vec::new();
+    for i in n - 2..n + 3 {
+        results.push(apply_entry(&d, &OWN, &A1, &entry(9, i, fresh_key(i)), 5).unwrap());
+    }
+    assert_eq!(
+        results.iter().filter(|r| **r == Applied::Removed).count(),
+        3,
+        "{results:?}"
+    );
+    assert!(results[3..].iter().all(|r| *r == Applied::Limit));
+    // The refused entries are not on record and sync did not advance past them.
+    assert!(!load_removed(&d).unwrap().is_removed(&fresh_key(n + 2)));
+    assert!(store::load(&d).is_ok());
+    // The other admin is unaffected, and an entry already held is still Known.
+    assert_eq!(
+        apply_entry(&d, &OWN, &A2, &entry(8, 1, PEER), 5).unwrap(),
+        Applied::Removed
+    );
+    assert_eq!(
+        apply_entry(&d, &OWN, &A1, &entry(9, 1, fresh_key(1)), 5).unwrap(),
+        Applied::Known
+    );
+    // No new removals while the caller's budget is spent.
+    assert_eq!(
+        apply_entry_limited(&d, &OWN, &A2, &entry(8, 2, OP), 5, false).unwrap(),
+        Applied::Limit
+    );
+}
+
+#[test]
+fn a_removed_file_over_one_mib_still_loads_and_appends() {
+    let d = device();
+    seed_removed(
+        &d,
+        (1..=20000u32).map(|i| Record {
+            key: fresh_key(i),
+            kind: RecordKind::Removed(Source::Local),
+            time: 1,
+        }),
+    );
+    assert!(std::fs::metadata(d.join(REMOVED_FILE)).unwrap().len() > 1 << 20);
+    let r = load_removed(&d).unwrap();
+    assert!(r.is_removed(&fresh_key(1)) && r.is_removed(&fresh_key(20000)));
+    assert!(store::load(&d).is_ok());
+    remove_local(&d, &OWN, &PEER, 9).unwrap();
+    assert!(load_removed(&d).unwrap().is_removed(&PEER));
+}

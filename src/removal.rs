@@ -23,7 +23,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::files::{DirLock, read_private_file_opt, write_private_file};
+use crate::files::{
+    DirLock, append_private_line, open_private_file, read_private_file_opt, write_private_file,
+};
 use crate::identity::{check_peer_public, fingerprint};
 use crate::link::FileTimestampStore;
 use crate::signing::{AUTOPILOT_KEY_FILE, PEER_KEYS_DIR};
@@ -163,6 +165,10 @@ impl Record {
 #[derive(Debug, Clone, Default)]
 pub struct Removed {
     records: Vec<Record>,
+    /// For each key, whether its latest record is a removal (so a lookup does
+    /// not walk a long file), and the order keys first appeared in.
+    latest: std::collections::HashMap<[u8; 32], bool>,
+    order: Vec<[u8; 32]>,
 }
 
 impl Removed {
@@ -173,23 +179,42 @@ impl Removed {
     /// Is this key removed right now? The latest record for it decides:
     /// removed, or restored by a person at the device.
     pub fn is_removed(&self, key: &[u8; 32]) -> bool {
+        self.latest.get(key).copied().unwrap_or(false)
+    }
+
+    fn from_records(records: Vec<Record>) -> Self {
+        let mut latest = std::collections::HashMap::new();
+        let mut order = Vec::new();
+        for r in &records {
+            if latest
+                .insert(r.key, matches!(r.kind, RecordKind::Removed(_)))
+                .is_none()
+            {
+                order.push(r.key);
+            }
+        }
+        Self {
+            records,
+            latest,
+            order,
+        }
+    }
+
+    /// How many entries from this admin are on record (all its logs).
+    pub fn entries_from(&self, admin_fp: &str) -> usize {
         self.records
             .iter()
-            .rev()
-            .find(|r| &r.key == key)
-            .is_some_and(|r| matches!(r.kind, RecordKind::Removed(_)))
+            .filter(|r| matches!(&r.kind, RecordKind::Removed(Source::Admin { fingerprint, .. }) if fingerprint == admin_fp))
+            .count()
     }
 
     /// Every key that is removed right now, once each.
     pub fn removed_keys(&self) -> Vec<[u8; 32]> {
-        let mut seen: Vec<[u8; 32]> = Vec::new();
-        for r in &self.records {
-            if !seen.contains(&r.key) {
-                seen.push(r.key);
-            }
-        }
-        seen.retain(|k| self.is_removed(k));
-        seen
+        self.order
+            .iter()
+            .copied()
+            .filter(|k| self.is_removed(k))
+            .collect()
     }
 
     /// Was this exact entry (same key, admin, log and seq) already received?
@@ -204,34 +229,50 @@ impl Removed {
     }
 }
 
-/// Read `removed`. Strict: a line it cannot read is an error, because
-/// skipping it would trust a key somebody removed.
+/// The biggest `removed` file read or written (about 150,000 records).
+pub const REMOVED_CAP: u64 = 16 << 20;
+
+/// Read `removed`, line by line. Strict: a line it cannot read is an error,
+/// because skipping it would trust a key somebody removed. A last line with
+/// no newline is a write that was cut short; it was never complete, so it
+/// is left out.
 pub fn load_removed(dir: &Path) -> Result<Removed> {
-    let Some(bytes) = read_private_file_opt(&dir.join(REMOVED_FILE))? else {
+    use std::io::{BufRead, BufReader};
+    let path = dir.join(REMOVED_FILE);
+    if fs::symlink_metadata(&path).is_err() {
         return Ok(Removed::default());
-    };
-    let text = std::str::from_utf8(&bytes).map_err(|_| bad("removed file is not UTF-8"))?;
-    let records = text
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(Record::parse)
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Removed { records })
+    }
+    let (f, _) = open_private_file(&path, REMOVED_CAP)?;
+    let mut reader = BufReader::new(f);
+    let mut records = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            break; // cut short
+        }
+        let text = std::str::from_utf8(&line[..line.len() - 1])
+            .map_err(|_| bad("removed file is not UTF-8"))?;
+        if !text.is_empty() {
+            records.push(Record::parse(text)?);
+        }
+    }
+    Ok(Removed::from_records(records))
 }
 
-/// Append one record. The file is only ever added to; it is rewritten whole
-/// (and replaced atomically) only because that is the one way to add a line
-/// without a reader seeing half of it.
+/// Append one record: a true append, flushed to disk, so adding a line costs
+/// the same however long the file is (and a reader never sees half a record
+/// that mattered).
 fn append_record(dir: &Path, _lock: &DirLock, rec: &Record) -> Result<()> {
-    let path = dir.join(REMOVED_FILE);
-    let mut text: Vec<u8> = read_private_file_opt(&path)?
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
-    if !text.is_empty() && !text.ends_with(b"\n") {
-        return Err(bad("removed file does not end with a newline"));
-    }
-    text.extend_from_slice(rec.to_line().as_bytes());
-    write_private_file(&path, &text)
+    append_private_line(
+        &dir.join(REMOVED_FILE),
+        REMOVED_CAP,
+        rec.to_line().as_bytes(),
+    )
 }
 
 // ---- removing on this device -------------------------------------------
@@ -597,7 +638,15 @@ pub enum Applied {
     SelfRevoke,
     /// The sender is not (or no longer) an admin here. Nothing changed.
     NotAdmin,
+    /// A limit was reached (this admin already has [`MAX_ENTRIES_PER_ADMIN`]
+    /// entries on record, or the caller's budget for new removals is spent).
+    /// Nothing changed and the entry must not be acked.
+    Limit,
 }
+
+/// Entries one admin may have on record here, across all its logs. A stolen
+/// admin cannot fill the `removed` file; a real fleet needs far fewer.
+pub const MAX_ENTRIES_PER_ADMIN: usize = 4096;
 
 /// Apply an entry from `admin`'s removal log (`REMOVE_ENTRY`), all under the
 /// lock. Union semantics: every entry from a valid admin applies, in any
@@ -611,6 +660,20 @@ pub fn apply_entry(
     admin: &[u8; 32],
     entry: &Entry,
     unix: u64,
+) -> Result<Applied> {
+    apply_entry_limited(dir, own, admin, entry, unix, true)
+}
+
+/// [`apply_entry`] with a say in whether an entry that would add a new
+/// removal or vote may go ahead (`allow_new`); the control layer spends a
+/// per-session budget on it.
+pub fn apply_entry_limited(
+    dir: &Path,
+    own: &[u8; 32],
+    admin: &[u8; 32],
+    entry: &Entry,
+    unix: u64,
+    allow_new: bool,
 ) -> Result<Applied> {
     check_peer_public(&entry.target)?;
     store::migrate_if_needed(dir)?;
@@ -634,6 +697,8 @@ pub fn apply_entry(
         Applied::SelfRevoke
     } else if removed.knows_entry(&entry.target, &admin_fp, &entry.log_id, entry.seq) {
         Applied::Known
+    } else if !allow_new || removed.entries_from(&admin_fp) >= MAX_ENTRIES_PER_ADMIN {
+        return Ok(Applied::Limit);
     } else {
         let source = Source::Admin {
             fingerprint: admin_fp.clone(),

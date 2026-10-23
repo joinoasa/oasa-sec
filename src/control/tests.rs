@@ -1290,3 +1290,37 @@ fn nothing_hostile_changes_the_trust_files() {
     }
     assert_eq!(snapshot(&dir), before);
 }
+
+#[test]
+fn a_session_may_add_only_so_many_new_removals_and_the_rest_are_refused_not_acked() {
+    let dir = tempdir("ctl-budget");
+    trust(&dir, ADMIN, "admin", Role::Admin);
+    let key = |i: u32| {
+        let mut k = [0x55u8; 32];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        k[31] = 0x40;
+        k
+    };
+    let mut c = control(&dir, DEVICE, ADMIN, 1);
+    c.session_started(secs(0));
+    for i in 1..=SESSION_NEW_REMOVALS {
+        let out = c.handle(secs(1), 10, &entry_bytes(1, i, key(i)));
+        assert_eq!(sends(&out).len(), 1, "entry {i} is acked");
+    }
+    let before = std::fs::read(dir.join(REMOVED_FILE)).unwrap();
+    let over = SESSION_NEW_REMOVALS + 1;
+    let out = c.handle(secs(2), 10, &entry_bytes(2, over, key(over)));
+    assert!(sends(&out).is_empty(), "a refused entry is not acked");
+    assert_eq!(notes(&out), vec!["removal_refused"]);
+    assert_eq!(std::fs::read(dir.join(REMOVED_FILE)).unwrap(), before);
+    assert!(!is_removed(&dir, &key(over)));
+    // An entry we already hold is still acked.
+    let again = c.handle(secs(3), 10, &entry_bytes(3, 1, key(1)));
+    assert_eq!(sends(&again).len(), 1);
+    // A new session gets a new budget.
+    let mut c2 = control(&dir, DEVICE, ADMIN, 2);
+    c2.session_started(secs(0));
+    let out = c2.handle(secs(1), 10, &entry_bytes(4, over, key(over)));
+    assert_eq!(sends(&out).len(), 1);
+    assert!(is_removed(&dir, &key(over)));
+}

@@ -75,9 +75,10 @@ pub(crate) fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Read a secret file. Refuses symlinks and files others can read or write.
-/// Checks and reads the same open file, so it can't be swapped in between.
-pub(crate) fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+/// Open a secret file for reading. Refuses symlinks and files others can
+/// read or write, and files over `cap` bytes. Checks and reads the same open
+/// file, so it can't be swapped in between. Returns the file and its length.
+pub(crate) fn open_private_file(path: &Path, cap: u64) -> Result<(fs::File, u64)> {
     let link = fs::symlink_metadata(path)?;
     if link.file_type().is_symlink() {
         return Err(Error::BadKeyFile(format!(
@@ -85,35 +86,120 @@ pub(crate) fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
             path.display()
         )));
     }
-    let mut f = fs::File::open(path)?;
+    let f = fs::File::open(path)?;
     let meta = f.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.dev() != link.dev() || meta.ino() != link.ino() {
-            return Err(Error::BadKeyFile(format!(
-                "{} changed while opening",
-                path.display()
-            )));
-        }
-        let mode = meta.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(Error::BadKeyFile(format!(
-                "{} can be read by others (mode {:o}); run chmod 600 on it",
-                path.display(),
-                mode & 0o777
-            )));
-        }
-    }
-    if !meta.is_file() || meta.len() > 1 << 20 {
+    check_private_meta(path, &link, &meta)?;
+    if !meta.is_file() || meta.len() > cap {
         return Err(Error::BadKeyFile(format!(
-            "{} is not a small regular file",
+            "{} is not a regular file of at most {cap} bytes",
             path.display()
         )));
     }
-    let mut buf = Zeroizing::new(Vec::with_capacity(meta.len() as usize));
+    Ok((f, meta.len()))
+}
+
+#[cfg(unix)]
+fn check_private_meta(path: &Path, link: &fs::Metadata, meta: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if meta.dev() != link.dev() || meta.ino() != link.ino() {
+        return Err(Error::BadKeyFile(format!(
+            "{} changed while opening",
+            path.display()
+        )));
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(Error::BadKeyFile(format!(
+            "{} can be read by others (mode {:o}); run chmod 600 on it",
+            path.display(),
+            mode & 0o777
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private_meta(_: &Path, _: &fs::Metadata, _: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+/// Read a secret file (at most 1 MiB). See [`open_private_file`].
+pub(crate) fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let (mut f, len) = open_private_file(path, 1 << 20)?;
+    let mut buf = Zeroizing::new(Vec::with_capacity(len as usize));
     f.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Add `line` (which must end in a newline) to the end of a private,
+/// append-only file, and flush it to disk. Nothing is rewritten, so the cost
+/// does not grow with the file. Refuses to grow it past `cap`. A previous
+/// write that was cut short (a last line with no newline) is cut off first:
+/// it was never complete, so nothing relied on it. Call it under the folder lock.
+pub(crate) fn append_private_line(path: &Path, cap: u64, line: &[u8]) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    if !line.ends_with(b"\n") {
+        return Err(Error::BadKeyFile("a record must end in a newline".into()));
+    }
+    let link = fs::symlink_metadata(path).ok();
+    if link.as_ref().is_some_and(|l| l.file_type().is_symlink()) {
+        return Err(Error::BadKeyFile(format!(
+            "{} is a symlink; refusing",
+            path.display()
+        )));
+    }
+    ensure_private_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    let meta = f.metadata()?;
+    if let Some(l) = &link {
+        check_private_meta(path, l, &meta)?;
+    }
+    let mut len = meta.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1))?;
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            // Find the end of the last complete line and cut there.
+            let mut keep = 0u64;
+            let mut pos = 0u64;
+            f.seek(SeekFrom::Start(0))?;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = f.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                for (i, b) in chunk[..n].iter().enumerate() {
+                    if *b == b'\n' {
+                        keep = pos + i as u64 + 1;
+                    }
+                }
+                pos += n as u64;
+            }
+            f.set_len(keep)?;
+            len = keep;
+        }
+    }
+    if len.saturating_add(line.len() as u64) > cap {
+        return Err(Error::BadKeyFile(format!(
+            "{} would grow past {cap} bytes; refusing",
+            path.display()
+        )));
+    }
+    f.write_all(line)?;
+    f.sync_all()?;
+    if len == 0 {
+        sync_parent(path);
+    }
+    Ok(())
 }
 
 fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
@@ -329,5 +415,26 @@ mod tests {
         assert!(write_private_file(&d.join("k"), b"x").is_err());
         let mode = fs::metadata(&d).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o777, "must not chmod a directory it didn't create");
+    }
+
+    #[test]
+    fn append_is_a_true_append_cuts_a_torn_tail_and_honours_the_cap() {
+        let d = tempdir("files-append");
+        let p = d.join("log");
+        append_private_line(&p, 64, b"one\n").unwrap();
+        append_private_line(&p, 64, b"two\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"one\ntwo\n");
+        // A crash left half a line: the next append cuts it first.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(b"thr").unwrap();
+        }
+        append_private_line(&p, 64, b"four\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"one\ntwo\nfour\n");
+        // No newline, no append; the cap is a hard stop and changes nothing.
+        assert!(append_private_line(&p, 64, b"x").is_err());
+        assert!(append_private_line(&p, 16, b"1234567\n").is_err());
+        assert_eq!(fs::read(&p).unwrap(), b"one\ntwo\nfour\n");
     }
 }

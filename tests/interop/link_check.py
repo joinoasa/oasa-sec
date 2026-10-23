@@ -280,7 +280,7 @@ def check_lines(args):
         assert e["event"] in ("handshake_sent", "session_established", "rekey",
                               "drop", "drops_suppressed", "hint", "stats", "error",
                               "mavlink_guard", "warning", "peer_removed", "trust_reloaded",
-                              "trust_migrated", "removal_entry", "not_admin_here",
+                              "trust_migrated", "trust_unreadable", "removal_refused", "removal_entry", "not_admin_here",
                               "control_error", "signing_key_message_ignored",
                               "signing_key_next", "signing_key_commit",
                               "signing_key_commit_unknown", "signing_key_acked"), e

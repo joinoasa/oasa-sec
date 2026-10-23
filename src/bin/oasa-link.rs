@@ -96,7 +96,8 @@ At most 10 drop lines a second are printed; a drops_suppressed line counts the r
 Removal (R-SEC2): oasa-link watches trusted-peers.v1, removed and removal-log and reloads
 within a second (at once on SIGHUP). If its own --peer has been removed it prints
 {\"event\":\"peer_removed\",...}, then the stats, and exits with code 3. If those files
-cannot be read it exits with code 1 (it fails closed). Control messages (removal sync
+cannot be read at startup it exits with code 1; if they become unreadable while it runs it prints
+{\"event\":\"trust_unreadable\"} and keeps the last good state. Control messages (removal sync
 between admins and devices) are handled here and never reach --plain-send; their drops
 count as bad_role, bad_control and peer_removed. Lines: removal_entry, not_admin_here,
 trust_reloaded, trust_migrated.
@@ -1017,11 +1018,15 @@ fn run(args: &[String]) -> R<u8> {
                         break;
                     }
                     Err(e) => {
-                        // Fail closed: if the files cannot be read, a removal
-                        // might be in them. Stop rather than guess.
-                        t.flush_drop_summary(true);
-                        t.print_stats();
-                        return Err(format!("cannot read the trust files: {e}").into());
+                        // Fail safe: keep what was last read and checked (the
+                        // link is already limited to that peer), say so, and
+                        // look again when the files change. Stopping here
+                        // would let one bad file take every link down.
+                        println!(
+                            "{{\"ts\":\"{}\",\"event\":\"trust_unreadable\",\"why\":{:?}}}",
+                            rfc3339(SystemTime::now()),
+                            e.to_string()
+                        );
                     }
                 }
             }

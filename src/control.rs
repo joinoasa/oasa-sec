@@ -59,6 +59,11 @@ pub const NOT_ADMIN: u8 = 0x23;
 pub const RETRY_INITIAL: Duration = Duration::from_secs(2);
 pub const RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// Most new removals (or votes) one link session may add. A long log
+/// arrives over several sessions (every rekey starts one); a stolen admin
+/// cannot flood the files in one.
+pub const SESSION_NEW_REMOVALS: u32 = 64;
+
 /// Most `REMOVE_ENTRY` messages waiting for an ack at once. Keeps a long log
 /// from filling a slow radio; the rest follow as acks come in.
 pub const ENTRY_WINDOW: usize = 8;
@@ -372,6 +377,8 @@ struct SessionState {
     acked: BTreeSet<u32>,
     /// The peer's last `REMOVE_HAVE`.
     held: Option<u32>,
+    /// New removals and votes applied this session (see [`SESSION_NEW_REMOVALS`]).
+    new_removals: u32,
     /// A `SIGNING_KEY_NEXT` or `_COMMIT` waiting for its ack (drone side).
     signing: Option<(Outgoing, SigningKind)>,
 }
@@ -675,16 +682,33 @@ impl Control {
             return vec![Action::Drop("bad_control")];
         }
         let target_fp = fingerprint(&entry.target);
-        match removal::apply_entry(&self.dir, &self.own, &self.peer, entry, unix) {
+        let allow_new = self.session.new_removals < SESSION_NEW_REMOVALS;
+        match removal::apply_entry_limited(&self.dir, &self.own, &self.peer, entry, unix, allow_new)
+        {
             Ok(Applied::NotAdmin) => vec![Action::Drop("bad_role")],
+            // Over a limit: logged, not applied and not acked, so a stolen
+            // admin cannot fill the files and a real one just waits.
+            Ok(Applied::Limit) => vec![Action::Note(Note {
+                what: "removal_refused",
+                key: Some(target_fp),
+                seq: Some(entry.seq),
+                detail: Some(if allow_new {
+                    "admin_limit"
+                } else {
+                    "session_limit"
+                }),
+            })],
             Ok(applied) => {
+                if applied == Applied::Removed || applied == Applied::Voted {
+                    self.session.new_removals += 1;
+                }
                 let detail = match applied {
                     Applied::Removed => "removed",
                     Applied::Voted => "voted",
                     Applied::Known => "known",
                     Applied::OwnKey => "own_key",
                     Applied::SelfRevoke => "self_revoke",
-                    Applied::NotAdmin => unreachable!("handled above"),
+                    Applied::NotAdmin | Applied::Limit => unreachable!("handled above"),
                 };
                 vec![
                     Action::Note(Note {
