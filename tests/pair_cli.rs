@@ -237,3 +237,165 @@ fn reset_stamp_forgets_saved_timestamps() {
         .contains("--which")
     );
 }
+
+// ---- roles, removal and the lock (R-SEC2) -------------------------------------
+
+fn make(tag: &str) -> (PathBuf, String, String) {
+    let d = tempdir(tag);
+    ok(&["init", "--dir", s(&d), "--name", tag]);
+    let j = ok(&["show", "--dir", s(&d)]);
+    (
+        d,
+        field(&j, "public_key").to_string(),
+        field(&j, "fingerprint").to_string(),
+    )
+}
+
+#[test]
+fn trust_sets_roles_and_peers_shows_them() {
+    let (a, _, _) = make("ra");
+    let (_, kb, fb) = make("rb");
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    assert!(ok(&["peers", "--dir", s(&a)]).contains("peer"));
+    // Same key and name again with a role changes the role.
+    ok(&[
+        "trust",
+        "--dir",
+        s(&a),
+        "--name",
+        "b",
+        "--key",
+        &kb,
+        "--role",
+        "admin",
+    ]);
+    let peers = ok(&["peers", "--dir", s(&a)]);
+    assert!(peers.contains("admin") && peers.contains(&fb), "{peers}");
+    assert_eq!(peers.lines().count(), 1);
+    err(&[
+        "trust",
+        "--dir",
+        s(&a),
+        "--name",
+        "b",
+        "--key",
+        &kb,
+        "--role",
+        "root",
+    ]);
+}
+
+#[test]
+fn remove_is_permanent_until_restore_and_restore_does_not_trust() {
+    let (a, _, _) = make("rma");
+    let (_, kb, fb) = make("rmb");
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    let out = ok(&["remove", "--dir", s(&a), "b"]);
+    assert!(out.contains(&fb), "{out}");
+    assert!(ok(&["peers", "--dir", s(&a)]).contains("No paired devices"));
+    assert!(ok(&["removed", "--dir", s(&a)]).contains(&fb));
+    // A removed key can not be trusted again, by name or by key.
+    err(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    // Restore lifts the tombstone but trusts nothing.
+    ok(&["restore", "--dir", s(&a), &fb]);
+    assert!(ok(&["peers", "--dir", s(&a)]).contains("No paired devices"));
+    assert!(ok(&["removed", "--dir", s(&a)]).contains("Nothing removed"));
+    err(&["restore", "--dir", s(&a), &fb]);
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    assert!(ok(&["peers", "--dir", s(&a)]).contains(&fb));
+}
+
+#[test]
+fn revoke_removes_and_writes_a_removal_log() {
+    let (a, _, _) = make("rva");
+    let (_, kb, fb) = make("rvb");
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    let out = ok(&["revoke", "--dir", s(&a), &fb]);
+    assert!(out.contains("entry 1"), "{out}");
+    assert!(ok(&["removed", "--dir", s(&a)]).contains(&fb));
+    // Again: still one entry.
+    let again = ok(&["revoke", "--dir", s(&a), &fb]);
+    assert!(again.contains("already"), "{again}");
+    let log = std::fs::read_to_string(a.join("removal-log")).unwrap();
+    assert_eq!(log.lines().count(), 2, "log id plus one entry: {log}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in ["removal-log", "removed"] {
+            let m = std::fs::metadata(a.join(f)).unwrap().permissions().mode();
+            assert_eq!(m & 0o777, 0o600, "{f}");
+        }
+    }
+    err(&["remove", "--dir", s(&a), "nobody"]);
+    err(&["remove", "--dir", s(&a)]);
+}
+
+#[test]
+fn an_old_trusted_peers_file_is_converted_and_reported() {
+    let a = tempdir("mig");
+    ok(&["init", "--dir", s(&a), "--name", "old"]);
+    let key = data_encoding::BASE32_NOPAD.encode(&[9u8; 32]);
+    std::fs::write(
+        a.join("trusted-peers"),
+        format!("# OASA-SEC v0 trusted peers: <public key> <name>\n{key} friend\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            a.join("trusted-peers"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let o = pair(&["peers", "--dir", s(&a)]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let (so, se) = (
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr),
+    );
+    assert!(se.contains("Converted") && se.contains("friend"), "{se}");
+    assert!(so.contains("friend") && so.contains("peer"), "{so}");
+    assert!(a.join("trusted-peers.v0-migrated").exists());
+    assert!(!a.join("trusted-peers").exists());
+    // Second run: nothing to say.
+    let o = pair(&["peers", "--dir", s(&a)]);
+    assert!(o.stderr.is_empty());
+}
+
+#[test]
+fn many_processes_changing_one_folder_lose_nothing() {
+    let n = 24usize;
+    let keys: Vec<String> = (0..n)
+        .map(|i| data_encoding::HEXLOWER.encode(&[(i as u8) + 20; 32]))
+        .collect();
+    // Spawn them all first, then wait: they really overlap.
+    let b = tempdir("lock2");
+    ok(&["init", "--dir", s(&b), "--name", "b"]);
+    let procs: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+                .args([
+                    "trust",
+                    "--dir",
+                    s(&b),
+                    "--name",
+                    &format!("p{i}"),
+                    "--key",
+                    k,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for p in procs {
+        let o = p.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert_eq!(ok(&["peers", "--dir", s(&b)]).lines().count(), n);
+}
