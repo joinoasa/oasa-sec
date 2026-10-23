@@ -6,13 +6,50 @@
 set -euo pipefail
 
 B=target/debug
+PYTHON=${PYTHON:-python3}
 T=$(mktemp -d)
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$T"; }
 trap cleanup EXIT
 pass() { echo "PASS  $1"; }
-fail() { echo "FAIL  $1"; for f in "$T"/*.log; do echo "--- $f"; cat "$f"; done; exit 1; }
-PY="python3 -I tests/interop/pymavlink_check.py"
+fail() {
+  echo "FAIL  $1"
+  local f msg="$1"
+  for f in "$T"/*.log; do [ -e "$f" ] && { echo "--- $f"; cat "$f"; }; done
+  # Also surface the failure and the log tails as GitHub Actions annotations.
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    for f in "$T"/*.log; do
+      [ -e "$f" ] || continue
+      msg+="%0A--- $(basename "$f") (last 30 lines)"
+      msg+="%0A$(tail -n 30 "$f" | head -c 3000 | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')"
+    done
+    echo "::error title=e2e::${msg}"
+  fi
+  exit 1
+}
+PY="$PYTHON -I tests/interop/pymavlink_check.py"
+
+# Wait up to $1 seconds for grep pattern $2 to appear in file $3.
+wait_for() {
+  local secs=$1 pat=$2 file=$3 i
+  for i in $(seq $((secs * 10))); do grep -q -- "$pat" "$file" 2>/dev/null && return 0; sleep 0.1; done
+  return 1
+}
+# Wait up to $1 seconds for something to listen on TCP port $2 (without connecting to it).
+wait_tcp_listen() {
+  local secs=$1 hex i
+  hex=$(printf '%04X' "$2")
+  for i in $(seq $((secs * 10))); do
+    { cat /proc/net/tcp /proc/net/tcp6 2>/dev/null || true; } \
+      | awk -v h=":$hex" '$4=="0A" && $2 ~ h"$" {f=1} END{exit !f}' && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Warm up pymavlink: the first import on a fresh machine can take a while.
+$PYTHON -I -c 'import os; os.environ["MAVLINK20"]="1"; from pymavlink import mavutil' \
+  || { echo "pymavlink is not importable by $PYTHON (pip install pymavlink)"; fail "pymavlink import failed"; }
 # Expect the pymavlink client to get no ACK: exit code 2, nothing else.
 expect_no_ack() { set +e; $PY client "$1" "$2" >/dev/null 2>&1; local rc=$?; set -e; [ "$rc" = 2 ]; }
 key32() { head -c 32 "$1" | od -An -tx1; }
@@ -21,11 +58,13 @@ start_drone() { # dir name logfile [extra args...]
   local dir=$1 name=$2 log=$3; shift 3
   $B/oasa-pair drone --dir "$dir" --name "$name" --listen 127.0.0.1:7400 --wait 30 "$@" > "$log" 2>&1 &
   DRONE=$!
-  for _ in $(seq 50); do grep -q 'OASA1-' "$log" && break; sleep 0.1; done
+  wait_for 30 'OASA1-' "$log" || fail "drone did not show a code"
+  wait_tcp_listen 30 7400 || fail "drone is not listening on 7400"
   CODE=$(grep -o 'OASA1-[A-Z2-7]*' "$log") || fail "drone did not show a code"
 }
 
 $B/examples/fake_autopilot udpin:127.0.0.1:14540 > "$T/ap.log" 2>&1 & PIDS+=($!)
+wait_for 30 "listening" "$T/ap.log" || fail "fake autopilot did not start"
 for d in drone gcs gcs2 attacker; do $B/oasa-pair init --dir "$T/$d" >/dev/null; done
 DRONE_FP=$($B/oasa-pair init --dir "$T/drone" | awk '{print $3}')
 
@@ -33,7 +72,7 @@ DRONE_FP=$($B/oasa-pair init --dir "$T/drone" | awk '{print $3}')
 start_drone "$T/drone" drone-1 "$T/drone.log" --autopilot udpout:127.0.0.1:14540
 
 # The attacker knows the drone's public key (it's in the code) but guesses the secret.
-FAKE=$(python3 - "$CODE" <<'PY'
+FAKE=$($PYTHON - "$CODE" <<'PY'
 import base64, os, sys, hashlib
 t = sys.argv[1][6:]
 body = bytearray(base64.b32decode(t + "=" * (-len(t) % 8)))
@@ -44,8 +83,7 @@ PY
 )
 echo "$FAKE" | $B/oasa-pair ground --dir "$T/attacker" --name evil --connect 127.0.0.1:7400 --code - >/dev/null 2>&1 \
   && fail "attacker without the secret was able to pair"
-sleep 0.3
-grep -q "Pairing attempt failed: encryption or authentication failed" "$T/drone.log" \
+wait_for 10 "Pairing attempt failed: encryption or authentication failed" "$T/drone.log" \
   || fail "drone did not reject the attacker for the right reason"
 pass "attacker without the secret is rejected by the handshake"
 
@@ -82,7 +120,7 @@ $PY client "$GKEY" 14540 >/dev/null || fail "pymavlink-signed command not accept
 pass "Rust verifies pymavlink's signatures"
 
 $PY autopilot "$GKEY" 14541 > "$T/py.log" 2>&1 & PY_AP=$!
-sleep 1.5
+wait_for 30 "pymavlink autopilot on" "$T/py.log" || fail "pymavlink autopilot did not start"
 $B/oasa-pair command --dir "$T/gcs" --to udpout:127.0.0.1:14541 >/dev/null || fail "no signed ACK from pymavlink"
 wait "$PY_AP" || fail "pymavlink rejected our signature"
 pass "pymavlink verifies our signatures, and we verify its ACK"
