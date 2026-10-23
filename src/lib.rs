@@ -15,6 +15,7 @@
 //! This is a prototype. Do not fly with it.
 
 pub mod code;
+pub mod control;
 pub mod error;
 mod files;
 pub mod identity;
