@@ -251,6 +251,8 @@ pub struct Stats {
     pub handshakes_sent: u64,
     /// Handshake 1 packets that were accepted and answered.
     pub handshakes_accepted: u64,
+    /// Handshake 2 packets accepted (we were the initiator).
+    pub handshakes_completed: u64,
     drops: [u64; 8],
 }
 

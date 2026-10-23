@@ -580,6 +580,7 @@ impl PeerLink {
                 return;
             }
         };
+        sh.stats.handshakes_completed += 1;
         let session = Session::new(transport, f.local_index, remote_index, true, now);
         let rekey = self.install_current(session, now);
         out.push(Event::SessionEstablished {
