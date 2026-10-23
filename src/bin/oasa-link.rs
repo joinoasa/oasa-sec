@@ -453,11 +453,9 @@ impl Tunnel {
                     }
                 }
                 Event::Deliver(p) => {
-                    if let Some(g) = self.guard {
-                        if let Err(b) = g.check(&p) {
-                            self.guard_drop(b);
-                            continue;
-                        }
+                    if let Some(Err(b)) = self.guard.map(|g| g.check(&p)) {
+                        self.guard_drop(b);
+                        continue;
                     }
                     let _ = self.plain_out.send_to(&p, self.plain_send);
                 }
