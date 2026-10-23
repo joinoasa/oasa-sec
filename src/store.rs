@@ -44,6 +44,7 @@ pub fn load(dir: &Path) -> Result<Vec<Peer>> {
             let public: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| Error::BadKeyFile("trust key must be 32 bytes".into()))?;
+            crate::identity::check_peer_public(&public)?;
             Ok(Peer {
                 public,
                 name: name.to_string(),
@@ -54,6 +55,7 @@ pub fn load(dir: &Path) -> Result<Vec<Peer>> {
 
 /// Add or replace a peer (matched by public key) and save.
 pub fn add(dir: &Path, peer: &Peer) -> Result<()> {
+    crate::identity::check_peer_public(&peer.public)?;
     let mut peers = load(dir)?;
     peers.retain(|p| p.public != peer.public);
     peers.push(peer.clone());

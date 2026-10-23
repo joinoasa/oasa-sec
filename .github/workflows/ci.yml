@@ -32,3 +32,5 @@ jobs:
           "$RUNNER_TEMP/venv/bin/python" -m pip install pymavlink
           cargo build --locked --bins --examples
           PYTHON="$RUNNER_TEMP/venv/bin/python" scripts/e2e.sh
+      - name: Link end-to-end
+        run: scripts/link-e2e.sh

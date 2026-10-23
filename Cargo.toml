@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-description = "OASA-SEC v0 prototype: device identity, encrypted pairing and MAVLink signing keys (R-SEC1)"
+description = "OASA-SEC v0 prototype: device identity, encrypted pairing, MAVLink signing keys (R-SEC1) and the encrypted link (R-COM2)"
 repository = "https://github.com/joinoasa/oasa-sec"
 publish = false
 
@@ -21,3 +21,11 @@ qrcode = { version = "0.14", default-features = false }
 [[bin]]
 name = "oasa-pair"
 path = "src/bin/oasa-pair.rs"
+
+[[bin]]
+name = "oasa-link"
+path = "src/bin/oasa-link.rs"
+
+# Crypto crates are far too slow unoptimized for the handshake-heavy tests.
+[profile.dev.package."*"]
+opt-level = 2

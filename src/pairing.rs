@@ -173,6 +173,7 @@ pub fn pair_as_drone<S: Read + Write>(
         .ok_or(Error::Protocol("ground station sent no identity"))?
         .try_into()
         .map_err(|_| Error::Protocol("bad ground station key"))?;
+    crate::identity::check_peer_public(&ground_public)?;
 
     let n = hs.write_message(&hello(my_name), &mut buf)?;
     write_frame(stream, &buf[..n])?;
@@ -297,11 +298,27 @@ pub fn check_name(name: &str) -> Result<()> {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Protocol("name must be 1-32 of A-Z a-z 0-9 - _ ."))
+    if !ok {
+        return Err(Error::Protocol("name must be 1-32 of A-Z a-z 0-9 - _ ."));
     }
+    // Lookups try a fingerprint before a name, so a name must not look like one.
+    if looks_like_fingerprint(name) {
+        return Err(Error::Protocol(
+            "name must not look like a fingerprint (XXXX-XXXX-XXXX-XXXX)",
+        ));
+    }
+    Ok(())
+}
+
+/// Four groups of four base32 characters, joined by `-`.
+fn looks_like_fingerprint(name: &str) -> bool {
+    let groups: Vec<&str> = name.split('-').collect();
+    groups.len() == 4
+        && groups.iter().all(|g| {
+            g.len() == 4
+                && g.bytes()
+                    .all(|b| b.is_ascii_alphabetic() || (b'2'..=b'7').contains(&b))
+        })
 }
 
 fn write_frame<W: Write>(w: &mut W, data: &[u8]) -> Result<()> {
@@ -530,6 +547,12 @@ mod tests {
         for bad in ["", "has space", "new\nline", &"x".repeat(33), "émoji"] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+        // A name shaped like a fingerprint could be mistaken for one.
+        let fp = crate::identity::fingerprint(&[7u8; 32]);
+        assert!(check_name(&fp).is_err());
+        assert!(check_name(&fp.to_lowercase()).is_err());
+        assert!(check_name("device-1234abcd").is_ok());
+        assert!(check_name("ABCD-EFGH-IJKL").is_ok());
     }
 
     #[test]
