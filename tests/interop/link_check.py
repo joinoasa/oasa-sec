@@ -128,16 +128,33 @@ def count(args):
     return 0
 
 
+def drops_add_up(args):
+    """drops_add_up FILE: printed drop lines + suppressed counts == stats drops.
+    Prints the largest number of drop lines in any one second."""
+    ev = lines(args[0])
+    stats = ev[-1]
+    assert stats["event"] == "stats", "last line is not stats"
+    total = sum(stats["drops"].values())
+    printed = [e for e in ev if e["event"] == "drop"]
+    held_back = sum(e["count"] for e in ev if e["event"] == "drops_suppressed")
+    assert len(printed) + held_back == total, (len(printed), held_back, total)
+    per_second = {}
+    for e in printed:
+        per_second[e["ts"][:19]] = per_second.get(e["ts"][:19], 0) + 1
+    print(max(per_second.values(), default=0))
+    return 0
+
+
 def check_lines(args):
     """check_lines FILE: every line is JSON with a UTC timestamp; nothing secret."""
     for e in lines(args[0]):
         assert e["ts"].endswith("Z") and len(e["ts"]) == 24, e
         assert e["event"] in ("handshake_sent", "session_established", "rekey",
-                              "drop", "stats", "error"), e
+                              "drop", "drops_suppressed", "hint", "stats", "error"), e
     return 0
 
 
 if __name__ == "__main__":
     cmds = {"traffic": traffic, "listen": listen_only, "junk": junk, "stat": stat,
-            "count": count, "check": check_lines}
+            "count": count, "check": check_lines, "drops": drops_add_up}
     sys.exit(cmds[sys.argv[1]](sys.argv[2:]))

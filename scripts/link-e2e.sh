@@ -109,6 +109,20 @@ wait "$DRONE" || fail "drone did not exit 0 on SIGTERM"
 [ "$(jstat "$T/drone.log" drops.untrusted_peer)" -ge 1 ] || fail "drone stats miss untrusted_peer"
 pass "SIGTERM: stats printed, exit 0; drone totals 80 sent / 80 delivered; junk and untrusted counted"
 
+# Drop lines are limited, and nothing is lost from the count: every drop is
+# either a printed line or part of a drops_suppressed total. The clock second
+# in the timestamp can straddle two windows, so allow up to 20 in one.
+PER_SECOND=$($CHECK drops "$T/drone.log") || fail "drop lines and suppressed counts do not add up to the stats"
+[ "$PER_SECOND" -le 20 ] || fail "drone printed $PER_SECOND drop lines in one second"
+[ "$(n "$T/drone.log" drops_suppressed)" -ge 1 ] || fail "no drops_suppressed line after the junk burst"
+pass "drop log limited (at most $PER_SECOND lines in a second); printed + suppressed == stats"
+
+# Plaintext from anywhere is not accepted by default.
+if $B/oasa-link --dir "$T/gcs" --peer drone --bind 127.0.0.1:7790 --plain-listen 0.0.0.0:7791 \
+  --plain-send 127.0.0.1:7792 --duration 1 >"$T/lan.log" 2>&1; then fail "--plain-listen 0.0.0.0 was accepted"; fi
+grep -q loopback "$T/lan.log" || fail "no loopback message"
+pass "--plain-listen on a non-loopback address is refused"
+
 # --- 4. Files and secrets ------------------------------------------------
 [ "$(jstat "$T/drone.log" received)" = 80 ] || fail "received count"
 for f in "$T"/gcs/link-timestamp-* "$T"/drone/link-timestamp-*; do

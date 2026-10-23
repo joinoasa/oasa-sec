@@ -9,7 +9,7 @@
 //! this file only moves bytes and reads the clock.
 
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use oasa_sec::identity::Identity;
 use oasa_sec::link::{
-    Config, CounterLen, Dest, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy, SendError,
+    Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
+    SendError, SourceLimiter, looks_like_handshake1,
 };
 use oasa_sec::store;
 
@@ -28,7 +29,7 @@ oasa-link: OASA-SEC v0 encrypted link over UDP (R-COM2). Do not fly with it.
 USAGE:
   oasa-link --dir DIR --peer PEERNAME --bind HOST:PORT
             --plain-listen HOST:PORT --plain-send HOST:PORT
-            [--remote HOST:PORT] [--initiate]
+            [--remote HOST:PORT] [--initiate] [--allow-remote-plain]
             [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N]
             [--mtu BYTES] [--duration SECS]
 
@@ -38,8 +39,14 @@ USAGE:
   --remote         Where the peer is. A responder without it learns the address from
                    the first packet that authenticates, and follows the peer if it moves.
   --initiate       Start the handshake (needs --remote). Without it, wait for the peer.
-  --plain-listen   Local programs send plaintext packets here.
-  --plain-send     Decrypted packets from the peer go here.
+  --plain-listen   Local programs send plaintext packets here. Must be a loopback
+                   address (127.0.0.1 or ::1) unless --allow-remote-plain is given.
+  --plain-send     Decrypted packets from the peer go here. Plaintext is accepted only
+                   from this host unless --allow-remote-plain is given.
+  --allow-remote-plain
+                   Let --plain-listen be a non-loopback address and accept plaintext from
+                   any host. Anyone who can reach that port can then inject packets into
+                   the link; only use it on a wired, trusted network.
   --counter-bytes  2 (default) or 4: how much of the packet counter goes on the wire.
   --rekey-secs     New handshake after this many seconds (default 600).
   --keepalive-secs Send an empty packet after this many idle seconds (default 25, 0 = off).
@@ -47,9 +54,14 @@ USAGE:
                    link supports). Plaintext must fit in MTU minus 21 bytes (23 with 4).
   --duration       Stop after this many seconds. Stops on SIGINT or SIGTERM too.
 
-Prints one JSON line per event: handshake_sent, session_established, rekey, drop.
-On exit prints {\"event\":\"stats\",...} and exits 0. Packet contents and keys are never printed.
+Prints one JSON line per event: handshake_sent, session_established, rekey, drop, hint.
+At most 10 drop lines a second are printed; a drops_suppressed line counts the rest. The
+trusted peers are read once at startup: restart oasa-link after `oasa-pair trust` or
+`remove`. On exit prints {\"event\":\"stats\",...} and exits 0. Packet contents and keys are never printed.
 ";
+
+/// Handshake 1 packets let through per second from one source address.
+const SOURCE_HANDSHAKES_PER_SECOND: u32 = 3;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -104,6 +116,7 @@ struct Args {
     bind: SocketAddr,
     remote: Option<SocketAddr>,
     initiate: bool,
+    allow_remote_plain: bool,
     plain_listen: SocketAddr,
     plain_send: SocketAddr,
     counter: CounterLen,
@@ -113,14 +126,19 @@ struct Args {
     duration: Option<Duration>,
 }
 
+/// About ten years, in seconds.
+const MAX_SECS: u64 = 10 * 365 * 86_400;
+
 fn parse_args(args: &[String]) -> R<Option<Args>> {
     let mut named: BTreeMap<String, String> = BTreeMap::new();
     let mut initiate = false;
+    let mut allow_remote_plain = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" | "help" => return Ok(None),
             "--initiate" => initiate = true,
+            "--allow-remote-plain" => allow_remote_plain = true,
             _ => {
                 let k = a
                     .strip_prefix("--")
@@ -175,26 +193,51 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
     }
     let counter = match num("counter-bytes")? {
         None => CounterLen::Short,
-        Some(n) => CounterLen::from_bytes(n as usize).ok_or("--counter-bytes must be 2 or 4")?,
+        Some(n) => usize::try_from(n)
+            .ok()
+            .and_then(CounterLen::from_bytes)
+            .ok_or("--counter-bytes must be 2 or 4")?,
     };
-    let mtu = num("mtu")?.map_or(MIN_MTU, |n| n as usize);
+    let mtu = match num("mtu")? {
+        None => MIN_MTU,
+        Some(n) => usize::try_from(n)
+            .ok()
+            .filter(|n| (MIN_MTU..=65_535).contains(n))
+            .ok_or("--mtu must be 128 to 65535")?,
+    };
+    // The most we allow for a time option: about ten years.
+    let secs = |k: &str, max: u64| -> R<Option<u64>> {
+        match num(k)? {
+            Some(n) if n > max => Err(format!("--{k} is too large (at most {max})").into()),
+            other => Ok(other),
+        }
+    };
+    let plain_listen = addr("plain-listen")?;
+    if !plain_listen.ip().is_loopback() && !allow_remote_plain {
+        return Err(
+            "--plain-listen must be a loopback address (127.0.0.1 or ::1); anyone who can reach \
+             it could inject packets into the link. Use --allow-remote-plain to override"
+                .into(),
+        );
+    }
     Ok(Some(Args {
         dir: PathBuf::from(req("dir")?),
         peer: req("peer")?.clone(),
         bind: addr("bind")?,
         remote,
         initiate,
-        plain_listen: addr("plain-listen")?,
+        allow_remote_plain,
+        plain_listen,
         plain_send: addr("plain-send")?,
         counter,
-        rekey_secs: num("rekey-secs")?,
-        keepalive_secs: num("keepalive-secs")?,
+        rekey_secs: secs("rekey-secs", MAX_SECS / 2)?,
+        keepalive_secs: secs("keepalive-secs", MAX_SECS)?,
         mtu,
-        duration: num("duration")?.map(Duration::from_secs),
+        duration: secs("duration", MAX_SECS)?.map(Duration::from_secs),
     }))
 }
 
-fn config_from(a: &Args) -> Config {
+fn config_from(a: &Args) -> R<Config> {
     let mut c = Config {
         counter_len: a.counter,
         mtu: a.mtu,
@@ -203,17 +246,64 @@ fn config_from(a: &Args) -> Config {
     if let Some(n) = a.rekey_secs {
         c.rekey_after = Duration::from_secs(n);
         // Keep the usual margin of a half again, but never below 15 minutes.
-        c.reject_after = c.reject_after.max(Duration::from_secs(n + n / 2 + 1));
+        let margin = n
+            .checked_add(n / 2)
+            .and_then(|m| m.checked_add(1))
+            .ok_or("--rekey-secs is too large")?;
+        c.reject_after = c.reject_after.max(Duration::from_secs(margin));
     }
     if let Some(n) = a.keepalive_secs {
         c.keepalive = (n > 0).then(|| Duration::from_secs(n));
     }
-    c
+    c.validate()?;
+    Ok(c)
+}
+
+/// Limits drop lines on standard output: 10 a second, then one summary line
+/// a second. Counting is not affected; the statistics stay exact.
+struct DropLog {
+    window: Instant,
+    printed: u32,
+    suppressed: u64,
+}
+
+const DROP_LINES_PER_SECOND: u32 = 10;
+
+impl DropLog {
+    fn new(now: Instant) -> Self {
+        Self {
+            window: now,
+            printed: 0,
+            suppressed: 0,
+        }
+    }
+
+    /// Start a new second if one has passed. Returns how many lines the
+    /// second that ended held back.
+    fn roll(&mut self, now: Instant) -> u64 {
+        if now.saturating_duration_since(self.window) < Duration::from_secs(1) {
+            return 0;
+        }
+        self.window = now;
+        self.printed = 0;
+        std::mem::take(&mut self.suppressed)
+    }
+
+    /// May one more drop line be printed now? (After `roll`.)
+    fn allow(&mut self) -> bool {
+        if self.printed < DROP_LINES_PER_SECOND {
+            self.printed += 1;
+            true
+        } else {
+            self.suppressed += 1;
+            false
+        }
+    }
 }
 
 enum Msg {
     Encrypted(Vec<u8>, SocketAddr),
-    Plain(Vec<u8>),
+    Plain(Vec<u8>, SocketAddr),
 }
 
 /// Read datagrams from `sock` forever and pass them on.
@@ -227,7 +317,7 @@ fn spawn_reader(sock: UdpSocket, tx: mpsc::SyncSender<Msg>, encrypted: bool) {
                     let msg = if encrypted {
                         Msg::Encrypted(data, from)
                     } else {
-                        Msg::Plain(data)
+                        Msg::Plain(data, from)
                     };
                     if tx.send(msg).is_err() {
                         return;
@@ -251,15 +341,35 @@ struct Tunnel {
     remote: Option<SocketAddr>,
     /// Drops that happen before a packet is made (counted with the link's).
     local_drops: BTreeMap<&'static str, u64>,
+    drop_log: DropLog,
+    /// Handshakes in a row refused as old or too far ahead.
+    stale_run: u32,
+    hinted: bool,
 }
 
 impl Tunnel {
     fn local_drop(&mut self, reason: &'static str) {
         *self.local_drops.entry(reason).or_insert(0) += 1;
-        println!(
-            "{{\"ts\":\"{}\",\"event\":\"drop\",\"reason\":\"{reason}\"}}",
-            rfc3339(SystemTime::now())
-        );
+        if self.drop_log.allow() {
+            println!(
+                "{{\"ts\":\"{}\",\"event\":\"drop\",\"reason\":\"{reason}\"}}",
+                rfc3339(SystemTime::now())
+            );
+        }
+    }
+
+    /// Once a second, say how many drop lines were held back.
+    fn flush_drop_summary(&mut self, force: bool) {
+        let mut n = self.drop_log.roll(Instant::now());
+        if force {
+            n += std::mem::take(&mut self.drop_log.suppressed);
+        }
+        if n > 0 {
+            println!(
+                "{{\"ts\":\"{}\",\"event\":\"drops_suppressed\",\"count\":{n}}}",
+                rfc3339(SystemTime::now())
+            );
+        }
     }
 
     /// Act on what the link asked for. `source` is where the packet being
@@ -294,6 +404,8 @@ impl Tunnel {
                     "{{\"ts\":\"{ts}\",\"event\":\"handshake_sent\",\"retry\":{retry},\"rekey\":{rekey}}}"
                 ),
                 Event::SessionEstablished { initiator, rekey } => {
+                    self.stale_run = 0;
+                    self.hinted = false;
                     let role = if initiator { "initiator" } else { "responder" };
                     println!(
                         "{{\"ts\":\"{ts}\",\"event\":\"session_established\",\"role\":\"{role}\"}}"
@@ -302,16 +414,29 @@ impl Tunnel {
                         println!("{{\"ts\":\"{ts}\",\"event\":\"rekey\",\"role\":\"{role}\"}}");
                     }
                 }
-                Event::Dropped(reason) => match source {
-                    Some(s) => println!(
-                        "{{\"ts\":\"{ts}\",\"event\":\"drop\",\"reason\":\"{}\",\"from\":\"{s}\"}}",
-                        reason.as_str()
-                    ),
-                    None => println!(
-                        "{{\"ts\":\"{ts}\",\"event\":\"drop\",\"reason\":\"{}\"}}",
-                        reason.as_str()
-                    ),
-                },
+                Event::Dropped(reason) => {
+                    if reason == DropReason::StaleHandshake {
+                        self.stale_run += 1;
+                        if self.stale_run >= 3 && !self.hinted {
+                            self.hinted = true;
+                            println!(
+                                "{{\"ts\":\"{ts}\",\"event\":\"hint\",\"what\":\"handshakes from the peer keep being refused as old or too far ahead; check that both clocks are right, then run oasa-pair reset-stamp and restart\"}}"
+                            );
+                        }
+                    }
+                    if self.drop_log.allow() {
+                        match source {
+                            Some(s) => println!(
+                                "{{\"ts\":\"{ts}\",\"event\":\"drop\",\"reason\":\"{}\",\"from\":\"{s}\"}}",
+                                reason.as_str()
+                            ),
+                            None => println!(
+                                "{{\"ts\":\"{ts}\",\"event\":\"drop\",\"reason\":\"{}\"}}",
+                                reason.as_str()
+                            ),
+                        }
+                    }
+                }
                 Event::Failure(what) => {
                     println!("{{\"ts\":\"{ts}\",\"event\":\"error\",\"what\":\"{what}\"}}")
                 }
@@ -365,7 +490,7 @@ fn run(args: &[String]) -> R {
     let link = Link::new(
         &me,
         peer.public,
-        config_from(&a),
+        config_from(&a)?,
         Box::new(OsEntropy),
         wall_base,
         Box::new(FileTimestampStore::new(&a.dir, &peer.public)),
@@ -384,6 +509,8 @@ fn run(args: &[String]) -> R {
     let (tx, rx) = mpsc::sync_channel::<Msg>(4096);
     spawn_reader(enc.try_clone()?, tx.clone(), true);
     spawn_reader(plain_in, tx, false);
+    // Handshakes per source address (the port is free for an attacker to vary).
+    let mut source_limit: SourceLimiter<IpAddr> = SourceLimiter::new(SOURCE_HANDSHAKES_PER_SECOND);
 
     let mut t = Tunnel {
         link,
@@ -392,13 +519,19 @@ fn run(args: &[String]) -> R {
         plain_send: a.plain_send,
         remote: a.remote,
         local_drops: BTreeMap::new(),
+        drop_log: DropLog::new(Instant::now()),
+        stale_run: 0,
+        hinted: false,
     };
 
     if a.initiate {
         let ev = t.link.start_handshake(start.elapsed())?;
         t.apply(ev, None);
     }
-    let deadline = a.duration.map(|d| start + d);
+    let deadline = match a.duration {
+        Some(d) => Some(start.checked_add(d).ok_or("--duration is too large")?),
+        None => None,
+    };
     while !STOP.load(Ordering::SeqCst) && deadline.is_none_or(|d| Instant::now() < d) {
         // Wait briefly for a packet, then take whatever else is already
         // queued, then run the timers.
@@ -419,24 +552,39 @@ fn run(args: &[String]) -> R {
             let now = start.elapsed();
             match m {
                 Msg::Encrypted(bytes, from) => {
+                    if looks_like_handshake1(&bytes) && !source_limit.allow(now, from.ip()) {
+                        t.local_drop("source_limited");
+                        continue;
+                    }
                     let ev = t.link.handle_packet(now, &bytes);
                     t.apply(ev, Some(from));
                 }
-                Msg::Plain(bytes) => match t.link.send(now, &bytes) {
-                    Ok(packet) => match t.remote {
-                        Some(r) => {
+                Msg::Plain(bytes, from) => {
+                    if !a.allow_remote_plain && from.ip() != a.plain_send.ip() {
+                        t.local_drop("plain_source");
+                        continue;
+                    }
+                    // Without a place to send to, nothing is encrypted: a
+                    // packet is not counted as sent if it never leaves.
+                    let Some(r) = t.remote else {
+                        t.local_drop("no_remote");
+                        continue;
+                    };
+                    match t.link.send(now, &bytes) {
+                        Ok(packet) => {
                             let _ = t.enc.send_to(&packet, r);
                         }
-                        None => t.local_drop("no_remote"),
-                    },
-                    Err(SendError::TooLarge) => t.local_drop("too_large"),
-                    Err(e) => t.local_drop(e.as_str()),
-                },
+                        Err(SendError::TooLarge) => t.local_drop("too_large"),
+                        Err(e) => t.local_drop(e.as_str()),
+                    }
+                }
             }
         }
         let ev = t.link.poll_timers(start.elapsed());
         t.apply(ev, None);
+        t.flush_drop_summary(false);
     }
+    t.flush_drop_summary(true);
     t.print_stats();
     Ok(())
 }
@@ -514,12 +662,71 @@ mod tests {
     }
 
     #[test]
+    fn plain_listen_must_be_loopback_unless_allowed() {
+        let remote =
+            "--dir d --peer p --bind 127.0.0.1:1 --plain-listen 0.0.0.0:2 --plain-send 127.0.0.1:3";
+        let e = parse_args(&v(remote)).err().unwrap().to_string();
+        assert!(e.contains("loopback"), "{e}");
+        let lan = "--dir d --peer p --bind 127.0.0.1:1 --plain-listen 192.168.1.5:2 --plain-send 127.0.0.1:3";
+        assert!(parse_args(&v(lan)).is_err());
+        let a = parse_args(&v(&format!("{remote} --allow-remote-plain")))
+            .unwrap()
+            .unwrap();
+        assert!(a.allow_remote_plain);
+        let v6 = "--dir d --peer p --bind 127.0.0.1:1 --plain-listen [::1]:2 --plain-send [::1]:3";
+        assert!(parse_args(&v(v6)).unwrap().is_some());
+        assert!(!parse_args(&v(BASE)).unwrap().unwrap().allow_remote_plain);
+    }
+
+    #[test]
+    fn huge_numbers_are_refused_not_wrapped() {
+        for bad in [
+            "--duration 18446744073709551615",
+            "--duration 99999999999",
+            "--rekey-secs 18446744073709551615",
+            "--rekey-secs 9999999999999",
+            "--keepalive-secs 18446744073709551615",
+            "--mtu 18446744073709551615",
+            "--mtu 70000",
+            "--mtu 127",
+            "--counter-bytes 4294967298", // wraps to 2 on a 32-bit usize
+        ] {
+            assert!(parse_args(&v(&format!("{BASE} {bad}"))).is_err(), "{bad}");
+        }
+        // The largest allowed values still make a valid config.
+        let a = parse_args(&v(&format!(
+            "{BASE} --rekey-secs {} --keepalive-secs {} --duration {}",
+            MAX_SECS / 2,
+            MAX_SECS,
+            MAX_SECS
+        )))
+        .unwrap()
+        .unwrap();
+        config_from(&a).unwrap();
+    }
+
+    #[test]
+    fn drop_lines_are_limited_to_ten_a_second_with_a_summary() {
+        let t0 = Instant::now();
+        let mut log = DropLog::new(t0);
+        let printed = (0..1000).filter(|_| log.allow()).count();
+        assert_eq!(printed, 10);
+        assert_eq!(log.suppressed, 990);
+        // Nothing to report until the second is over, then exactly the rest.
+        assert_eq!(log.roll(t0 + Duration::from_millis(900)), 0);
+        assert_eq!(log.roll(t0 + Duration::from_millis(1000)), 990);
+        assert_eq!(log.roll(t0 + Duration::from_millis(1100)), 0);
+        // A new second starts with a new allowance.
+        assert_eq!((0..50).filter(|_| log.allow()).count(), 10);
+    }
+
+    #[test]
     fn rekey_setting_keeps_the_config_valid() {
         for secs in [1u64, 3, 600, 899, 900, 5000] {
             let a = parse_args(&v(&format!("{BASE} --rekey-secs {secs}")))
                 .unwrap()
                 .unwrap();
-            config_from(&a).validate().unwrap();
+            config_from(&a).unwrap();
         }
     }
 }
