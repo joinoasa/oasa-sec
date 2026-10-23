@@ -19,7 +19,7 @@ Follow the [OASA software standard](https://joinoasa.org/docs/software-standard/
 | `cargo build --bins --examples` | Build `oasa-pair` and the stand-in autopilot |
 | `cargo test` | Unit tests |
 | `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` | Format and lint (CI fails otherwise) |
-| `scripts/e2e.sh` | End-to-end check with no hardware (needs `pip install pymavlink`) |
+| `scripts/e2e.sh` | End-to-end check with no hardware (needs `pip install pymavlink`, or set `PYTHON` to a venv python) |
 
 ## Pull requests
 

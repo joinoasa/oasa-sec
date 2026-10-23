@@ -12,4 +12,4 @@ We'll reply within a few days, agree a fix and a date to publish, and credit you
 
 ## Status
 
-Everything here is a **prototype**. It has not been independently reviewed. Do not use it to fly or drive anything.
+Everything here is a **prototype**. Known limits are listed in [docs/oasa-sec-v0-pairing.md](docs/oasa-sec-v0-pairing.md#6-known-limits-v0). It has not been independently reviewed. Do not use it to fly or drive anything.
