@@ -576,11 +576,9 @@ fn run(args: &[String]) -> R {
 
     let enc = UdpSocket::bind(a.bind)?;
     let plain_in = UdpSocket::bind(a.plain_listen)?;
-    let plain_out = UdpSocket::bind(if a.plain_send.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })?;
+    // Decrypted packets leave from the same socket that plaintext arrives on,
+    // so a program that answers the sender (PX4 does) answers to --plain-listen.
+    let plain_out = plain_in.try_clone()?;
     signals::install();
 
     // On by default for a drone (the device that holds the autopilot's key).
