@@ -15,9 +15,11 @@ pub(crate) struct Session {
     /// We started the handshake that made this session.
     pub initiator: bool,
     /// The peer has proved it holds the session: a valid data packet arrived
-    /// on it. Until then an initiator cannot tell a working session from one
-    /// whose handshake 2 was changed on the way (the indexes in it are not
-    /// covered by the Noise tags).
+    /// on it. Until then an initiator cannot be sure the peer finished its
+    /// side (handshake 2 may have been lost after the peer made the session,
+    /// or the peer may have restarted). The indexes are inside the Noise
+    /// payloads, so a changed handshake 2 is already refused; this is a
+    /// second line of defence.
     pub confirmed: bool,
     pub created: Duration,
     transport: StatelessTransportState,

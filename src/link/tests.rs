@@ -43,13 +43,18 @@ fn random_key() -> [u8; 32] {
 }
 
 pub(super) fn pair(cfg: Config) -> Pair {
+    pair_with(cfg.clone(), cfg)
+}
+
+/// Each side with its own settings.
+pub(super) fn pair_with(cfg_a: Config, cfg_b: Config) -> Pair {
     let (a_key, b_key) = (random_key(), random_key());
     let ia = Identity::from_private_bytes(&a_key).unwrap();
     let ib = Identity::from_private_bytes(&b_key).unwrap();
     let a = Link::new(
         &ia,
         *ib.public_key(),
-        cfg.clone(),
+        cfg_a,
         Box::new(TestRng(1)),
         Duration::from_secs(1_000_000),
         Box::new(MemoryTimestampStore::default()),
@@ -58,7 +63,7 @@ pub(super) fn pair(cfg: Config) -> Pair {
     let b = Link::new(
         &ib,
         *ia.public_key(),
-        cfg,
+        cfg_b,
         Box::new(TestRng(2)),
         Duration::from_secs(1_000_000),
         Box::new(MemoryTimestampStore::default()),
@@ -99,8 +104,12 @@ pub(super) fn drops(events: &[Event]) -> Vec<DropReason> {
 
 /// A established link: `a` is the initiator. Returns the pair and the time.
 pub(super) fn established(cfg: Config) -> (Pair, Duration) {
-    let cl = cfg.counter_len;
-    let mut p = pair(cfg);
+    established_with(cfg.clone(), cfg)
+}
+
+pub(super) fn established_with(cfg_a: Config, cfg_b: Config) -> (Pair, Duration) {
+    let cl = cfg_a.counter_len;
+    let mut p = pair_with(cfg_a, cfg_b);
     let now = ms(10);
     let ev = p.a.start_handshake(now).unwrap();
     let hs1 = sends(&ev).remove(0);
@@ -1294,4 +1303,75 @@ fn a_future_timestamp_that_was_refused_does_not_lock_the_peer_out() {
     );
     let hs1 = sends(&good.start_handshake(ms(20)).unwrap()).remove(0);
     assert_eq!(sends(&b.handle_packet(ms(20), &hs1)).len(), 1);
+}
+
+#[test]
+fn the_receiver_refuses_counters_at_its_own_packet_limit() {
+    // The sender allows more packets than the receiver: counter 99 gets
+    // through, 100 and above are refused (as forgeries) on the receiving side.
+    let strict = Config {
+        reject_after_packets: 100,
+        rekey_after_packets: 90,
+        keepalive: None,
+        ..Config::default()
+    };
+    let loose = Config {
+        reject_after_packets: 1000,
+        rekey_after_packets: 900,
+        keepalive: None,
+        ..Config::default()
+    };
+    let (mut p, now) = established_with(loose, strict);
+    // `established` used counter 0 for the first keepalive on A's session.
+    let used = p.a.stats().sent + p.a.stats().keepalives_sent;
+    let mut results = Vec::new();
+    for i in used..110 {
+        let pkt = p.a.send(now, &[i as u8]).unwrap();
+        let ev = p.b.handle_packet(now, &pkt);
+        results.push(delivered(&ev).len() + 100 * drops(&ev).len());
+        if i + 1 == 100 {
+            // counter i is the 100th packet counting from 0: the last allowed
+            assert_eq!(*results.last().unwrap(), 1);
+        }
+    }
+    let ok = results.iter().filter(|r| **r == 1).count();
+    let refused = results.iter().filter(|r| **r == 100).count();
+    assert_eq!(ok as u64, 100 - used);
+    assert_eq!(refused as u64, 110 - 100);
+    assert_eq!(p.b.stats().dropped(DropReason::BadTag), 10);
+}
+
+#[test]
+fn the_previous_session_grace_counts_from_the_last_packet_on_it() {
+    let cfg = Config {
+        previous_grace: Duration::from_secs(10),
+        keepalive: None,
+        ..Config::default()
+    };
+    let (mut p, t0) = established(cfg);
+    // A packet A sends on the old session, delayed in the network.
+    let mut old_packets = Vec::new();
+    for i in 0..4u8 {
+        old_packets.push(p.a.send(t0, &[i]).unwrap());
+    }
+    // A rekeys: B's new session takes over on A's first packet on it.
+    let t1 = t0 + Duration::from_secs(1);
+    let hs1 = sends(&p.a.start_handshake(t1).unwrap()).remove(0);
+    let hs2 = sends(&p.b.handle_packet(t1, &hs1)).remove(0);
+    let ev = p.a.handle_packet(t1, &hs2);
+    let first = sends(&ev).remove(0);
+    p.b.handle_packet(t1, &first);
+    // 8 s later one old packet still arrives (inside the 10 s grace)...
+    let t2 = t1 + Duration::from_secs(8);
+    assert_eq!(delivered(&p.b.handle_packet(t2, &old_packets[0])).len(), 1);
+    // ...which restarts the grace, so 8 s after that another is still read
+    // (16 s after the switch).
+    let t3 = t2 + Duration::from_secs(8);
+    p.b.poll_timers(t3);
+    assert_eq!(delivered(&p.b.handle_packet(t3, &old_packets[1])).len(), 1);
+    // Once 10 s pass with nothing on the old session it is gone.
+    let t4 = t3 + Duration::from_secs(10);
+    p.b.poll_timers(t4);
+    let ev = p.b.handle_packet(t4, &old_packets[2]);
+    assert_eq!(drops(&ev), vec![DropReason::UnknownIndex]);
 }
