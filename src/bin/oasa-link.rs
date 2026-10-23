@@ -21,6 +21,8 @@ use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
     SendError, SourceLimiter, looks_like_handshake1,
 };
+use oasa_sec::mavguard::{Block, Guard};
+use oasa_sec::signing::AUTOPILOT_KEY_FILE;
 use oasa_sec::store;
 
 const USAGE: &str = "\
@@ -32,6 +34,7 @@ USAGE:
             [--remote HOST:PORT] [--initiate] [--allow-remote-plain] [--trusted-clock]
             [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N]
             [--mtu BYTES] [--duration SECS]
+            [--mavlink-guard | --no-mavlink-guard] [--allow-mavlink-ftp]
 
   --dir            Device folder made by `oasa-pair init`.
   --peer           Name of a trusted peer (see `oasa-pair peers`, `oasa-pair trust`).
@@ -57,9 +60,19 @@ USAGE:
   --keepalive-secs Send an empty packet after this many idle seconds (default 25, 0 = off).
   --mtu            Largest encrypted packet in bytes (default 128, the smallest radio the
                    link supports). Plaintext must fit in MTU minus 21 bytes (23 with 4).
+  --mavlink-guard  Check every packet from the link before it goes to --plain-send, and
+                   drop any datagram with a malformed or blocked MAVLink frame
+                   (SETUP_SIGNING, FTP, PARAM_SET of a signing setting). On by default
+                   when --dir holds mavlink-signing-key.bin (a drone); this forces it on.
+  --no-mavlink-guard
+                   Turn the guard off (prints a warning). Not for flight.
+  --allow-mavlink-ftp
+                   Let FILE_TRANSFER_PROTOCOL through the guard (log download needs it).
   --duration       Stop after this many seconds. Stops on SIGINT or SIGTERM too.
 
-Prints one JSON line per event: handshake_sent, session_established, rekey, drop, hint.
+Prints one JSON line per event: handshake_sent, session_established, rekey, drop, hint,
+mavlink_guard (at start), warning. A datagram stopped by the guard is a drop with reason
+mavlink_blocked and the message id (never its contents).
 At most 10 drop lines a second are printed; a drops_suppressed line counts the rest. The
 trusted peers are read once at startup: restart oasa-link after `oasa-pair trust` or
 `remove`. On exit prints {\"event\":\"stats\",...} and exits 0. Packet contents and keys are never printed.
@@ -123,6 +136,8 @@ struct Args {
     initiate: bool,
     allow_remote_plain: bool,
     trusted_clock: bool,
+    guard: Option<bool>,
+    allow_ftp: bool,
     plain_listen: SocketAddr,
     plain_send: SocketAddr,
     counter: CounterLen,
@@ -140,6 +155,9 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
     let mut initiate = false;
     let mut allow_remote_plain = false;
     let mut trusted_clock = false;
+    let mut guard_on = false;
+    let mut guard_off = false;
+    let mut allow_ftp = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -147,6 +165,9 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
             "--initiate" => initiate = true,
             "--allow-remote-plain" => allow_remote_plain = true,
             "--trusted-clock" => trusted_clock = true,
+            "--mavlink-guard" => guard_on = true,
+            "--no-mavlink-guard" => guard_off = true,
+            "--allow-mavlink-ftp" => allow_ftp = true,
             _ => {
                 let k = a
                     .strip_prefix("--")
@@ -192,6 +213,17 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
             .transpose()
             .map_err(Into::into)
     };
+    if guard_on && guard_off {
+        return Err("--mavlink-guard and --no-mavlink-guard together make no sense".into());
+    }
+    if guard_off && allow_ftp {
+        return Err("--allow-mavlink-ftp has no effect with --no-mavlink-guard".into());
+    }
+    let guard = match (guard_on, guard_off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    };
     let remote = match named.get("remote") {
         Some(_) => Some(addr("remote")?),
         None => None,
@@ -236,6 +268,8 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         initiate,
         allow_remote_plain,
         trusted_clock,
+        guard,
+        allow_ftp,
         plain_listen,
         plain_send: addr("plain-send")?,
         counter,
@@ -351,6 +385,8 @@ struct Tunnel {
     plain_out: UdpSocket,
     plain_send: SocketAddr,
     remote: Option<SocketAddr>,
+    /// The MAVLink guard on what comes out of the link, if it is on.
+    guard: Option<Guard>,
     /// Drops that happen before a packet is made (counted with the link's).
     local_drops: BTreeMap<&'static str, u64>,
     drop_log: DropLog,
@@ -366,6 +402,20 @@ impl Tunnel {
             println!(
                 "{{\"ts\":\"{}\",\"event\":\"drop\",\"reason\":\"{reason}\"}}",
                 rfc3339(SystemTime::now())
+            );
+        }
+    }
+
+    /// The guard stopped a datagram from the link. Counted as `mavlink_blocked`
+    /// and logged like any drop; the line names the message id, never contents.
+    fn guard_drop(&mut self, b: Block) {
+        *self.local_drops.entry("mavlink_blocked").or_insert(0) += 1;
+        if self.drop_log.allow() {
+            let id = b.msgid.map_or(String::new(), |m| format!(",\"msgid\":{m}"));
+            println!(
+                "{{\"ts\":\"{}\",\"event\":\"drop\",\"reason\":\"mavlink_blocked\",\"why\":\"{}\"{id}}}",
+                rfc3339(SystemTime::now()),
+                b.why.as_str()
             );
         }
     }
@@ -403,6 +453,12 @@ impl Tunnel {
                     }
                 }
                 Event::Deliver(p) => {
+                    if let Some(g) = self.guard {
+                        if let Err(b) = g.check(&p) {
+                            self.guard_drop(b);
+                            continue;
+                        }
+                    }
                     let _ = self.plain_out.send_to(&p, self.plain_send);
                 }
                 Event::Authenticated => {
@@ -527,6 +583,29 @@ fn run(args: &[String]) -> R {
     })?;
     signals::install();
 
+    // On by default for a drone (the device that holds the autopilot's key).
+    let has_key = a.dir.join(AUTOPILOT_KEY_FILE).exists();
+    let guard = match a.guard {
+        Some(on) => on,
+        None => has_key,
+    }
+    .then_some(Guard {
+        allow_ftp: a.allow_ftp,
+    });
+    let now = rfc3339(SystemTime::now());
+    match (guard, a.guard) {
+        (Some(g), _) => println!(
+            "{{\"ts\":\"{now}\",\"event\":\"mavlink_guard\",\"state\":\"on\",\"ftp\":{}}}",
+            g.allow_ftp
+        ),
+        (None, Some(false)) => println!(
+            "{{\"ts\":\"{now}\",\"event\":\"warning\",\"what\":\"the MAVLink guard is off: the link can carry SETUP_SIGNING, FTP and signing parameter changes to the autopilot\"}}"
+        ),
+        (None, _) => println!(
+            "{{\"ts\":\"{now}\",\"event\":\"mavlink_guard\",\"state\":\"off\",\"ftp\":false}}"
+        ),
+    }
+
     let (tx, rx) = mpsc::sync_channel::<Msg>(4096);
     spawn_reader(enc.try_clone()?, tx.clone(), true);
     spawn_reader(plain_in, tx, false);
@@ -539,6 +618,7 @@ fn run(args: &[String]) -> R {
         plain_out,
         plain_send: a.plain_send,
         remote: a.remote,
+        guard,
         local_drops: BTreeMap::new(),
         drop_log: DropLog::new(Instant::now()),
         stale_run: 0,
