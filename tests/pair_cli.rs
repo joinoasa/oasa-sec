@@ -108,7 +108,7 @@ fn trust_adds_a_peer_and_prints_its_fingerprint() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(a.join("trusted-peers"))
+        let mode = std::fs::metadata(a.join("trusted-peers.v1"))
             .unwrap()
             .permissions()
             .mode();
@@ -146,7 +146,7 @@ fn trust_refuses_bad_input() {
     // Its own key.
     assert!(err(&["trust", "--dir", s(&a), "--name", "me", "--key", &ka]).contains("own key"));
     // Nothing was written by any of the failures.
-    assert!(!a.join("trusted-peers").exists());
+    assert!(!a.join("trusted-peers.v1").exists());
     // Clashes with an existing entry.
     ok(&["trust", "--dir", s(&a), "--name", "relay", "--key", &kb]);
     let same_name = err(&["trust", "--dir", s(&a), "--name", "relay", "--key", &kc]);
@@ -186,7 +186,7 @@ fn trust_refuses_small_order_keys_and_fingerprint_shaped_names() {
     let fp = field(&ok(&["show", "--dir", s(&b)]), "fingerprint").to_string();
     let e = err(&["trust", "--dir", s(&a), "--name", &fp, "--key", &kb]);
     assert!(e.contains("fingerprint"), "{e}");
-    assert!(!a.join("trusted-peers").exists());
+    assert!(!a.join("trusted-peers.v1").exists());
 }
 
 #[test]

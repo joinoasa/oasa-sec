@@ -22,6 +22,7 @@ pub mod link;
 pub mod mavguard;
 mod mavlens;
 pub mod pairing;
+pub mod removal;
 pub mod signing;
 pub mod store;
 

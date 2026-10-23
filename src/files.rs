@@ -1,5 +1,6 @@
 //! Safe handling of secret files: owner-only, written atomically, never
-//! read through a symlink.
+//! read through a symlink. Also the directory lock that every
+//! read-modify-write of the trust and removal files takes (R-SEC2).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -152,6 +153,82 @@ fn sync_parent(path: &Path) {
     }
 }
 
+/// Name of the lock file inside a device folder.
+pub(crate) const LOCK_FILE: &str = ".lock";
+
+/// An exclusive lock on `<dir>/.lock`, held until dropped. Every
+/// read-modify-write of `trusted-peers.v1`, `removed`, `removal-log`,
+/// `removal-sync/*`, `admin-votes` and `rotation-pending` happens under it, so
+/// `oasa-pair` and any number of `oasa-link` processes can never save a stale
+/// copy over a removal (spec R-SEC2 section 3).
+///
+/// The lock belongs to the open file, so locking twice in one process
+/// deadlocks. Functions that already hold it take a `&DirLock` as proof and
+/// never lock again.
+#[derive(Debug)]
+pub(crate) struct DirLock {
+    file: fs::File,
+}
+
+impl DirLock {
+    /// Wait for the lock (blocking). Makes the folder (mode 0700) if needed.
+    pub(crate) fn acquire(dir: &Path) -> Result<Self> {
+        ensure_private_dir(dir)?;
+        let path = dir.join(LOCK_FILE);
+        if let Ok(m) = fs::symlink_metadata(&path)
+            && m.file_type().is_symlink()
+        {
+            return Err(Error::BadKeyFile(format!(
+                "{} is a symlink; refusing",
+                path.display()
+            )));
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path)?;
+        file.lock()?;
+        Ok(Self { file })
+    }
+
+    /// Only for tests of the lock itself: take it if it is free.
+    #[cfg(test)]
+    pub(crate) fn try_acquire(dir: &Path) -> Result<Option<Self>> {
+        ensure_private_dir(dir)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LOCK_FILE))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // Closing the file also releases it; this just does it sooner.
+        let _ = self.file.unlock();
+    }
+}
+
+/// Read a private file if it exists; `None` if it does not.
+pub(crate) fn read_private_file_opt(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_private_file(path).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// A fresh, empty, private temporary directory for tests.
 #[cfg(test)]
 pub(crate) fn tempdir(name: &str) -> PathBuf {
@@ -180,6 +257,54 @@ mod tests {
         assert_eq!(&read_private_file(&p).unwrap()[..], b"three");
         // No temp files left behind.
         assert_eq!(fs::read_dir(&d).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn the_lock_excludes_other_holders_and_is_released_on_drop() {
+        let d = tempdir("files-lock");
+        let l = DirLock::acquire(&d).unwrap();
+        assert!(DirLock::try_acquire(&d).unwrap().is_none());
+        drop(l);
+        assert!(DirLock::try_acquire(&d).unwrap().is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(d.join(LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn locked_read_modify_write_loses_no_update_across_threads() {
+        let d = tempdir("files-lock-rmw");
+        let path = d.join("counter");
+        write_private_file(&path, b"0").unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..40 {
+                        let _lock = DirLock::acquire(&d).unwrap();
+                        let n: u32 = std::str::from_utf8(&read_private_file(&path).unwrap())
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        write_private_file(&path, (n + 1).to_string().as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(&read_private_file(&path).unwrap()[..], b"320");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlinked_lock_file() {
+        let d = tempdir("files-lock-link");
+        std::os::unix::fs::symlink(d.join("elsewhere"), d.join(LOCK_FILE)).unwrap();
+        assert!(DirLock::acquire(&d).is_err());
     }
 
     #[cfg(unix)]

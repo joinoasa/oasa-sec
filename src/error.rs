@@ -20,6 +20,9 @@ pub enum Error {
     /// A public key that is a small-order point (zero, one and the like). No
     /// real device has one, and a Diffie-Hellman with it proves nothing.
     SmallOrderKey,
+    /// The key is in this device's `removed` file (R-SEC2). Only a person at
+    /// the device can undo that, with `oasa-pair restore`.
+    Removed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -34,6 +37,10 @@ impl fmt::Display for Error {
             Error::Protocol(why) => write!(f, "pairing protocol error: {why}"),
             Error::Link(why) => write!(f, "link error: {why}"),
             Error::SmallOrderKey => write!(f, "that public key is not a valid device key"),
+            Error::Removed => write!(
+                f,
+                "that device was removed here; a removed device must make a new identity and pair again (or run `oasa-pair restore` on this device)"
+            ),
         }
     }
 }
