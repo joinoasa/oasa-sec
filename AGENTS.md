@@ -1,6 +1,6 @@
 # AGENTS.md: working in oasa-sec
 
-Read by AI coding agents (Claude Code, Codex, Cursor and others) and useful for people too. This repo is **OASA-SEC**: device identity, encrypted pairing and link keys for OASA systems. It covers tech tree nodes R-SEC1 (identity, keys, pairing) and R-COM2 (the encrypted link), and later R-SEC2.
+Read by AI coding agents (Claude Code, Codex, Cursor and others) and useful for people too. This repo is **OASA-SEC**: device identity, encrypted pairing and link keys for OASA systems. It covers tech tree nodes R-SEC1 (identity, keys, pairing) and R-COM2 (the encrypted link), and R-SEC2 phase A (roles and device removal; signing-key rotation is phase B).
 
 ## Rules that never bend
 
@@ -21,6 +21,10 @@ Follow the [OASA software standard](https://joinoasa.org/docs/software-standard/
 | `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` | Format and lint (CI fails otherwise) |
 | `scripts/e2e.sh` | End-to-end check of pairing with no hardware (needs `pip install pymavlink`, or set `PYTHON` to a venv python) |
 | `scripts/link-e2e.sh` | End-to-end check of the encrypted link: real `oasa-link` processes over localhost UDP (needs `cargo build --bins`) |
+
+## Trust files and removal
+
+Files in a device folder: `trusted-peers.v1` (roles), `removed` (append-only tombstones, decide over the list), `removal-log`, `removal-sync/`, `admin-votes`. Change them only through `store` and `removal`, which take the `.lock` and write atomically. The control layer (`src/control.rs`) is sans-IO like the link and reads roles fresh from the files. Roles are set only by `oasa-pair`, never by a message. Spec: `docs/oasa-sec-v0-rotation.md`. The MSRV is 1.89 (`File::lock`).
 
 ## Pull requests
 

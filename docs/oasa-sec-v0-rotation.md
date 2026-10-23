@@ -94,21 +94,7 @@ A drone's autopilot has one MAVLink signing key, shared with its operators. Each
 
 ### The guard
 
-**The tunnel never carries key or signing changes to the autopilot.** On a drone, `oasa-link` runs a MAVLink guard on everything arriving from the link. It is **on by default** whenever the device has `mavlink-signing-key.bin`; turning it off (`--no-mavlink-guard`) prints a warning. The guard:
-- parses every frame in each datagram (routers may batch several);
-- checks frame shape and length only, not CRC, so other dialects pass;
-- passes MAVLink 1 frames unless their message id is blocked;
-- **drops the whole datagram** if any frame is malformed or blocked, and counts it (`mavlink_blocked`).
-
-Blocked by default:
-
-| Message | Why |
-|---|---|
-| 256 `SETUP_SIGNING` | Would load someone else's key into the autopilot |
-| 110 `FILE_TRANSFER_PROTOCOL` | PX4 keeps its key in a file; a file write and reboot could replace it. `--allow-mavlink-ftp` turns it back on (log download needs it) |
-| 23 `PARAM_SET`, 323 `PARAM_EXT_SET` for names starting `MAV_SIGN` | Could turn signing off *(parameter names to verify in SITL)* |
-
-Otherwise an operator holding the key, or a ground station app's signing screen, could lock everyone else out.
+**The tunnel never carries key or signing changes to the autopilot.** The MAVLink guard on a drone is described once, in the [link spec section 7](oasa-sec-v0-link.md#7-using-it). It is on by default whenever the device has `mavlink-signing-key.bin`, and it is an allowlist: anything not listed there is dropped, so key and signing changes cannot pass.
 
 ### Who does what
 
@@ -161,6 +147,18 @@ An operator that reconnects with an older generation gets `SIGNING_KEY_NEXT` and
 - L0/L1: role matrix, every control message hostile and replayed, union and two-admin rules, vote loss, lock contention, a reload removing a peer mid-session, tombstones winning over a stale `trusted-peers`.
 - Lab: `oasa-link` removal mid-run (exit code 3); the guard drops `SETUP_SIGNING`, FTP and signing parameters sent through the tunnel, and passes ordinary traffic.
 - SITL: rotation on PX4 and ArduPilot, lost `COMMAND_ACK` (probe recovers), power loss between steps 4 and 6, armed (waits), a reconnecting operator catching up, generations never reused.
+
+### Status
+
+Phase A (sections 1 to 3, and the parts of 6 and 7 that belong to them) is built and tested. Phase B (section 4) is not built; `SIGNING_KEY_NEXT` and `SIGNING_KEY_COMMIT` are parsed and role-checked, then only noted.
+
+Tested in phase A (unit tests, `tests/link_sim.rs`, `tests/pair_cli.rs`, `scripts/link-e2e.sh`):
+- Every control message, including malformed, wrong-role and replayed ones; the role matrix.
+- Union, two-admin, vote loss and log-id reset; removal sync through the lossy simulated channel (many seeds, restarts, an admin offline then catching up, a removed admin).
+- Migration from v0; tombstones beating a stale `trusted-peers`; restore; lock contention (threads and 24 processes).
+- `oasa-link` removal mid-run (exit code 3), reload on SIGHUP, and a revoke carried from an admin to a device.
+
+Not tested yet: everything in section 4 (SITL rotation), real radios, independent review.
 
 ## 8. Open questions
 

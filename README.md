@@ -15,7 +15,7 @@ Signing is only a second layer. The design is in [docs/oasa-sec-v0-pairing.md](d
 
 ## The encrypted link (R-COM2)
 
-One encrypted, authenticated link between two trusted devices, over any radio that can carry a packet. Modeled on WireGuard: Noise `IK`, 21 bytes of overhead (handshakes 119 and 55 bytes), every packet stands alone (loss, reordering and duplicates never break it), and a device that is not in `trusted-peers` gets no reply at all. Design: [docs/oasa-sec-v0-link.md](docs/oasa-sec-v0-link.md).
+One encrypted, authenticated link between two trusted devices, over any radio that can carry a packet. Modeled on WireGuard: Noise `IK`, 22 bytes of overhead (handshakes 119 and 55 bytes; wire version 1 adds a content type byte so control messages stay apart from app data), every packet stands alone (loss, reordering and duplicates never break it), and a device that is not in `trusted-peers.v1` gets no reply at all. Design: [docs/oasa-sec-v0-link.md](docs/oasa-sec-v0-link.md).
 
 - **`oasa_sec::link`** is a library with no sockets, threads or clock inside: bytes and the time go in, events come out. `Link` is one peer; `Endpoint` serves several (one ground station, many drones).
 - **`oasa-link`** carries local UDP packets (for example MAVLink) over the link and logs one JSON line per event.
@@ -41,7 +41,7 @@ $B/oasa-link --dir /tmp/gcs --peer drone --bind 127.0.0.1:7002 --remote 127.0.0.
 echo hello | nc -u -q1 127.0.0.1 7021
 ```
 
-Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line. It reads `trusted-peers` once at startup, so restart it after `oasa-pair trust` or `remove`. `--plain-listen` must be a loopback address unless you pass `--allow-remote-plain`. If a peer's clock was wrong and its handshakes are now refused as stale, fix the clock and run `oasa-pair reset-stamp --dir DIR --peer NAME`. Set the same rekey limits on both sides. Give `--remote` whenever you know the peer's address: a device without it cannot start a handshake itself. Use `--trusted-clock` only on a device whose clock is set before it starts.
+Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line. It watches the trust files and reloads within a second (or at once on SIGHUP), so `oasa-pair trust`, `remove` and `revoke` need no restart; if its own peer is removed it exits with code 3. `--plain-listen` must be a loopback address unless you pass `--allow-remote-plain`. If a peer's clock was wrong and its handshakes are now refused as stale, fix the clock and run `oasa-pair reset-stamp --dir DIR --peer NAME`. Set the same rekey limits on both sides. Give `--remote` whenever you know the peer's address: a device without it cannot start a handshake itself. Use `--trusted-clock` only on a device whose clock is set before it starts.
 
 On a drone (a device folder with `mavlink-signing-key.bin`) `oasa-link` also runs a **MAVLink guard** on what comes out of the link. It is an **allowlist**: only whole, CRC-valid frames of the right length, for the messages and commands a ground station needs to monitor and fly, get through (the tables are in section 7 of the link doc). Parameter writes, FTP, `SETUP_SIGNING`, geofence and rally changes, RTK data, reboot, calibration and storage commands and every other message are dropped. `--allow-param NAME`, `--allow-mavlink-ftp`, `--allow-fence-rally`, `--allow-rtk`, `--allow-msg ID` and `--allow-command ID` widen it and each logs a warning; `--no-mavlink-guard` turns it off.
 
@@ -86,12 +86,20 @@ Run `oasa-pair --help` for every command.
 
 Choices follow OASA's [adoption standard](https://joinoasa.org/docs/adopting-software/) and are recorded in the [software register](https://joinoasa.org/docs/software-register/).
 
+## Roles and device removal (R-SEC2, phase A)
+
+Every trusted peer has a role: **admin** (its removal log is obeyed, 1 to 3 owner devices), **operator** (flies the drone) or **peer** (link traffic only). Pairing sets them (the drone saves the ground station as operator; the ground station saves the drone as peer); `oasa-pair trust --role` sets them by hand. An old `trusted-peers` is converted on first use and kept as `trusted-peers.v0-migrated`.
+
+- `oasa-pair remove PEER` removes a device here, for good (a `removed` tombstone beats the list). `restore KEY` lifts it, and trusts nothing until you pair or `trust` it again. `removed` lists them.
+- `oasa-pair revoke PEER` also adds it to this device's removal log. Devices that list this one as admin pick it up over the link, with retries; removing an admin there needs two admins. The rules are in [docs/oasa-sec-v0-rotation.md](docs/oasa-sec-v0-rotation.md).
+- Files are changed under an exclusive lock on `.lock` and swapped in atomically, so several programs can share one folder.
+
 ## Next
 
 - Test on real autopilot hardware (PX4 and ArduPilot SITL already pass: [docs/sitl.md](docs/sitl.md)).
 - An on-drone confirm button, and checking key file ownership.
 - R-COM2: radio adapters in [oasa-radio](https://github.com/joinoasa/oasa-radio) plug in where `oasa-link` uses UDP; handshakes for radios under 128 bytes; DoS cookies; group keys.
-- R-SEC2: key rotation and lost-device lockout.
+- R-SEC2 phase B: signing-key rotation (spec section 4). Phase A is built, see below.
 - Independent review.
 
 Licensed under [Apache-2.0](LICENSE).

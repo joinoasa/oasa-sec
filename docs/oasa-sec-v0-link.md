@@ -99,7 +99,7 @@ Sending can fail locally (`empty`, `too_large`, `no_session`, `unknown_peer`); n
 
 ## 6. Who may connect
 
-`trusted-peers` is the gate. Removing a peer ends its sessions and stops new ones. A lost device is locked out only by key rotation (R-SEC2). `oasa-link` reads `trusted-peers` once at startup: restart it after `trust` or `remove`.
+`trusted-peers.v1` is the gate, with a role per peer, and the `removed` list beats it (see the [roles and removal spec](oasa-sec-v0-rotation.md)). Removing a peer ends its sessions and stops new ones. `oasa-link` checks the trust files every 250 ms and on SIGHUP, so `trust`, `remove` and `revoke` take effect within a second with no restart. If its own peer is removed it prints `peer_removed` and exits with code 3. A lost device is cut off by removal; a stolen key that is not yet removed still works until it is (key rotation, R-SEC2 phase B, changes the autopilot's signing key).
 
 **Threat model note (clocks).** A trusted peer is trusted, including to set its clock. Timestamps stop replay of recorded handshakes, not a misbehaving peer: a peer that sends a far-future timestamp is refused (10 minutes ahead, when the check is on). If a wrong future value was saved before that, or our own clock was once far ahead, nothing newer than that value is accepted until `oasa-pair reset-stamp` clears it. Fix the clock first. Resetting what we have `seen` lets one recorded old handshake from that peer through again until a newer one arrives. `oasa-link` prints a `hint` when handshakes keep being refused as stale.
 
@@ -241,7 +241,8 @@ Two ways in:
 
 - L0: unit tests, counter rebuilding edge cases, replay window, hostile headers.
 - L1: two endpoints through a seeded simulated channel with loss, delay, reordering, duplicates and replayed or changed packets; rekey under loss; changed handshake indexes refused; a stale rule restart after a reboot or a long blackout; mismatched rekey settings; a flood of replayed handshakes with and without the per-source limit; untrusted peers ignored; captured packets checked for the plaintext.
-- L2: real `oasa-link` processes over localhost UDP (`scripts/link-e2e.sh`): marked packets both ways, a rekey, a restart from a new port, junk and an untrusted device getting no reply, and the stats output.
+- L1 (control): removal sync through the lossy channel, with restarts, an admin offline then catching up, and the two-admin rule.
+- L2: real `oasa-link` processes over localhost UDP (`scripts/link-e2e.sh`): marked packets both ways, a rekey, a restart from a new port, junk and an untrusted device getting no reply, the stats output, removal mid-run (exit 3), SIGHUP reload, and a revoke carried from an admin to a device.
 - Mutation checks: the receive-side packet limit and the previous-session grace are each covered by a test that fails without them.
 - Not tested: real radios, long runs, and independent review.
 
