@@ -133,6 +133,9 @@ struct Sim {
     blackout: bool,
     /// Change the sender index in this many handshake 2 packets on the way.
     tamper_hs2: u32,
+    /// This side's application sends nothing.
+    mute: Option<Side>,
+    cfgs: (Config, Config),
 }
 
 fn pub_of(k: &[u8; 32]) -> [u8; 32] {
@@ -141,10 +144,15 @@ fn pub_of(k: &[u8; 32]) -> [u8; 32] {
 
 impl Sim {
     fn new(seed: u64, cfg: Config, channel: Channel) -> Self {
+        Self::new_with(seed, cfg.clone(), cfg, channel)
+    }
+
+    /// Each side with its own settings (a misconfigured pair).
+    fn new_with(seed: u64, cfg_a: Config, cfg_b: Config, channel: Channel) -> Self {
         let mut rng = Rng(seed);
         let ka = key(&mut rng);
         let kb = key(&mut rng);
-        let mk = |own: &[u8; 32], peer: [u8; 32], seed: u64| {
+        let mk = |own: &[u8; 32], peer: [u8; 32], seed: u64, cfg: &Config| {
             Link::new(
                 &Identity::from_private_bytes(own).unwrap(),
                 peer,
@@ -156,8 +164,8 @@ impl Sim {
             .unwrap()
         };
         let mut links = HashMap::new();
-        links.insert(Side::A, mk(&ka, pub_of(&kb), seed ^ 0xA));
-        links.insert(Side::B, mk(&kb, pub_of(&ka), seed ^ 0xB));
+        links.insert(Side::A, mk(&ka, pub_of(&kb), seed ^ 0xA, &cfg_a));
+        links.insert(Side::B, mk(&kb, pub_of(&ka), seed ^ 0xB, &cfg_b));
         let mut keys = HashMap::new();
         keys.insert(Side::A, ka);
         keys.insert(Side::B, kb);
@@ -177,7 +185,32 @@ impl Sim {
             next_id: 0,
             blackout: false,
             tamper_hs2: 0,
+            mute: None,
+            cfgs: (cfg_a, cfg_b),
         }
+    }
+
+    /// The device on `side` reboots: all session state is gone, the key and
+    /// the settings stay, the wall clock has moved on.
+    fn restart(&mut self, side: Side) {
+        let cfg = if side == Side::A {
+            self.cfgs.0.clone()
+        } else {
+            self.cfgs.1.clone()
+        };
+        let seed = self.rng.below(u64::MAX);
+        let k = self.keys[&side];
+        let peer = pub_of(&self.keys[&side.other()]);
+        let link = Link::new(
+            &Identity::from_private_bytes(&k).unwrap(),
+            peer,
+            cfg,
+            Box::new(Rng(seed)),
+            Duration::from_secs(1_700_000_000) + self.now,
+            Box::new(MemoryTimestampStore::default()),
+        )
+        .unwrap();
+        self.links.insert(side, link);
     }
 
     fn link(&mut self, s: Side) -> &mut Link {
@@ -307,8 +340,11 @@ impl Sim {
             self.step(tick);
             if self.now >= next_send {
                 next_send += send_every;
-                self.app_send(Side::A);
-                self.app_send(Side::B);
+                for side in [Side::A, Side::B] {
+                    if self.mute != Some(side) {
+                        self.app_send(side);
+                    }
+                }
             }
             hook(self);
         }
@@ -767,8 +803,10 @@ fn counter_rebuilds_across_65536_packets_and_survives_a_long_blackout() {
 #[test]
 fn a_blackout_over_32768_packets_stops_the_short_counter_until_rekey() {
     // The documented limit (spec section 3): with the 2-byte counter, losing
-    // 32,768 or more packets in a row makes the counter ambiguous, and the
-    // session is dead until the next rekey. The 4-byte counter is fine.
+    // 32,768 or more packets in a row makes the counter ambiguous. The
+    // session is dead, but the stale rule (nothing heard for 30 s after we
+    // sent) starts a new handshake without waiting for the rekey timer.
+    // The 4-byte counter is fine.
     for (len, dies) in [(CounterLen::Short, true), (CounterLen::Long, false)] {
         let mut cfg = config(len);
         cfg.rekey_after = Duration::from_secs(100);
@@ -785,7 +823,7 @@ fn a_blackout_over_32768_packets_stops_the_short_counter_until_rekey() {
         let between = sim.logs[&Side::B]
             .delivered
             .iter()
-            .filter(|(t, _)| *t > ms(82_000) && *t < ms(98_000))
+            .filter(|(t, _)| *t > ms(80_000) && *t < ms(84_000))
             .count();
         let after_rekey = sim.logs[&Side::B]
             .delivered
@@ -794,9 +832,16 @@ fn a_blackout_over_32768_packets_stops_the_short_counter_until_rekey() {
             .count();
         if dies {
             assert_eq!(between, 0, "{len:?}");
-            assert!(sim.stats(Side::B).dropped(DropReason::TooOld) > 10_000);
+            assert!(sim.stats(Side::B).dropped(DropReason::TooOld) > 100);
+            // Recovered by the stale rule, before the rekey at 100 s.
+            let early = sim.logs[&Side::B]
+                .delivered
+                .iter()
+                .filter(|(t, _)| *t > ms(90_000) && *t < ms(99_000))
+                .count();
+            assert!(early > 1_000, "{len:?}: stale rule restarts: {early}");
         } else {
-            assert!(between > 15_000, "{len:?}: {between}");
+            assert!(between > 2_000, "{len:?}: {between}");
         }
         assert!(
             after_rekey > 10_000,
@@ -1000,4 +1045,64 @@ fn without_the_per_source_limit_replays_do_starve_the_budget() {
     // Shows why the per-address limit exists, and that the test above bites.
     let (_, limited, _) = handshake_flood(false);
     assert!(limited > 100, "limited {limited}");
+}
+
+#[test]
+fn a_rebooted_peer_is_noticed_and_the_link_heals() {
+    // B reboots and loses its session. If B has data it starts a handshake
+    // itself; if it only listens, A notices after the stale time.
+    for (mute_b, bound) in [(None, 6u64), (Some(Side::B), 40)] {
+        let mut cfg = config(CounterLen::Short);
+        cfg.keepalive = None;
+        let mut sim = Sim::new(41, cfg, Channel::clean());
+        sim.mute = mute_b;
+        sim.start();
+        sim.run(Duration::from_secs(10), ms(10), ms(100), |_| {});
+        sim.restart(Side::B);
+        let at = sim.now;
+        sim.run(Duration::from_secs(60), ms(10), ms(100), |_| {});
+        sim.check_delivery_integrity();
+        // B's new link got a session, and soon enough.
+        let first_new = sim.logs[&Side::B]
+            .established
+            .iter()
+            .map(|(t, ..)| *t)
+            .filter(|t| *t > at)
+            .min()
+            .expect("B has a session again");
+        assert!(
+            first_new - at <= Duration::from_secs(bound),
+            "mute={mute_b:?}: took {:?}",
+            first_new - at
+        );
+        // Delivery in both directions goes on to the end (A to B always).
+        let late = sim.logs[&Side::B]
+            .delivered
+            .iter()
+            .filter(|(t, _)| *t > at + Duration::from_secs(50))
+            .count();
+        assert!(late > 50, "mute={mute_b:?}: {late}");
+    }
+}
+
+#[test]
+fn mismatched_expiry_settings_cost_seconds_and_recover_by_themselves() {
+    // B rejects sessions after 60 s while A would use them for 150 s.
+    // Not a supported setup (the spec says to set the same limits on both
+    // sides) but it must not wedge.
+    let mut a = config(CounterLen::Short);
+    a.rekey_after = Duration::from_secs(100);
+    a.reject_after = Duration::from_secs(150);
+    let mut b = a.clone();
+    b.rekey_after = Duration::from_secs(50);
+    b.reject_after = Duration::from_secs(60);
+    let mut sim = Sim::new_with(51, a, b, Channel::clean());
+    sim.start();
+    sim.run(Duration::from_secs(400), ms(10), ms(100), |_| {});
+    sim.check_delivery_integrity();
+    sim.check_accounting();
+    for side in [Side::A, Side::B] {
+        let gap = longest_gap(&sim, side, Duration::from_secs(5), Duration::from_secs(400));
+        assert!(gap < 8.0, "{side:?} was silent for {gap:.1}s");
+    }
 }

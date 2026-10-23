@@ -77,6 +77,12 @@ pub struct Config {
     pub retry_max: Duration,
     /// Send a keepalive when nothing was sent for this long. `None` is off.
     pub keepalive: Option<Duration>,
+    /// A side that has sent payload packets on its session but heard nothing
+    /// authenticated for this long starts a new handshake (WireGuard's rule:
+    /// keepalive time plus retry time). Applies with keepalives off too. The
+    /// peer answers payload it receives with a keepalive after half of this,
+    /// so a healthy one-way link does not trip it.
+    pub stale_after: Duration,
     /// How long a replaced session stays readable (for packets still in the
     /// air), counted from the last packet that arrived on it.
     pub previous_grace: Duration,
@@ -98,6 +104,7 @@ impl Default for Config {
             retry_initial: Duration::from_secs(5),
             retry_max: Duration::from_secs(60),
             keepalive: Some(Duration::from_secs(25)),
+            stale_after: Duration::from_secs(30),
             previous_grace: Duration::from_secs(10),
             handshakes_per_second: 20,
             peer_handshake_gap: Duration::from_secs(1),
@@ -127,8 +134,14 @@ impl Config {
         if self.retry_initial.is_zero() || self.retry_max < self.retry_initial {
             return bad("retry_initial must be above zero and not above retry_max");
         }
-        if self.handshakes_per_second == 0 {
-            return bad("handshakes_per_second must be above zero");
+        if self.handshakes_per_second == 0 || self.handshakes_per_second > 100_000 {
+            return bad("handshakes_per_second must be 1 to 100000");
+        }
+        if self.stale_after.is_zero() {
+            return bad("stale_after must be above zero");
+        }
+        if self.reject_after > Duration::from_secs(10 * 365 * 86_400) {
+            return bad("reject_after is over ten years");
         }
         Ok(())
     }

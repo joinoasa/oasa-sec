@@ -113,6 +113,14 @@ struct PeerLink {
     /// Handshakes started because our newest session was never confirmed.
     /// Slows the retries down (backoff); reset when a session is confirmed.
     unconfirmed_rounds: u32,
+    /// When we first sent a payload packet after the last authenticated
+    /// packet we received (None: nothing is waiting for an answer).
+    awaiting_since: Option<Duration>,
+    /// When we first received payload after the last packet we sent (we owe
+    /// the peer a sign of life).
+    owe_ack_since: Option<Duration>,
+    /// We tried to send with no session: start a handshake ourselves.
+    wants_session: Option<Duration>,
     hs: Option<InFlight>,
     current: Option<Session>,
     /// A replaced session and when it last carried a valid packet.
@@ -183,6 +191,9 @@ impl Endpoint {
             initiator_role: false,
             hold_until: Duration::ZERO,
             unconfirmed_rounds: 0,
+            awaiting_since: None,
+            owe_ack_since: None,
+            wants_session: None,
             hs: None,
             current: None,
             previous: None,
@@ -388,9 +399,20 @@ impl Endpoint {
             return Err(SendError::UnknownPeer);
         };
         let Some(cur) = peer.current.as_mut() else {
+            peer.wants_session.get_or_insert(now);
             return Err(SendError::NoSession);
         };
-        let packet = cur.encrypt(now, &self.sh.cfg, plaintext)?;
+        let packet = match cur.encrypt(now, &self.sh.cfg, plaintext) {
+            Ok(p) => p,
+            Err(e) => {
+                if e == SendError::NoSession {
+                    peer.wants_session.get_or_insert(now);
+                }
+                return Err(e);
+            }
+        };
+        peer.awaiting_since.get_or_insert(now);
+        peer.owe_ack_since = None;
         self.sh.stats.sent += 1;
         Ok(packet)
     }
@@ -637,6 +659,8 @@ impl PeerLink {
     /// itself with a valid packet, the old session always stays readable.)
     fn install_current(&mut self, session: Session, now: Duration, from_handshake_2: bool) -> bool {
         let rekey = self.current.is_some();
+        self.awaiting_since = None;
+        self.wants_session = None;
         if let Some(old) = self.current.take()
             && (old.confirmed || self.previous.is_none() || !from_handshake_2)
         {
@@ -651,6 +675,7 @@ impl PeerLink {
             && let Ok(packet) = cur.encrypt(now, &sh.cfg, &[])
         {
             sh.stats.keepalives_sent += 1;
+            self.owe_ack_since = None;
             out.push(Event::Send {
                 packet,
                 to: Dest::Remote,
@@ -710,6 +735,10 @@ impl PeerLink {
         };
         let session_is_initiator = session.initiator;
         session.confirmed = true;
+        self.awaiting_since = None;
+        if !plain.is_empty() {
+            self.owe_ack_since.get_or_insert(now);
+        }
         out.push(Event::Authenticated);
         match slot {
             Slot::Current => {
@@ -773,13 +802,29 @@ impl PeerLink {
             if now >= f.next_retry {
                 start = Some(f.attempt.saturating_add(1));
             }
-        } else if self.initiator_role && now >= self.hold_until {
+        } else if now >= self.hold_until {
+            // Sent payload, heard nothing for too long: the peer may have
+            // restarted, or the counters may have drifted apart (a long
+            // one-way loss). Either side may start over.
+            let stale = self
+                .awaiting_since
+                .is_some_and(|t| now.saturating_sub(t) >= sh.cfg.stale_after);
+            // Whoever made the current session renews it; a side with no
+            // session starts one if it is the dialing side or has data to send.
             match &self.current {
-                None => start = Some(0),
+                None if self.initiator_role => start = Some(0),
+                // Data to send and no session: start one, after giving the
+                // dialing side a moment to do it first.
+                None if self
+                    .wants_session
+                    .is_some_and(|t| now.saturating_sub(t) >= sh.cfg.retry_initial) =>
+                {
+                    start = Some(0)
+                }
+                None => {}
                 Some(c) if c.initiator && c.wants_rekey(now, &sh.cfg) => start = Some(0),
                 // We made this session and the peer has not sent a single valid
-                // packet on it. Its handshake 2 may have been changed on the
-                // way, so ask again, slowing down each time.
+                // packet on it: ask again, slowing down each time.
                 Some(c)
                     if c.initiator
                         && !c.confirmed
@@ -789,8 +834,12 @@ impl PeerLink {
                     self.unconfirmed_rounds = self.unconfirmed_rounds.saturating_add(1);
                     start = Some(self.unconfirmed_rounds);
                 }
+                Some(_) if stale => start = Some(0),
                 Some(_) => {}
             }
+        }
+        if start.is_some() {
+            self.wants_session = None;
         }
         if let Some(attempt) = start
             && self.begin_handshake(sh, taken, now, attempt, out).is_err()
@@ -805,6 +854,15 @@ impl PeerLink {
         // Keepalive.
         if let (Some(every), Some(cur)) = (sh.cfg.keepalive, self.current.as_ref())
             && now.saturating_sub(cur.last_sent) >= every
+        {
+            self.send_keepalive(sh, now, out);
+        }
+        // We received payload and have sent nothing since: say we are alive,
+        // before the peer decides we are not.
+        if self.current.is_some()
+            && self
+                .owe_ack_since
+                .is_some_and(|t| now.saturating_sub(t) >= sh.cfg.stale_after / 2)
         {
             self.send_keepalive(sh, now, out);
         }

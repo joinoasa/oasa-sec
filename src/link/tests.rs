@@ -1093,3 +1093,101 @@ fn an_unconfirmed_session_is_replaced_and_does_not_push_out_the_working_one() {
         vec![b"still on old".to_vec()]
     );
 }
+
+fn handshake_sent(ev: &[Event]) -> bool {
+    ev.iter().any(|e| matches!(e, Event::HandshakeSent { .. }))
+}
+
+#[test]
+fn stale_rule_starts_a_handshake_when_we_sent_and_heard_nothing() {
+    let cfg = Config {
+        keepalive: None,
+        stale_after: Duration::from_secs(30),
+        ..Config::default()
+    };
+    // Either side can be the one that notices, including the responder.
+    for a_sends in [true, false] {
+        let (mut p, t0) = established(cfg.clone());
+        let t1 = t0 + Duration::from_secs(5);
+        let sender = if a_sends { &mut p.a } else { &mut p.b };
+        sender.send(t1, b"hello").unwrap();
+        assert!(!handshake_sent(
+            &sender.poll_timers(t1 + Duration::from_secs(29))
+        ));
+        let ev = sender.poll_timers(t1 + Duration::from_secs(30));
+        assert!(handshake_sent(&ev), "a_sends={a_sends}");
+        // The new handshake works and replaces the session.
+        let hs1 = sends(&ev).remove(0);
+        let (other, me) = if a_sends {
+            (&mut p.b, &mut p.a)
+        } else {
+            (&mut p.a, &mut p.b)
+        };
+        let t2 = t1 + Duration::from_secs(30);
+        let hs2 = sends(&other.handle_packet(t2, &hs1)).remove(0);
+        let ev = me.handle_packet(t2, &hs2);
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, Event::SessionEstablished { rekey: true, .. }))
+        );
+    }
+}
+
+#[test]
+fn hearing_from_the_peer_clears_the_stale_timer() {
+    let cfg = Config {
+        keepalive: None,
+        ..Config::default()
+    };
+    let (mut p, t0) = established(cfg);
+    let t1 = t0 + Duration::from_secs(5);
+    let pkt = p.a.send(t1, b"x").unwrap();
+    p.b.handle_packet(t1, &pkt);
+    let back = p.b.send(t1 + Duration::from_secs(10), b"y").unwrap();
+    p.a.handle_packet(t1 + Duration::from_secs(10), &back);
+    assert!(!handshake_sent(
+        &p.a.poll_timers(t1 + Duration::from_secs(60))
+    ));
+}
+
+#[test]
+fn a_side_with_no_session_starts_one_when_it_has_data() {
+    let mut p = pair(Config::default());
+    // The responder side has something to say first.
+    assert_eq!(p.b.send(ms(0), b"hi"), Err(SendError::NoSession));
+    // The dialing side gets a moment to go first.
+    assert!(!handshake_sent(&p.b.poll_timers(ms(500))));
+    let ev = p.b.poll_timers(Config::default().retry_initial);
+    assert!(handshake_sent(&ev));
+    let hs1 = sends(&ev).remove(0);
+    let t = Config::default().retry_initial;
+    let hs2 = sends(&p.a.handle_packet(t, &hs1)).remove(0);
+    let ev = p.b.handle_packet(t, &hs2);
+    assert!(ev.contains(&Event::SessionEstablished {
+        initiator: true,
+        rekey: false
+    }));
+    assert!(p.b.can_send());
+}
+
+#[test]
+fn a_side_that_only_receives_sends_a_keepalive_before_the_peer_gives_up() {
+    let cfg = Config {
+        keepalive: None,
+        stale_after: Duration::from_secs(30),
+        ..Config::default()
+    };
+    let (mut p, t0) = established(cfg);
+    let t1 = t0 + Duration::from_secs(1);
+    let pkt = p.a.send(t1, b"one way").unwrap();
+    p.b.handle_packet(t1, &pkt);
+    assert!(sends(&p.b.poll_timers(t1 + Duration::from_secs(14))).is_empty());
+    let ev = p.b.poll_timers(t1 + Duration::from_secs(15));
+    let ka = sends(&ev);
+    assert_eq!(ka.len(), 1);
+    // That keepalive tells A the link is alive, so A never goes stale.
+    p.a.handle_packet(t1 + Duration::from_secs(15), &ka[0]);
+    assert!(!handshake_sent(
+        &p.a.poll_timers(t1 + Duration::from_secs(80))
+    ));
+}
