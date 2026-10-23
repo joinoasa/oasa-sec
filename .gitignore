@@ -1,0 +1,5 @@
+/target
+*.key
+mavlink-signing-key.bin
+trusted-peers
+__pycache__/
