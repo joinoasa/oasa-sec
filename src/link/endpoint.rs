@@ -344,7 +344,13 @@ impl Endpoint {
             self.drop_packet(DropReason::UntrustedPeer, out);
             return;
         };
-        let Some(ts) = Timestamp::from_bytes(&payload[..n]) else {
+        // Payload: 12-byte timestamp, then the initiator's index, which must
+        // be the one in the clear header. Checked before anything is recorded.
+        let parsed = (n == Timestamp::LEN + 2)
+            .then(|| Timestamp::from_bytes(&payload[..Timestamp::LEN]))
+            .flatten()
+            .filter(|_| u16::from_be_bytes([payload[12], payload[13]]) == sender);
+        let Some(ts) = parsed else {
             self.drop_packet(DropReason::BadHeader, out);
             return;
         };
@@ -453,7 +459,10 @@ impl PeerLink {
             .and_then(|b| b.build_initiator())
             .map_err(Error::from)?;
         let mut buf = [0u8; 128];
-        let n = hs.write_message(&ts.to_bytes(), &mut buf)?;
+        let mut payload = [0u8; Timestamp::LEN + 2];
+        payload[..Timestamp::LEN].copy_from_slice(&ts.to_bytes());
+        payload[Timestamp::LEN..].copy_from_slice(&index.to_be_bytes());
+        let n = hs.write_message(&payload, &mut buf)?;
         // Save before the packet can leave: a crash must never let us send
         // an older timestamp later.
         let mut next = self.stamps;
@@ -513,7 +522,10 @@ impl PeerLink {
             return;
         };
         let mut buf = [0u8; 64];
-        let n = match hs.write_message(&[], &mut buf) {
+        let mut payload = [0u8; 4];
+        payload[..2].copy_from_slice(&index.to_be_bytes());
+        payload[2..].copy_from_slice(&remote_index.to_be_bytes());
+        let n = match hs.write_message(&payload, &mut buf) {
             Ok(n) => n,
             Err(_) => {
                 out.push(Event::Failure("could not answer a handshake"));
@@ -559,11 +571,20 @@ impl PeerLink {
             out.push(Event::Dropped(DropReason::UnknownIndex));
             return;
         };
-        let mut payload = [0u8; 16];
+        let mut payload = [0u8; 32];
         match f.state.read_message(noise, &mut payload) {
-            Ok(0) if f.state.is_handshake_finished() => {}
+            // Payload: the responder's index, then ours. Both must equal the
+            // ones in the clear header (the receiver index is what routed
+            // the packet here).
+            Ok(4)
+                if f.state.is_handshake_finished()
+                    && u16::from_be_bytes([payload[0], payload[1]]) == remote_index
+                    && u16::from_be_bytes([payload[2], payload[3]]) == f.local_index => {}
             Ok(_) => {
-                // Authenticated but not what the spec says: abandon it.
+                // Authentic Noise but the clear indexes were changed (or the
+                // payload is wrong). snow has used up this handshake, so the
+                // retry timer starts a new one; nothing was installed.
+                self.hs = Some(f);
                 sh.stats.count_drop(DropReason::BadHeader);
                 out.push(Event::Dropped(DropReason::BadHeader));
                 return;

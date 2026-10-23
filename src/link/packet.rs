@@ -13,10 +13,10 @@ const TYPE_DATA: u8 = 3;
 /// Poly1305 tag. Never shortened.
 pub const TAG_LEN: usize = 16;
 
-/// Noise message 1: 32 (e) + 48 (encrypted s) + 12 + 16 (encrypted timestamp).
-const NOISE1_LEN: usize = 108;
-/// Noise message 2: 32 (e) + 16 (tag of the empty payload).
-const NOISE2_LEN: usize = 48;
+/// Noise message 1: 32 (e) + 48 (encrypted s) + 14 + 16 (encrypted timestamp and sender index).
+const NOISE1_LEN: usize = 110;
+/// Noise message 2: 32 (e) + 4 + 16 (encrypted sender and receiver index).
+const NOISE2_LEN: usize = 52;
 
 /// Handshake 1 on the wire: header, sender index, Noise message 1.
 pub const HANDSHAKE1_LEN: usize = 1 + 2 + NOISE1_LEN;
@@ -179,8 +179,8 @@ mod tests {
 
     #[test]
     fn sizes_match_the_spec() {
-        assert_eq!(HANDSHAKE1_LEN, 111);
-        assert_eq!(HANDSHAKE2_LEN, 53);
+        assert_eq!(HANDSHAKE1_LEN, 113);
+        assert_eq!(HANDSHAKE2_LEN, 57);
         assert_eq!(data_overhead(CounterLen::Short), 21);
         assert_eq!(data_overhead(CounterLen::Long), 23);
     }
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn handshakes_round_trip() {
         let p = encode_handshake1(0x0102, &[9u8; NOISE1_LEN]);
-        assert_eq!(p.len(), 111);
+        assert_eq!(p.len(), 113);
         assert_eq!(
             parse(&p, MTU).unwrap(),
             Packet::Handshake1 {
@@ -222,7 +222,7 @@ mod tests {
             }
         );
         let p = encode_handshake2(1, 2, &[5u8; NOISE2_LEN]);
-        assert_eq!(p.len(), 53);
+        assert_eq!(p.len(), 57);
         assert_eq!(
             parse(&p, MTU).unwrap(),
             Packet::Handshake2 {

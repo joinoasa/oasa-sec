@@ -591,14 +591,14 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
     let hs1_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 111)
+        .find(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 113)
         .unwrap()
         .1
         .clone();
     let hs2_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 53)
+        .find(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 57)
         .unwrap()
         .1
         .clone();
@@ -612,7 +612,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs1s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 111)
+                .filter(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 113)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs1s {
@@ -630,7 +630,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs2s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 53)
+                .filter(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 57)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs2s {
@@ -821,10 +821,10 @@ fn forged_handshake_2_does_not_spoil_the_real_one() {
     let mut forged = vec![0x20u8, 0x12, 0x34];
     forged.extend_from_slice(&a_index.to_be_bytes());
     let mut r = Rng(1);
-    let mut noise = [0u8; 48];
+    let mut noise = [0u8; 52];
     r.fill(&mut noise);
     forged.extend_from_slice(&noise);
-    assert_eq!(forged.len(), 53);
+    assert_eq!(forged.len(), 57);
     let ev = sim.inject(Side::A, &forged);
     assert!(ev.contains(&Event::Dropped(DropReason::BadTag)));
     assert_eq!(sim.logs[&Side::A].replies_to_injected, 0);
@@ -885,7 +885,7 @@ fn sizes_on_the_wire_match_the_spec() {
             .filter(|(_, p)| p[0] == 0x10 || p[0] == 0x20)
             .map(|(_, p)| p.len())
             .collect();
-        assert_eq!(handshakes, vec![111, 53]);
+        assert_eq!(handshakes, vec![113, 57]);
         let min_data = sim
             .wire
             .iter()
@@ -903,8 +903,8 @@ fn sizes_on_the_wire_match_the_spec() {
 
 #[test]
 fn a_handshake_2_changed_on_the_way_costs_seconds_not_minutes() {
-    // The responder's index in handshake 2 has no tag of its own. Changing it
-    // used to leave the initiator sending into the void until the next rekey.
+    // The indexes in handshake 2 are inside the Noise payload, so a changed
+    // clear index is refused (bad_header) and the timer simply tries again.
     for seed in 1..=3u64 {
         let mut sim = Sim::new(seed, config(CounterLen::Short), Channel::clean());
         sim.tamper_hs2 = 2; // the first two attempts (the second a retry)
@@ -913,7 +913,7 @@ fn a_handshake_2_changed_on_the_way_costs_seconds_not_minutes() {
         sim.drain();
         sim.check_delivery_integrity();
         sim.check_accounting();
-        // Two bad sessions were noticed and replaced, and then it worked.
+        // Two changed handshake 2 packets were refused, and then it worked.
         let first = sim.logs[&Side::B].established[0].0;
         assert!(
             first < Duration::from_secs(25),
@@ -933,6 +933,6 @@ fn a_handshake_2_changed_on_the_way_costs_seconds_not_minutes() {
             Duration::from_secs(90),
         );
         assert!(gap < 1.0, "seed {seed}: {gap}");
-        assert!(sim.stats(Side::B).dropped(DropReason::UnknownIndex) >= 1);
+        assert!(sim.stats(Side::A).dropped(DropReason::BadHeader) >= 1);
     }
 }

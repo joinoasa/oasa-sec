@@ -104,10 +104,10 @@ pub(super) fn established(cfg: Config) -> (Pair, Duration) {
     let now = ms(10);
     let ev = p.a.start_handshake(now).unwrap();
     let hs1 = sends(&ev).remove(0);
-    assert_eq!(hs1.len(), 111);
+    assert_eq!(hs1.len(), 113);
     let ev = p.b.handle_packet(now, &hs1);
     let hs2 = sends(&ev).remove(0);
-    assert_eq!(hs2.len(), 53);
+    assert_eq!(hs2.len(), 57);
     let ev = p.a.handle_packet(now, &hs2);
     assert!(ev.contains(&Event::SessionEstablished {
         initiator: true,
@@ -307,15 +307,8 @@ fn handshake_packets_with_flipped_bits_get_no_reply() {
             // A fresh responder each time keeps rate limits out of this test.
             let mut b = fresh_responder(&p);
             let ev = b.handle_packet(ms(5), &bad);
-            if byte == 1 || byte == 2 {
-                // The sender index is not authenticated (it only says where
-                // the reply's "receiver" field points), so this one is
-                // accepted. The reply then carries the changed index.
-                assert_eq!(sends(&ev).len(), 1);
-            } else {
-                assert!(sends(&ev).is_empty(), "byte {byte} bit {bit}: {ev:?}");
-                assert_eq!(drops(&ev).len(), 1);
-            }
+            assert!(sends(&ev).is_empty(), "byte {byte} bit {bit}: {ev:?}");
+            assert_eq!(drops(&ev).len(), 1);
         }
     }
 }
@@ -552,7 +545,7 @@ fn only_the_initiator_rekeys_and_only_when_due() {
         retry: false,
         rekey: true
     }));
-    assert_eq!(sends(&ev)[0].len(), 111);
+    assert_eq!(sends(&ev)[0].len(), 113);
 }
 
 #[test]
@@ -972,37 +965,64 @@ fn ciphertext_does_not_contain_the_plaintext() {
 }
 
 #[test]
-fn a_changed_handshake_2_is_noticed_and_the_link_recovers() {
-    // The sender index in handshake 2 is not covered by the Noise tags. An
-    // attacker on the path can change it: the initiator then sends to an
-    // index the responder does not have. The initiator must notice that no
-    // packet ever comes back, and ask again.
+fn changed_handshake_indexes_are_refused_without_side_effects() {
+    // Handshake 1: the clear sender index must equal the encrypted one.
     let mut p = pair(Config::default());
     let hs1 = sends(&p.a.start_handshake(ms(0)).unwrap()).remove(0);
-    let mut hs2 = sends(&p.b.handle_packet(ms(0), &hs1)).remove(0);
-    hs2[1] ^= 0x55; // the responder's index, as the initiator will use it
-    let ev = p.a.handle_packet(ms(10), &hs2);
+    for byte in [1usize, 2] {
+        let mut bad = hs1.clone();
+        bad[byte] ^= 0x5A;
+        let ev = p.b.handle_packet(ms(0), &bad);
+        assert_eq!(drops(&ev), vec![DropReason::BadHeader]);
+        assert!(sends(&ev).is_empty());
+    }
+    // Nothing was recorded: the real one is still accepted at once (no
+    // stale timestamp, no per-peer allowance used).
+    let ev = p.b.handle_packet(ms(10), &hs1);
+    assert_eq!(sends(&ev).len(), 1);
+    assert_eq!(p.b.stats().dropped(DropReason::StaleHandshake), 0);
+    assert_eq!(p.b.stats().dropped(DropReason::RateLimited), 0);
+    let hs2 = sends(&ev).remove(0);
+
+    // Handshake 2: either clear index changed: dropped, no session.
+    for byte in [1usize, 2, 3, 4] {
+        let mut q = pair(Config::default());
+        let h1 = sends(&q.a.start_handshake(ms(0)).unwrap()).remove(0);
+        let mut h2 = sends(&q.b.handle_packet(ms(0), &h1)).remove(0);
+        h2[byte] ^= 0x5A;
+        let ev = q.a.handle_packet(ms(10), &h2);
+        let d = drops(&ev);
+        // A changed receiver index may also simply not match any handshake.
+        assert!(
+            d == vec![DropReason::BadHeader] || (byte >= 3 && d == vec![DropReason::UnknownIndex]),
+            "byte {byte}: {d:?}"
+        );
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, Event::SessionEstablished { .. }))
+        );
+        assert!(sends(&ev).is_empty());
+        assert!(!q.a.can_send());
+    }
+    // The untouched hs2 still completes (with the first pair).
+    let ev = p.a.handle_packet(ms(20), &hs2);
     assert!(
         ev.iter()
             .any(|e| matches!(e, Event::SessionEstablished { .. }))
     );
-    let ka = sends(&ev).remove(0);
-    // The responder drops everything the initiator sends on this session.
+}
+
+#[test]
+fn a_changed_handshake_2_is_retried_by_the_timer() {
+    let mut p = pair(Config::default());
+    let hs1 = sends(&p.a.start_handshake(ms(0)).unwrap()).remove(0);
+    let mut hs2 = sends(&p.b.handle_packet(ms(0), &hs1)).remove(0);
+    hs2[1] ^= 0x55;
     assert_eq!(
-        drops(&p.b.handle_packet(ms(10), &ka)),
-        vec![DropReason::UnknownIndex]
+        drops(&p.a.handle_packet(ms(10), &hs2)),
+        vec![DropReason::BadHeader]
     );
-    let data = p.a.send(ms(20), b"lost").unwrap();
-    assert_eq!(
-        drops(&p.b.handle_packet(ms(20), &data)),
-        vec![DropReason::UnknownIndex]
-    );
-    // Not yet: the initiator waits as long as a handshake retry would.
-    assert!(sends(&p.a.poll_timers(ms(4000))).is_empty());
-    // Then it starts over, and this time nothing is changed.
-    let ev = p.a.poll_timers(ms(5100));
-    let hs1 = sends(&ev).remove(0);
-    assert_eq!(hs1.len(), 111);
+    let hs1 = sends(&p.a.poll_timers(ms(5100))).remove(0);
     let hs2 = sends(&p.b.handle_packet(ms(5200), &hs1)).remove(0);
     let ka = sends(&p.a.handle_packet(ms(5300), &hs2)).remove(0);
     p.b.handle_packet(ms(5300), &ka);
@@ -1011,33 +1031,30 @@ fn a_changed_handshake_2_is_noticed_and_the_link_recovers() {
         delivered(&p.b.handle_packet(ms(5400), &data)),
         vec![b"through".to_vec()]
     );
-    let back = p.b.send(ms(5500), b"back").unwrap();
-    assert_eq!(
-        delivered(&p.a.handle_packet(ms(5500), &back)),
-        vec![b"back".to_vec()]
-    );
-    // A confirmed session is left alone.
-    assert!(sends(&p.a.poll_timers(ms(60_000))).is_empty() || p.a.stats().handshakes_sent == 2);
 }
 
 #[test]
-fn an_unconfirmed_session_does_not_push_out_the_working_one() {
+fn an_unconfirmed_session_is_replaced_and_does_not_push_out_the_working_one() {
     let (mut p, t0) = established(Config::default());
-    // Confirmed old session: b sends something so a has seen data on it.
     let first = p.b.send(t0, b"hello").unwrap();
-    p.a.handle_packet(t0, &first);
+    p.a.handle_packet(t0, &first); // a has seen data on the old session
     let old_b = index_of(&first);
-    // A rekey whose handshake 2 is tampered with.
+    // Rekey: a gets hs2, but nothing it sends on the new session reaches b.
     let t = t0 + Duration::from_secs(2);
     let hs1 = sends(&p.a.start_handshake(t).unwrap()).remove(0);
-    let mut hs2 = sends(&p.b.handle_packet(t, &hs1)).remove(0);
-    hs2[1] ^= 0x55;
-    p.a.handle_packet(t, &hs2);
-    // b keeps sending on the old session; a must still read it.
-    let still = p.b.send(t + ms(100), b"still on old").unwrap();
+    let hs2 = sends(&p.b.handle_packet(t, &hs1)).remove(0);
+    p.a.handle_packet(t, &hs2); // keepalive lost
+    assert!(sends(&p.a.poll_timers(t + ms(4900))).is_empty());
+    // After the retry time with no valid packet back, a asks again.
+    let t2 = t + ms(5100);
+    let hs1 = sends(&p.a.poll_timers(t2)).remove(0);
+    let hs2 = sends(&p.b.handle_packet(t2, &hs1)).remove(0);
+    p.a.handle_packet(t2, &hs2); // keepalive lost again
+    // b still sends on its old session; a must still read it.
+    let still = p.b.send(t2 + ms(100), b"still on old").unwrap();
     assert_eq!(index_of(&still), old_b);
     assert_eq!(
-        delivered(&p.a.handle_packet(t + ms(100), &still)),
+        delivered(&p.a.handle_packet(t2 + ms(100), &still)),
         vec![b"still on old".to_vec()]
     );
 }

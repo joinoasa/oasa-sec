@@ -95,7 +95,7 @@ Two ways in:
 ## 8. Tested
 
 - L0: unit tests, counter rebuilding edge cases, replay window, hostile headers.
-- L1: two endpoints through a seeded simulated channel with loss, delay, reordering, duplicates and replayed or changed packets; rekey under loss; untrusted peers ignored; captured packets checked for the plaintext.
+- L1: two endpoints through a seeded simulated channel with loss, delay, reordering, duplicates and replayed or changed packets; rekey under loss; changed handshake indexes refused; untrusted peers ignored; captured packets checked for the plaintext.
 - L2: real `oasa-link` processes over localhost UDP (`scripts/link-e2e.sh`): marked packets both ways, a rekey, a restart from a new port, junk and an untrusted device getting no reply, and the stats output.
 - Not tested: real radios, long runs, and independent review.
 
