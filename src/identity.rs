@@ -13,6 +13,9 @@ use crate::{Error, PAIRING_NOISE, Result};
 /// File name of the private key inside a device's key directory.
 pub const PRIVATE_KEY_FILE: &str = "identity.key";
 
+/// File name of the device's own name inside its key directory. Not secret.
+pub const NAME_FILE: &str = "device-name";
+
 /// A device identity. The private key is wiped from memory when dropped.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Identity {
@@ -75,6 +78,54 @@ impl Identity {
         let bytes = read_private_file(&dir.join(PRIVATE_KEY_FILE))?;
         Self::from_private_bytes(&bytes)
     }
+}
+
+/// The name this device calls itself, if one was saved (by `oasa-pair init
+/// --name`, or the first time it paired).
+pub fn device_name(dir: &Path) -> Result<Option<String>> {
+    let path = dir.join(NAME_FILE);
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let bytes = read_private_file(&path)?;
+    let name = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::BadKeyFile("device name is not UTF-8".into()))?
+        .trim_end()
+        .to_string();
+    crate::pairing::check_name(&name).map_err(|_| Error::BadKeyFile("bad device name".into()))?;
+    Ok(Some(name))
+}
+
+/// Save the device name. Never changes a name that is already saved: a
+/// different name is an error, the same name is fine.
+pub fn save_device_name(dir: &Path, name: &str) -> Result<()> {
+    crate::pairing::check_name(name)?;
+    match device_name(dir)? {
+        Some(existing) if existing == name => Ok(()),
+        Some(existing) => Err(Error::BadKeyFile(format!(
+            "this device is already named {existing}"
+        ))),
+        None => {
+            match write_new_private_file(&dir.join(NAME_FILE), format!("{name}\n").as_bytes()) {
+                // Lost a race with a second process that saved the same name.
+                Err(Error::BadKeyFile(_)) => save_device_name_again(dir, name),
+                r => r,
+            }
+        }
+    }
+}
+
+fn save_device_name_again(dir: &Path, name: &str) -> Result<()> {
+    match device_name(dir)? {
+        Some(existing) if existing == name => Ok(()),
+        _ => Err(Error::BadKeyFile("this device is already named".into())),
+    }
+}
+
+/// A name for a device that was never given one: `device-` and the first
+/// four bytes of its public key in hex. Valid under the name rules.
+pub fn default_device_name(public: &[u8; 32]) -> String {
+    format!("device-{}", data_encoding::HEXLOWER.encode(&public[..4]))
 }
 
 /// Human-checkable fingerprint of a public key: the first 10 bytes of
@@ -150,6 +201,21 @@ mod tests {
         let path = dir.join(PRIVATE_KEY_FILE);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(Identity::load(&dir), Err(Error::BadKeyFile(_))));
+    }
+
+    #[test]
+    fn device_name_is_saved_once() {
+        let dir = crate::files::tempdir("name");
+        assert_eq!(device_name(&dir).unwrap(), None);
+        save_device_name(&dir, "gcs-1").unwrap();
+        assert_eq!(device_name(&dir).unwrap().as_deref(), Some("gcs-1"));
+        save_device_name(&dir, "gcs-1").unwrap();
+        assert!(save_device_name(&dir, "other").is_err());
+        assert!(save_device_name(&dir, "bad name").is_err());
+        assert_eq!(device_name(&dir).unwrap().as_deref(), Some("gcs-1"));
+        let default = default_device_name(&[0xAB; 32]);
+        assert_eq!(default, "device-abababab");
+        assert!(crate::pairing::check_name(&default).is_ok());
     }
 
     #[test]

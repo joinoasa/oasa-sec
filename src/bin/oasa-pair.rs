@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use mavlink::dialects::common::{COMMAND_LONG_DATA, MavCmd, MavMessage, MavResult};
 use mavlink::{MavConnection, MavHeader};
 use oasa_sec::code::PairingCode;
-use oasa_sec::identity::{Identity, fingerprint};
+use oasa_sec::identity::{self, Identity, fingerprint};
 use oasa_sec::pairing::{DeadlineStream, check_name, pair_as_drone, pair_as_ground};
 use oasa_sec::signing::{AUTOPILOT_KEY_FILE, SigningKey, peer_key_path};
 use oasa_sec::store;
@@ -21,17 +21,27 @@ const USAGE: &str = "\
 oasa-pair: OASA-SEC v0 pairing prototype (R-SEC1). Do not fly with it.
 
 USAGE:
-  oasa-pair init     --dir DIR
+  oasa-pair init     --dir DIR [--name NAME]
   oasa-pair drone    --dir DIR --name NAME --listen HOST:PORT
                      [--autopilot MAVLINK_ADDR] [--target SYS:COMP] [--wait SECONDS]
   oasa-pair ground   --dir DIR --name NAME --connect HOST:PORT
                      [--code-file FILE | --code -] [--expect-drone FINGERPRINT]
+  oasa-pair show     --dir DIR
+  oasa-pair trust    --dir DIR --name PEERNAME --key HEX64
   oasa-pair peers    --dir DIR
   oasa-pair remove   --dir DIR FINGERPRINT
   oasa-pair command  --dir DIR --to MAVLINK_ADDR [--peer NAME|FINGERPRINT]
                      [--target SYS:COMP] [--link-id N] [--wait SECONDS]
 
   init      Make this device's identity (once per device) and print its fingerprint.
+            --name saves the name this device calls itself (also saved the first
+            time it pairs).
+  show      Print this device's name, public key (64 hex characters) and fingerprint
+            as one line of JSON. Public information only; never the private key.
+  trust     Trust a device without pairing, like adding a WireGuard peer: give its
+            name and public key (from its `show`), and compare the printed fingerprint
+            with the one on that device, out loud, before using the link. For relays and
+            test nodes that have no autopilot to pair with.
   drone     Show a one-time pairing code (text and QR) and wait for a ground station
             to pair. The first ground station sends a new signing key; with
             --autopilot the drone loads it into the autopilot, checks that it works,
@@ -82,6 +92,8 @@ fn run(args: &[String]) -> R {
         "init" => init(&opts),
         "drone" => drone(&opts),
         "ground" => ground(&opts),
+        "show" => show(&opts),
+        "trust" => trust(&opts),
         "peers" => peers(&opts),
         "remove" => remove(&opts),
         "command" => command(&opts),
@@ -94,9 +106,89 @@ fn run(args: &[String]) -> R {
 }
 
 fn init(o: &Opts) -> R {
-    let (id, created) = Identity::load_or_create(&o.dir()?)?;
+    let dir = o.dir()?;
+    let name = o.get("name").map(check_given_name).transpose()?;
+    let (id, created) = Identity::load_or_create(&dir)?;
+    if let Some(name) = name {
+        identity::save_device_name(&dir, name)?;
+    }
     let word = if created { "Created" } else { "Existing" };
     println!("{word} identity {}", id.fingerprint());
+    Ok(())
+}
+
+/// A name given on the command line, checked against the name rules.
+fn check_given_name(n: &str) -> R<&str> {
+    check_name(n)?;
+    Ok(n)
+}
+
+/// Print this device's public details as JSON. The name is only letters,
+/// digits and `-_.`, so it needs no escaping.
+fn show(o: &Opts) -> R {
+    let dir = o.dir()?;
+    let id = Identity::load(&dir)
+        .map_err(|e| format!("{e} (run `oasa-pair init --dir {}` first)", dir.display()))?;
+    let name = identity::device_name(&dir)?
+        .unwrap_or_else(|| identity::default_device_name(id.public_key()));
+    println!(
+        "{{\"name\":\"{name}\",\"public_key\":\"{}\",\"fingerprint\":\"{}\"}}",
+        data_encoding::HEXLOWER.encode(id.public_key()),
+        id.fingerprint()
+    );
+    Ok(())
+}
+
+/// Add a trusted peer by name and public key.
+fn trust(o: &Opts) -> R {
+    let dir = o.dir()?;
+    let name = o.name()?;
+    let hex = o.req("key")?.trim().to_ascii_lowercase();
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(
+            "--key must be 64 hexadecimal characters (the public_key from `oasa-pair show`)".into(),
+        );
+    }
+    let bytes = data_encoding::HEXLOWER.decode(hex.as_bytes())?;
+    let public: [u8; 32] = bytes.try_into().map_err(|_| "--key must be 32 bytes")?;
+    let me = Identity::load(&dir)
+        .map_err(|e| format!("{e} (run `oasa-pair init --dir {}` first)", dir.display()))?;
+    if &public == me.public_key() {
+        return Err("that is this device's own key; a device cannot trust itself".into());
+    }
+    let peer = store::Peer { public, name };
+    for p in store::load(&dir)? {
+        if p == peer {
+            println!("Already trusted: {} {}", peer.name, peer.fingerprint());
+            return Ok(());
+        }
+        if p.public == peer.public {
+            return Err(format!(
+                "that key is already trusted as {}; remove it first (oasa-pair remove {})",
+                p.name,
+                p.fingerprint()
+            )
+            .into());
+        }
+        if p.name == peer.name {
+            return Err(format!(
+                "the name {} is already used by {}; pick another name or remove that device first",
+                p.name,
+                p.fingerprint()
+            )
+            .into());
+        }
+    }
+    store::add(&dir, &peer)?;
+    println!(
+        "Trusted {} {}\nCheck that this fingerprint matches the one shown on that device.",
+        peer.name,
+        peer.fingerprint()
+    );
     Ok(())
 }
 
@@ -105,6 +197,7 @@ fn drone(o: &Opts) -> R {
     let name = o.name()?;
     let window = Duration::from_secs(o.get("wait").map(str::parse).transpose()?.unwrap_or(300));
     let (me, _) = Identity::load_or_create(&dir)?;
+    remember_name(&dir, &name);
     let key_path = dir.join(AUTOPILOT_KEY_FILE);
     let current_key = if key_path.exists() {
         Some(SigningKey::load(&key_path)?)
@@ -182,6 +275,16 @@ fn drone(o: &Opts) -> R {
     Ok(())
 }
 
+/// The first name a device pairs under becomes its saved name, so `show` and
+/// the peers it later pairs with agree. An existing name is never changed.
+fn remember_name(dir: &Path, name: &str) {
+    if let Ok(None) = identity::device_name(dir)
+        && let Err(e) = identity::save_device_name(dir, name)
+    {
+        eprintln!("note: could not save the device name: {e}");
+    }
+}
+
 /// Load a brand-new key into the autopilot, prove it works with a signed
 /// round trip, and only then save it. If anything fails, nothing is saved.
 fn install_key(o: &Opts, key: &SigningKey, key_path: &Path) -> oasa_sec::Result<()> {
@@ -226,6 +329,7 @@ fn ground(o: &Opts) -> R {
         );
     }
     let (me, _) = Identity::load_or_create(&dir)?;
+    remember_name(&dir, &name);
 
     println!(
         "Pairing with drone {drone_fp} at {addr}. Check this matches the drone's screen or label."
