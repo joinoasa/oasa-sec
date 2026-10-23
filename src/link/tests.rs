@@ -124,7 +124,7 @@ pub(super) fn established_with(cfg_a: Config, cfg_b: Config) -> (Pair, Duration)
     }));
     // The initiator's keepalive makes the responder switch.
     let ka = sends(&ev).remove(0);
-    assert_eq!(ka.len(), data_overhead(cl));
+    assert_eq!(ka.len(), keepalive_len(cl));
     let ev = p.b.handle_packet(now, &ka);
     assert!(ev.contains(&Event::SessionEstablished {
         initiator: false,
@@ -164,15 +164,15 @@ fn send_refuses_empty_oversized_and_no_session() {
     assert_eq!(p.a.send(ms(0), b"x"), Err(SendError::NoSession));
     let (mut p, now) = established(Config::default());
     assert_eq!(p.a.send(now, b""), Err(SendError::Empty));
-    assert!(p.a.send(now, &[0u8; 107]).is_ok());
-    assert_eq!(p.a.send(now, &[0u8; 108]), Err(SendError::TooLarge));
+    assert!(p.a.send(now, &[0u8; 106]).is_ok());
+    assert_eq!(p.a.send(now, &[0u8; 107]), Err(SendError::TooLarge));
     let long = Config {
         counter_len: CounterLen::Long,
         ..Config::default()
     };
     let (mut p, now) = established(long);
-    assert!(p.a.send(now, &[0u8; 105]).is_ok());
-    assert_eq!(p.a.send(now, &[0u8; 106]), Err(SendError::TooLarge));
+    assert!(p.a.send(now, &[0u8; 104]).is_ok());
+    assert_eq!(p.a.send(now, &[0u8; 105]), Err(SendError::TooLarge));
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn truncated_and_extended_data_packets_are_dropped() {
     longer.push(0);
     let ev = p.b.handle_packet(now, &longer);
     assert_eq!(drops(&ev), vec![DropReason::BadTag]);
-    let ev = p.b.handle_packet(now, &vec![0x30u8; 5000]);
+    let ev = p.b.handle_packet(now, &vec![0x31u8; 5000]);
     assert_eq!(drops(&ev), vec![DropReason::BadHeader]);
 }
 
@@ -248,7 +248,7 @@ fn random_bytes_are_dropped_and_never_answered() {
         rng.fill(&mut buf);
         // Make a third of them look like real headers.
         if len > 0 && rng.next().is_multiple_of(3) {
-            buf[0] = [0x10, 0x20, 0x30, 0x38][(rng.next() % 4) as usize];
+            buf[0] = [0x11, 0x21, 0x31, 0x39][(rng.next() % 4) as usize];
         }
         let ev = p.b.handle_packet(now + ms(count * 10), &buf);
         assert!(delivered(&ev).is_empty());
@@ -272,7 +272,7 @@ fn wrong_index_and_wrong_version_and_reserved_types() {
         let ev = p.b.handle_packet(now, &bad);
         assert_eq!(drops(&ev), vec![DropReason::UnknownIndex], "index {idx}");
     }
-    for v in 1..8u8 {
+    for v in (0..8u8).filter(|v| *v != VERSION) {
         let mut bad = good.clone();
         bad[0] = (bad[0] & !7) | v;
         assert_eq!(
@@ -1483,5 +1483,180 @@ fn a_handshake_2_with_a_different_encrypted_receiver_index_is_bad_header() {
         );
         assert!(sends(&ev).is_empty());
         assert_eq!(ep.send(id, ms(6), b"x"), Err(SendError::NoSession));
+    }
+}
+
+// ---- wire version 1 and the content type byte (spec sections 2 and 3) ----
+
+#[test]
+fn version_0_packets_are_dropped_as_bad_header() {
+    let (mut p, now) = established(Config::default());
+    let data = p.a.send(now, b"x").unwrap();
+    let hs1 = sends(&p.a.start_handshake(now + ms(1)).unwrap()).remove(0);
+    let mut hs2 = encode_handshake2_for_test();
+    for pkt in [&data, &hs1, &mut hs2] {
+        let mut old = pkt.clone();
+        old[0] &= !7; // version 0
+        let ev = p.b.handle_packet(now, &old);
+        assert_eq!(drops(&ev), vec![DropReason::BadHeader]);
+        assert!(sends(&ev).is_empty());
+    }
+    // The real data packet is untouched by all that.
+    assert_eq!(delivered(&p.b.handle_packet(now, &data)).len(), 1);
+}
+
+fn encode_handshake2_for_test() -> Vec<u8> {
+    packet::encode_handshake2_for_tests()
+}
+
+#[test]
+fn a_v0_handshake_cannot_complete() {
+    // Same keys, same pattern, but the old prologue and the old mac1 label:
+    // the responder refuses it without a reply.
+    let p = pair(Config::default());
+    let ia = Identity::from_private_bytes(&p.a_key).unwrap();
+    let ib = Identity::from_private_bytes(&p.b_key).unwrap();
+    let build = |prologue: &[u8]| {
+        let mut hs = snow::Builder::new(LINK_NOISE.parse().unwrap())
+            .local_private_key(ia.private_key())
+            .unwrap()
+            .remote_public_key(ib.public_key())
+            .unwrap()
+            .prologue(prologue)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut buf = [0u8; 128];
+        let n = hs.write_message(&[1u8; 14], &mut buf).unwrap();
+        packet::encode_handshake1(ib.public_key(), &buf[..n])
+    };
+    // Control: with the v1 prologue the same code makes a handshake that is
+    // answered, so only the prologue differs below.
+    let mut b = fresh_responder(&p);
+    let ev = b.handle_packet(ms(5), &build(LINK_PROLOGUE));
+    assert_eq!(sends(&ev).len(), 1);
+    let mut b = fresh_responder(&p);
+    let ev = b.handle_packet(ms(5), &build(b"OASA-SEC v0 link"));
+    assert!(sends(&ev).is_empty());
+    assert_eq!(drops(&ev), vec![DropReason::BadTag]);
+    // The mac1 label changed too: a v0 mac1 does not pass.
+    let mut v0_mac = build(LINK_PROLOGUE);
+    let tag = {
+        use blake2::{Blake2s256, Digest};
+        let mut h = Blake2s256::new();
+        h.update(b"OASA-SEC v0 mac1");
+        h.update(ib.public_key());
+        let key: [u8; 32] = h.finalize().into();
+        packet::mac1(&key, &v0_mac[..111])
+    };
+    v0_mac[111..].copy_from_slice(&tag);
+    let mut b = fresh_responder(&p);
+    assert_eq!(
+        drops(&b.handle_packet(ms(5), &v0_mac)),
+        vec![DropReason::BadHeader]
+    );
+}
+
+fn controls(events: &[Event]) -> Vec<Vec<u8>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Control(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn application_and_control_packets_are_kept_apart() {
+    let (mut p, now) = established(Config::default());
+    let app = p.a.send(now, b"hello").unwrap();
+    let ctl = p.a.send_control(now, &[0x20, 1, 2, 3, 4, 9]).unwrap();
+    assert_eq!(app.len(), 5 + data_overhead(CounterLen::Short));
+    assert_eq!(ctl.len(), 6 + data_overhead(CounterLen::Short));
+    let ev = p.b.handle_packet(now, &ctl);
+    assert_eq!(controls(&ev), vec![vec![0x20, 1, 2, 3, 4, 9]]);
+    assert!(
+        delivered(&ev).is_empty(),
+        "control must never reach the app"
+    );
+    let ev = p.b.handle_packet(now, &app);
+    assert_eq!(delivered(&ev), vec![b"hello".to_vec()]);
+    assert!(controls(&ev).is_empty());
+    let st = p.b.stats();
+    assert_eq!((st.received, st.delivered, st.control_received), (1, 1, 1));
+    assert_eq!(
+        (p.a.stats().sent, p.a.stats().control_sent),
+        (1, 1),
+        "control is counted apart from application packets"
+    );
+    // A replayed control message is a replay like any other.
+    assert_eq!(
+        drops(&p.b.handle_packet(now, &ctl)),
+        vec![DropReason::Replay]
+    );
+    // Empty messages are refused locally.
+    assert_eq!(p.a.send_control(now, &[]), Err(SendError::Empty));
+}
+
+#[test]
+fn unknown_content_types_are_dropped_after_authentication() {
+    let (mut p, now) = established(Config::default());
+    let id = p.a.id;
+    for kind in [0x02u8, 0x03, 0x10, 0x7F, 0x80, 0xFF] {
+        let pkt = p.a.ep.send_content(id, now, kind, b"abc").unwrap();
+        let ev = p.b.handle_packet(now, &pkt);
+        assert_eq!(drops(&ev), vec![DropReason::BadContent], "type {kind:#04x}");
+        assert!(ev.contains(&Event::Authenticated), "it did authenticate");
+        assert!(delivered(&ev).is_empty() && controls(&ev).is_empty());
+        // Replayed: now it is a replay, which is checked first.
+        assert_eq!(
+            drops(&p.b.handle_packet(now, &pkt)),
+            vec![DropReason::Replay]
+        );
+    }
+    // A type byte with nothing after it is no packet at all.
+    for kind in [CONTENT_APP, CONTENT_CONTROL] {
+        let pkt = p.a.ep.send_content(id, now, kind, b"").unwrap();
+        assert_eq!(
+            drops(&p.b.handle_packet(now, &pkt)),
+            vec![DropReason::BadContent]
+        );
+    }
+    assert_eq!(p.b.stats().dropped(DropReason::BadContent), 8);
+    assert_eq!(p.b.stats().delivered, 0);
+}
+
+#[test]
+fn keepalives_stay_empty_and_sizes_are_22_and_24() {
+    for (len, overhead, keepalive) in [(CounterLen::Short, 22, 21), (CounterLen::Long, 24, 23)] {
+        let cfg = Config {
+            counter_len: len,
+            ..Config::default()
+        };
+        let (mut p, now) = established(cfg.clone());
+        assert_eq!(data_overhead(len), overhead);
+        assert_eq!(keepalive_len(len), keepalive);
+        let ev = p.a.poll_timers(now + Duration::from_secs(25));
+        assert_eq!(
+            sends(&ev)[0].len(),
+            keepalive,
+            "a keepalive has no type byte"
+        );
+        // Largest payload that fits the 128-byte MTU, for both kinds.
+        let room = cfg.mtu - overhead;
+        assert_eq!(p.a.send(now, &vec![7u8; room]).unwrap().len(), cfg.mtu);
+        assert_eq!(
+            p.a.send(now, &vec![7u8; room + 1]),
+            Err(SendError::TooLarge)
+        );
+        assert_eq!(
+            p.a.send_control(now, &vec![7u8; room]).unwrap().len(),
+            cfg.mtu
+        );
+        assert_eq!(
+            p.a.send_control(now, &vec![7u8; room + 1]),
+            Err(SendError::TooLarge)
+        );
     }
 }

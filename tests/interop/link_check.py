@@ -212,7 +212,7 @@ def junk(args):
         size = rng.randrange(0, 141)
         pkt = bytearray(rng.randbytes(size))
         if size and rng.random() < 0.5:
-            pkt[0] = rng.choice([0x10, 0x20, 0x30, 0x38, 0x01, 0xFF])
+            pkt[0] = rng.choice([0x11, 0x21, 0x31, 0x39, 0x01, 0xFF])
         s.sendto(bytes(pkt), (LOCAL, target))
         time.sleep(0.002)
     s.settimeout(1.0)

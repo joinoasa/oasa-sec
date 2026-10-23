@@ -80,9 +80,11 @@ mod tests {
 
     #[test]
     fn recognizes_the_shape() {
-        let mut p = vec![0x10u8; HANDSHAKE1_LEN];
+        let mut p = vec![0x11u8; HANDSHAKE1_LEN];
         assert!(looks_like_handshake1(&p));
-        p[0] = 0x30;
+        p[0] = 0x31;
+        assert!(!looks_like_handshake1(&p));
+        p[0] = 0x10; // version 0 is the old wire
         assert!(!looks_like_handshake1(&p));
         assert!(!looks_like_handshake1(&p[..50]));
     }

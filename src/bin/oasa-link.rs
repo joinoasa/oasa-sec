@@ -26,7 +26,7 @@ use oasa_sec::signing::AUTOPILOT_KEY_FILE;
 use oasa_sec::store;
 
 const USAGE: &str = "\
-oasa-link: OASA-SEC v0 encrypted link over UDP (R-COM2). Do not fly with it.
+oasa-link: OASA-SEC encrypted link (wire version 1) over UDP (R-COM2). Do not fly with it.
 
 USAGE:
   oasa-link --dir DIR --peer PEERNAME --bind HOST:PORT
@@ -61,7 +61,7 @@ USAGE:
   --rekey-secs     New handshake after this many seconds (default 600).
   --keepalive-secs Send an empty packet after this many idle seconds (default 25, 0 = off).
   --mtu            Largest encrypted packet in bytes (default 128, the smallest radio the
-                   link supports). Plaintext must fit in MTU minus 21 bytes (23 with 4).
+                   link supports). Plaintext must fit in MTU minus 22 bytes (24 with 4).
   --mavlink-guard  Check every packet from the link before it goes to --plain-send. Only
                    whole, CRC-valid frames of allowed messages and commands pass; the rest
                    of the datagram is dropped. Parameter writes, FTP and SETUP_SIGNING are
@@ -573,6 +573,7 @@ impl Tunnel {
                     }
                     let _ = self.plain_out.send_to(&p, self.plain_send);
                 }
+                Event::Control(_) => {}
                 Event::Authenticated => {
                     // Follow the peer if it moved, but only because a packet
                     // from the new address just passed every check.

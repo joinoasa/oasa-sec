@@ -1,6 +1,8 @@
 # OASA-SEC v0: the encrypted link (draft)
 
-**Stage:** Idea → Draft · **Node:** R-COM2 · **Last reviewed:** 2026-10-23 · **v0 changed before first release:** still Draft and unreleased, so wire changes stay v0 with no version bump. After the first release a wire change needs a new version.
+**Stage:** Idea → Draft · **Node:** R-COM2 · **Last reviewed:** 2026-10-23
+
+**Wire version 1 replaced v0.** This page describes link wire version 1: the header version field is `1`, the prologue is `"OASA-SEC v1 link"` and the `mac1` label is `"OASA-SEC v1 mac1"`. v1 adds a content type byte inside every data plaintext (§3), which carries the control messages of [R-SEC2](oasa-sec-v0-rotation.md). The old wire (v0) is gone: v0 packets are dropped as `bad_header`, and a v0 and a v1 device cannot complete a handshake. (The title says v0 for the draft series of these documents, not for the wire.) After the first release, a wire change needs a new version number.
 
 One encrypted, authenticated link between two paired OASA devices, over any radio that can carry a packet. Modeled on WireGuard. Uses the identities and trusted-peers list from [pairing](oasa-sec-v0-pairing.md). No new crypto: Noise through `snow`, X25519, ChaCha20-Poly1305, BLAKE2s.
 
@@ -9,19 +11,19 @@ One encrypted, authenticated link between two paired OASA devices, over any radi
 - **Any radio:** the link takes packets in and out. It never assumes order, delivery or a minimum speed. Smallest supported packet (MTU): **128 bytes**.
 - **Every packet stands alone:** loss, reordering and duplicates never break the session.
 - **Only trusted peers:** a device not in `trusted-peers` gets no reply at all.
-- **Small overhead:** 21 bytes per data packet (23 with the long counter).
+- **Small overhead:** 22 bytes per data packet (24 with the long counter).
 - **Not in v0:** one-to-many group keys, padding to fixed sizes, splitting handshakes for tiny MTUs, DoS cookies (a cheap `mac1` check is in, see §2), post-quantum. The version field leaves room for them.
 
 ## 2. Handshake
 
-`Noise_IK_25519_ChaChaPoly_BLAKE2s`, prologue `"OASA-SEC v0 link"`.
+`Noise_IK_25519_ChaChaPoly_BLAKE2s`, prologue `"OASA-SEC v1 link"`.
 
 - **IK:** the initiator knows the responder's public key from `trusted-peers` and sends its own, encrypted. The responder looks it up in `trusted-peers` and **silently drops** the handshake if it isn't there.
 - Either side may initiate. Ground stations initiate by default.
 - **Message 1** (initiator → responder) payload: a 12-byte **timestamp** (8-byte seconds, 4-byte nanoseconds, big-endian), then the initiator's 2-byte sender index. The timestamp must strictly increase per initiator. A device without a trusted clock uses `max(clock, last_sent + 1 ns)`, saving the last value so it survives reboots. The responder keeps the newest timestamp per peer and drops any handshake that isn't newer (`stale_handshake`), so a recorded message 1 can't be replayed. A responder **with a trusted clock** (an RTC or NTP set before it starts; off by default, `max_future` in the settings, `--trusted-clock` in `oasa-link`) also drops a timestamp more than **10 minutes ahead** of its current wall clock (`stale_handshake`) and does not save it: one wrong clock must not lock a peer out until that time. The clock is read at each check. A device with a slow or unset clock must leave this off, or it would refuse every handshake.
 - **Message 2** (responder → initiator) payload: the responder's sender index, then the receiver index (2 bytes each). The receiver index is the initiator's index from message 1.
 - **Indexes are authenticated, and message 1 has none in the clear:** the sender index of each side travels only inside the encrypted Noise payload. Message 2 carries the receiver index in the clear to find the handshake; it must equal the one inside the payload, or the handshake is dropped as `bad_header`. Someone on the path can't change an index to break a session or learn one from message 1.
-- **`mac1` on message 1:** the last 8 bytes of message 1 are the first 8 bytes of BLAKE2s-256 keyed with `BLAKE2s-256("OASA-SEC v0 mac1" ‖ responder public key)` over the header byte and the Noise message. Anyone who knows the responder's public key (not a secret) can make it. It is only a cheap filter: random junk is dropped (`bad_header`) before any X25519 and **before** the global handshake limit is charged, so junk can't use up the budget. It does not stop someone who recorded a real message 1 (§9).
+- **`mac1` on message 1:** the last 8 bytes of message 1 are the first 8 bytes of BLAKE2s-256 keyed with `BLAKE2s-256("OASA-SEC v1 mac1" ‖ responder public key)` over the header byte and the Noise message. Anyone who knows the responder's public key (not a secret) can make it. It is only a cheap filter: random junk is dropped (`bad_header`) before any X25519 and **before** the global handshake limit is charged, so junk can't use up the budget. It does not stop someone who recorded a real message 1 (§9).
 - **Limits:** cheap checks (header, size, `mac1`) come before any X25519. The responder handles at most 20 handshakes a second in total, and answers each peer at most once a second. The program that sees addresses (`oasa-link`) also limits message 1 per source address (3 a second) before the link sees it.
 - **Public keys that can't be real:** small-order Curve25519 points (zero, one and the like) are refused wherever a peer key enters: `trusted-peers`, pairing codes, pairing, and `add_peer`.
 - Sizes on the wire: handshake 1 is **119** bytes (1 header + 110 Noise + 8 `mac1`), handshake 2 is **55** bytes (1 header + 2 receiver index + 52 Noise).
@@ -36,20 +38,28 @@ Every packet starts with one header byte:
 |---|---|
 | 7–4 | Type: `1` handshake 1, `2` handshake 2, `3` data, `4`–`15` reserved |
 | 3 | Counter length, meaningful on data packets only (`0` = 2 bytes, `1` = 4 bytes). On handshake packets it must be `0`, or the packet is dropped |
-| 2–0 | Version: `0` for v0. Anything else is dropped |
+| 2–0 | Version: `1` (wire version 1). Anything else, version 0 included, is dropped |
 
 **Handshake 1:** `[header][Noise message 1: 110][mac1: 8]`
 **Handshake 2:** `[header][receiver index: 2][Noise message 2: 52]`
-**Data:** `[header][receiver index: 2][counter: 2 or 4][ciphertext + 16-byte tag]`
+**Data:** `[header][receiver index: 2][counter: 2 or 4][ciphertext + 16-byte tag]`; the plaintext is `[content type: 1][body]`, or empty for a keepalive
 
 - **Index:** a random 16-bit number each side picks per session, so the receiver finds the session without trying keys. Not secret. A side never picks an index that a live session or handshake of its own already uses.
 - **Counter:** a 64-bit number per direction per session, starting at 0, used as the nonce. It never repeats under a key. Only its low 2 or 4 bytes are sent.
 - **Rebuilding the counter** (as DTLS 1.3, RFC 9147 §4.2.2): the receiver picks the 64-bit value closest to `highest seen + 1` whose low bytes match. This works while fewer than 32,768 packets in a row are lost or reordered, so the short counter is for links where that can't happen, and the long one for fast links.
 - **The tag is never shortened** (RFC 8439 forbids it).
 - **No separate header authentication for data:** the type and index pick the key, so changing them makes the tag check fail, and the counter's low bytes are the nonce. The one change that keeps the nonce is re-encoding a short counter as a long one (or back) with the same value: the tag still verifies, and the replay window catches it as a duplicate (or it is the same packet). Handshake indexes are inside the Noise payloads (§2). Any field added later must keep this property or be covered as associated data.
-- **Data payload:** the plaintext packet, unchanged. An empty payload is a **keepalive**.
+- **Data payload:** an empty plaintext is a **keepalive** (no content type byte). Anything else starts with a **content type** byte, inside the encryption:
 
-Overhead per data packet: 1 + 2 + 2 + 16 = **21 bytes** (23 with the long counter).
+  | Content type | Body |
+  |---|---|
+  | `0x00` | An application packet, unchanged. `oasa-link` adds this byte to **every** local packet, so local programs can never send control messages |
+  | `0x01` | A control message ([R-SEC2](oasa-sec-v0-rotation.md) §2). It never reaches the application side |
+  | other | Dropped after authentication as `bad_content` |
+
+  A content type with nothing after it (`0x00` or `0x01` alone) is also `bad_content`: an empty application packet is not a packet.
+
+Overhead per data packet: 1 + 2 + 2 + 1 + 16 = **22 bytes** (24 with the long counter). A keepalive is 21 bytes (23).
 
 ## 4. Receiving data
 
@@ -60,8 +70,9 @@ In this order, dropping silently on any failure:
 3. Counter rebuilt (a tie exactly half a range away takes the higher value); not older than the replay window.
 4. Tag verified (decrypt).
 5. **Replay window** (RFC 6479, 1024 packets): drop if already seen, otherwise mark it. Updated only after step 4, so forged packets can't move it.
+6. **Content type:** empty is a keepalive; `0x00` goes to the application, `0x01` to the control layer; anything else is dropped as `bad_content`. This comes after step 5, so the packet was authentic and counts as proof of life for the session, but nothing is delivered.
 
-Drops are counted by reason (`bad_header`, `unknown_index`, `too_old`, `bad_tag`, `replay`, `untrusted_peer`, `stale_handshake`, `rate_limited`) and logged without packet contents. A packet whose counter is at or past the receiver's own packet limit is dropped as `bad_tag`: a real peer never sends one.
+Drops are counted by reason (`bad_header`, `unknown_index`, `too_old`, `bad_tag`, `replay`, `untrusted_peer`, `stale_handshake`, `rate_limited`, `bad_content`) and logged without packet contents. A packet whose counter is at or past the receiver's own packet limit is dropped as `bad_tag`: a real peer never sends one.
 
 Sending can fail locally (`empty`, `too_large`, `no_session`, `unknown_peer`); nothing goes on the wire. The tunnel logs at most 10 drop lines a second and then one `drops_suppressed` line a second with the count held back; the statistics always count every drop.
 

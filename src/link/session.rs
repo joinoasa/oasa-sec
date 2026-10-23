@@ -6,7 +6,7 @@ use std::time::Duration;
 use snow::StatelessTransportState;
 
 use super::counter::{ReplayWindow, rebuild_counter};
-use super::packet::{CounterLen, TAG_LEN, data_header, data_overhead};
+use super::packet::{CounterLen, TAG_LEN, data_header, keepalive_len};
 use super::{Config, DropReason, SendError};
 
 pub(crate) struct Session {
@@ -65,14 +65,22 @@ impl Session {
             || self.send_counter >= cfg.rekey_after_packets
     }
 
-    /// Encrypt `plaintext` (empty for a keepalive) into a data packet.
+    /// Encrypt `content` into a data packet: the content type byte, then
+    /// `body`. `None` makes a keepalive: an empty plaintext with no type byte.
     pub fn encrypt(
         &mut self,
         now: Duration,
         cfg: &Config,
-        plaintext: &[u8],
+        content: Option<(u8, &[u8])>,
     ) -> Result<Vec<u8>, SendError> {
-        if data_overhead(cfg.counter_len) + plaintext.len() > cfg.mtu {
+        let mut plaintext = Vec::new();
+        if let Some((kind, body)) = content {
+            plaintext.reserve(1 + body.len());
+            plaintext.push(kind);
+            plaintext.extend_from_slice(body);
+        }
+        let plaintext = &plaintext[..];
+        if keepalive_len(cfg.counter_len) + plaintext.len() > cfg.mtu {
             return Err(SendError::TooLarge);
         }
         if self.expired(now, cfg) {

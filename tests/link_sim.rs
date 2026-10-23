@@ -13,7 +13,7 @@ use std::time::Duration;
 use oasa_sec::identity::Identity;
 use oasa_sec::link::{
     Config, CounterLen, DropReason, Entropy, Event, Link, MemoryTimestampStore, SendError,
-    SourceLimiter, data_overhead, looks_like_handshake1,
+    SourceLimiter, data_overhead, keepalive_len, looks_like_handshake1,
 };
 
 /// splitmix64: small, fast, good enough for test randomness.
@@ -241,7 +241,7 @@ impl Sim {
 
     /// Put `bytes`, sent by `from`, on the channel towards the other side.
     fn transmit(&mut self, from: Side, mut bytes: Vec<u8>) {
-        if self.tamper_hs2 > 0 && bytes[0] == 0x20 {
+        if self.tamper_hs2 > 0 && bytes[0] == 0x21 {
             self.tamper_hs2 -= 1;
             bytes[1] ^= 0x5A; // not covered by any tag
         }
@@ -281,7 +281,7 @@ impl Sim {
                 }
                 Event::HandshakeSent { .. } => self.log(side).handshakes_sent += 1,
                 Event::Failure(_) => self.log(side).failures += 1,
-                Event::Authenticated | Event::Dropped(_) => {}
+                Event::Authenticated | Event::Dropped(_) | Event::Control(_) => {}
             }
         }
     }
@@ -437,6 +437,7 @@ impl Sim {
             let st = self.stats(side);
             let arrived = self.logs[&side].packets_arrived;
             let counted = st.received
+                + st.control_received
                 + st.keepalives_received
                 + st.total_dropped()
                 + st.handshakes_accepted
@@ -607,7 +608,7 @@ fn untrusted_identity_gets_no_reply_and_is_counted() {
                         vec![DropReason::UntrustedPeer]
                     );
                     // ...and sprays data packets with guessed indexes.
-                    let mut junk = vec![0x30u8, 0, 0];
+                    let mut junk = vec![0x31u8, 0, 0];
                     junk.extend_from_slice(&(s.rng.next() as u32).to_be_bytes());
                     junk.extend_from_slice(&[7u8; 40]);
                     let idx = (s.rng.next() as u16).to_be_bytes();
@@ -646,14 +647,14 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
     let hs1_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 119)
+        .find(|(to, p)| *to == Side::B && p[0] == 0x11 && p.len() == 119)
         .unwrap()
         .1
         .clone();
     let hs2_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 55)
+        .find(|(to, p)| *to == Side::A && p[0] == 0x21 && p.len() == 55)
         .unwrap()
         .1
         .clone();
@@ -667,7 +668,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs1s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 119)
+                .filter(|(to, p)| *to == Side::B && p[0] == 0x11 && p.len() == 119)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs1s {
@@ -685,7 +686,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs2s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 55)
+                .filter(|(to, p)| *to == Side::A && p[0] == 0x21 && p.len() == 55)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs2s {
@@ -879,7 +880,7 @@ fn forged_handshake_2_does_not_spoil_the_real_one() {
     let mut r = Rng(1);
     let (mut bad_tag, mut unknown) = (0, 0);
     for idx in 0..=u16::MAX {
-        let mut forged = vec![0x20u8];
+        let mut forged = vec![0x21u8];
         forged.extend_from_slice(&idx.to_be_bytes());
         let mut noise = [0u8; 52];
         r.fill(&mut noise);
@@ -916,7 +917,7 @@ fn hostile_flood_changes_nothing() {
             let mut p = vec![0u8; len];
             s.rng.fill(&mut p);
             if !p.is_empty() && s.rng.chance(0.5) {
-                p[0] = [0x10u8, 0x20, 0x30, 0x38][s.rng.below(4) as usize];
+                p[0] = [0x11u8, 0x21, 0x31, 0x39][s.rng.below(4) as usize];
             }
             let to = if s.rng.chance(0.5) { Side::A } else { Side::B };
             s.inject(to, &p);
@@ -940,28 +941,44 @@ fn hostile_flood_changes_nothing() {
 
 #[test]
 fn sizes_on_the_wire_match_the_spec() {
-    for (len, overhead) in [(CounterLen::Short, 21usize), (CounterLen::Long, 23)] {
+    for (len, overhead, keepalive) in [
+        (CounterLen::Short, 22usize, 21usize),
+        (CounterLen::Long, 24, 23),
+    ] {
         assert_eq!(data_overhead(len), overhead);
+        assert_eq!(keepalive_len(len), keepalive);
         let mut sim = Sim::new(3, config(len), Channel::clean());
         sim.start();
         sim.run(Duration::from_secs(2), ms(10), ms(100), |_| {});
         let handshakes: Vec<usize> = sim
             .wire
             .iter()
-            .filter(|(_, p)| p[0] == 0x10 || p[0] == 0x20)
+            .filter(|(_, p)| p[0] == 0x11 || p[0] == 0x21)
             .map(|(_, p)| p.len())
             .collect();
         assert_eq!(handshakes, vec![119, 55]);
         let min_data = sim
             .wire
             .iter()
-            .filter(|(_, p)| p[0] == 0x30 || p[0] == 0x38)
+            .filter(|(_, p)| p[0] == 0x31 || p[0] == 0x39)
             .map(|(_, p)| p.len())
             .min()
             .unwrap();
         assert_eq!(
-            min_data, overhead,
-            "a keepalive is header + index + counter + tag"
+            min_data, keepalive,
+            "a keepalive is header + index + counter + tag, no content type byte"
+        );
+        // Application packets carry the content type byte on top.
+        let min_app = sim
+            .wire
+            .iter()
+            .filter(|(_, p)| (p[0] == 0x31 || p[0] == 0x39) && p.len() > keepalive)
+            .map(|(_, p)| p.len())
+            .min()
+            .unwrap();
+        assert!(
+            min_app >= overhead + 12,
+            "payload is at least 12 bytes here"
         );
         assert!(sim.wire.iter().all(|(_, p)| p.len() <= 128));
     }
@@ -1032,7 +1049,7 @@ fn handshake_flood(use_source_limit: bool) -> (usize, u64, u64) {
         // Junk: right size and header, wrong mac1. From address Y.
         let mut junk = vec![0u8; recorded.len()];
         s.rng.fill(&mut junk);
-        junk[0] = 0x10;
+        junk[0] = 0x11;
         s.inject(Side::B, &junk);
         // A recorded real handshake 1, replayed from address Z.
         if !use_source_limit || limiter.allow(s.now, "Z") {
