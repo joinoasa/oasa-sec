@@ -151,7 +151,7 @@ guard_run() { # name mode [drone flags...]
   $B/oasa-link --dir "$T/gcsg" --peer dronek --bind 127.0.0.1:$GK_ENC --remote 127.0.0.1:$DK_ENC --initiate \
     --plain-listen 127.0.0.1:$GK_IN --plain-send 127.0.0.1:$GK_OUT --mtu 400 --duration 40 > "$T/$name-gcs.log" 2>&1 & local GK=$!; PIDS+=($GK)
   wait_for 15 session_established "$T/$name-gcs.log" || fail "$name: no session"
-  $CHECK guard $GK_IN $DK_OUT "$mode" $DK_IN > "$T/$name-guard.out" || { cat "$T/$name-guard.out"; [ -n "${GITHUB_ACTIONS:-}" ] && while IFS= read -r l; do echo "::error title=$name guard::$l"; done < "$T/$name-guard.out"; fail "$name: wrong datagrams reached the autopilot side"; }
+  $CHECK guard $GK_IN $DK_OUT "$mode" $DK_IN > "$T/$name-guard.out" 2>&1 || { cat "$T/$name-guard.out"; [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=$name guard::$(tr "\n" "|" < "$T/$name-guard.out" | cut -c1-900)"; fail "$name: wrong datagrams reached the autopilot side"; }
   cat "$T/$name-guard.out"
   want=$(sed -n 's/^blocked //p' "$T/$name-guard.out")
   kill -TERM "$DK" "$GK"; wait "$DK" "$GK" || fail "$name: a link did not exit 0"
