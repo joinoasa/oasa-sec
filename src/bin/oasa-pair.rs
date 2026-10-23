@@ -15,6 +15,8 @@ use oasa_sec::code::PairingCode;
 use oasa_sec::identity::{self, Identity, fingerprint};
 use oasa_sec::pairing::{DeadlineStream, check_name, pair_as_drone_checked, pair_as_ground};
 use oasa_sec::removal;
+use oasa_sec::rotation;
+use oasa_sec::signer::{self, port::UdpPort};
 use oasa_sec::signing::{AUTOPILOT_KEY_FILE, SigningKey, peer_key_path};
 use oasa_sec::store::{self, Role};
 
@@ -35,6 +37,8 @@ USAGE:
   oasa-pair revoke   --dir DIR PEER
   oasa-pair restore  --dir DIR KEY
   oasa-pair removed  --dir DIR
+  oasa-pair signer   --dir DIR --autopilot MAVLINK_ADDR [--target SYS:COMP] [--link-id N]
+  oasa-pair rotate-signing --dir DIR
   oasa-pair command  --dir DIR --to MAVLINK_ADDR [--peer NAME|FINGERPRINT]
                      [--target SYS:COMP] [--link-id N] [--wait SECONDS]
 
@@ -74,8 +78,8 @@ USAGE:
             again, even if an old trusted-peers comes back), out of the list, and its
             handshake timestamps are deleted. A running oasa-link notices within a
             second; the one talking to the removed device exits with code 3. On a drone,
-            removing an operator marks its signing key for rotation (the rotation itself
-            is not built yet). On a ground station, removing a drone deletes its signing
+            removing an operator marks its signing key for rotation (`oasa-pair signer`
+            does it). On a ground station, removing a drone deletes its signing
             key files.
   revoke    Like remove, and also add the device to this device's removal log, which
             devices that list this one as admin pick up over the link. Cannot revoke itself.
@@ -84,6 +88,18 @@ USAGE:
             Entries already received for it are not applied again; a new one removes
             it again.
   removed   List removed devices (the tombstones).
+  signer    On a drone: own a dedicated link to the autopilot (its own UDP/TCP port, never
+            a router endpoint) and run signing-key rotations. It waits until the autopilot
+            is disarmed, issues a new key and generation, sends SETUP_SIGNING signed with
+            the current key, proves the new key with a signed command and a signed
+            acknowledgment, then commits. At every start, and after any failed step, it
+            works out which key the autopilot has before it does anything (listens, then
+            asks under each key for 75 s) and never deletes a key that might be in use.
+            Prints one JSON line per event: rotation_waiting_armed, rotation_started,
+            rotation_done, rotation_rolled_back, rotation_stuck. Keep it running.
+  rotate-signing
+            Ask the signer to change the drone's signing key (it also does this by itself
+            after an operator is removed). Writes rotation-pending.
   command   Send one signed test command (request AUTOPILOT_VERSION) and wait for
             a signed, matching acknowledgment. On a ground station, --peer picks
             which drone's key to use (optional if only one is paired).
@@ -132,6 +148,8 @@ fn run(args: &[String]) -> R {
         "revoke" => revoke(&opts),
         "restore" => restore(&opts),
         "removed" => removed(&opts),
+        "signer" => signer(&opts),
+        "rotate-signing" => rotate_signing(&opts),
         "command" => command(&opts),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
@@ -572,7 +590,7 @@ fn describe_removal(dir: &Path, key: &[u8; 32], out: &removal::RemoveOutcome) {
         && out.peer.as_ref().is_some_and(|p| p.role == Role::Operator)
     {
         println!(
-            "The drone's MAVLink signing key is still the old one: a rotation is marked pending, but signing-key rotation is not built yet."
+            "The drone's MAVLink signing key is still the old one until `oasa-pair signer` changes it (it waits until the autopilot is disarmed)."
         );
     }
     println!("A running oasa-link notices within a second (or at once on SIGHUP).");
@@ -655,6 +673,57 @@ fn removed(o: &Opts) -> R {
         println!("{}  {by}", fingerprint(&k));
     }
     Ok(())
+}
+
+fn rotate_signing(o: &Opts) -> R {
+    let dir = o.dir()?;
+    if !dir.join(AUTOPILOT_KEY_FILE).exists() {
+        return Err("this device holds no autopilot signing key (rotation is for a drone)".into());
+    }
+    rotation::request(&dir, "requested", "-", now_unix())?;
+    println!(
+        "A signing-key rotation is requested. `oasa-pair signer` does it once the autopilot is disarmed."
+    );
+    Ok(())
+}
+
+fn json_event(e: &signer::Event) -> String {
+    let mut s = format!("{{\"ts\":{},\"event\":\"{}\"", now_unix(), e.name());
+    if let Some(g) = e.generation() {
+        s.push_str(&format!(",\"generation\":{g}"));
+    }
+    s.push('}');
+    s
+}
+
+/// Run rotations for a drone, until killed.
+fn signer(o: &Opts) -> R {
+    let dir = o.dir()?;
+    let (sys, comp) = o.target()?;
+    let link_id: u8 = o
+        .get("link-id")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(COMPANION_LINK_ID);
+    if !dir.join(AUTOPILOT_KEY_FILE).exists() {
+        return Err("this device holds no autopilot signing key; pair first".into());
+    }
+    let port = UdpPort::connect(o.req("autopilot")?, sys, link_id)?;
+    let mut s = signer::Signer::new(&dir, port, signer::Config { sys, comp });
+    s.on_event(|e| println!("{}", json_event(e)));
+    println!("{{\"ts\":{},\"event\":\"signer_started\"}}", now_unix());
+    loop {
+        if let Err(e) = s.tick() {
+            // The error text never holds a key. The next round looks at which
+            // key the autopilot has before it does anything.
+            println!(
+                "{{\"ts\":{},\"event\":\"signer_error\",\"error\":{:?}}}",
+                now_unix(),
+                e.to_string()
+            );
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
 }
 
 fn command(o: &Opts) -> R {

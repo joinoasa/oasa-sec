@@ -281,7 +281,9 @@ def check_lines(args):
                               "drop", "drops_suppressed", "hint", "stats", "error",
                               "mavlink_guard", "warning", "peer_removed", "trust_reloaded",
                               "trust_migrated", "removal_entry", "not_admin_here",
-                              "control_error", "signing_key_message_ignored"), e
+                              "control_error", "signing_key_message_ignored",
+                              "signing_key_next", "signing_key_commit",
+                              "signing_key_commit_unknown", "signing_key_acked"), e
     return 0
 
 

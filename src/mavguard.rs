@@ -622,6 +622,35 @@ pub fn is_signing_param(name: &[u8]) -> bool {
     false
 }
 
+/// The highest signature timestamp (MAVLink units) in the signed MAVLink 2
+/// frames of a datagram, or 0. Meant for a datagram the guard already passed;
+/// it reads only lengths and the 6 timestamp bytes and stops at anything odd.
+/// The signature is not checked here (the autopilot does that); the number is
+/// only a floor for the next `SETUP_SIGNING` initial timestamp, so a forged
+/// high one can at worst make that timestamp larger.
+pub fn max_signed_timestamp(datagram: &[u8]) -> u64 {
+    let (mut pos, mut best) = (0usize, 0u64);
+    while pos + 12 <= datagram.len() {
+        if datagram[pos] != 0xFD {
+            break;
+        }
+        let len = datagram[pos + 1] as usize;
+        let signed = datagram[pos + 2] & 0x01 != 0;
+        let end = pos + 10 + len + 2 + if signed { 13 } else { 0 };
+        if end > datagram.len() {
+            break;
+        }
+        if signed {
+            let ts = pos + 10 + len + 2 + 1;
+            let mut b = [0u8; 8];
+            b[..6].copy_from_slice(&datagram[ts..ts + 6]);
+            best = best.max(u64::from_le_bytes(b));
+        }
+        pos = end;
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1560,5 +1589,33 @@ mod tests {
             let d: Vec<u8> = (0..n).map(|_| next() as u8).collect();
             let _ = g.check(&d);
         }
+    }
+
+    #[test]
+    fn the_highest_signed_timestamp_is_read_from_signed_frames_only() {
+        // A signed HEARTBEAT-sized frame: 9-byte payload.
+        let frame = |ts: u64, signed: bool| {
+            let mut f = vec![0xFD, 9, u8::from(signed), 0, 0, 1, 1, 0, 0, 0];
+            f.extend_from_slice(&[0; 9]);
+            f.extend_from_slice(&[0, 0]);
+            if signed {
+                f.push(3);
+                f.extend_from_slice(&ts.to_le_bytes()[..6]);
+                f.extend_from_slice(&[0; 6]);
+            }
+            f
+        };
+        assert_eq!(max_signed_timestamp(&frame(1234, true)), 1234);
+        assert_eq!(max_signed_timestamp(&frame(1234, false)), 0);
+        let mut two = frame(10, true);
+        two.extend(frame(99, true));
+        two.extend(frame(5, false));
+        assert_eq!(max_signed_timestamp(&two), 99);
+        // Cut short, garbage, empty: nothing, no panic.
+        let f = frame(77, true);
+        assert_eq!(max_signed_timestamp(&f[..f.len() - 1]), 0);
+        assert_eq!(max_signed_timestamp(&[0xFD; 3]), 0);
+        assert_eq!(max_signed_timestamp(&[]), 0);
+        assert_eq!(max_signed_timestamp(&[0x55; 40]), 0);
     }
 }

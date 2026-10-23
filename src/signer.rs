@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use mavlink::MavHeader;
 use mavlink::dialects::common::{
-    COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, SETUP_SIGNING_DATA,
+    COMMAND_LONG_DATA, HEARTBEAT_DATA, MavAutopilot, MavCmd, MavMessage, MavModeFlag, MavState,
+    MavType, SETUP_SIGNING_DATA,
 };
 
 use crate::rotation;
@@ -76,6 +77,17 @@ pub trait Port {
     /// Wait up to `wait` for a frame. `keys` are the candidates a signature is
     /// checked against.
     fn recv(&mut self, wait: Duration, keys: &[&SigningKey]) -> Result<Option<Inbound>>;
+}
+
+fn companion_heartbeat() -> MavMessage {
+    MavMessage::HEARTBEAT(HEARTBEAT_DATA {
+        custom_mode: 0,
+        mavtype: MavType::MAV_TYPE_ONBOARD_CONTROLLER,
+        autopilot: MavAutopilot::MAV_AUTOPILOT_INVALID,
+        base_mode: MavModeFlag::empty(),
+        system_status: MavState::MAV_STATE_ACTIVE,
+        mavlink_version: 3,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +151,8 @@ pub struct Signer<P: Port> {
     stuck_with: Option<usize>,
     retry_at: Duration,
     last_wait: Option<Event>,
+    /// Told of each event as it happens (a tick can take 80 s).
+    on_event: Option<Box<dyn FnMut(&Event)>>,
 }
 
 impl<P: Port> Signer<P> {
@@ -154,7 +168,20 @@ impl<P: Port> Signer<P> {
             stuck_with: None,
             retry_at: Duration::ZERO,
             last_wait: None,
+            on_event: None,
         }
+    }
+
+    /// Call `f` for each event the moment it happens, not when the tick ends.
+    pub fn on_event(&mut self, f: impl FnMut(&Event) + 'static) {
+        self.on_event = Some(Box::new(f));
+    }
+
+    fn emit(&mut self, e: Event) -> Event {
+        if let Some(f) = self.on_event.as_mut() {
+            f(&e);
+        }
+        e
     }
 
     pub fn port(&mut self) -> &mut P {
@@ -243,12 +270,26 @@ impl<P: Port> Signer<P> {
         Ok(false)
     }
 
-    /// One round: watch, then probe or rotate if there is work.
+    /// One round: watch, then probe or rotate if there is work. After an
+    /// error (a lost link, a full disk) the next round works out which key
+    /// the autopilot has before it does anything else.
     pub fn tick(&mut self) -> Result<Vec<Event>> {
-        self.observe(TICK)?;
+        let r = self.tick_inner();
+        if r.is_err() {
+            self.probe_due = true;
+        }
+        r
+    }
+
+    fn tick_inner(&mut self) -> Result<Vec<Event>> {
         let Some(keys) = rotation::load_drone_keys(&self.dir)? else {
             return Err(Error::Link("this folder holds no autopilot key"));
         };
+        // A companion computer says hello once a second, signed with the
+        // current key: the autopilot learns where to send its frames (some only
+        // answer the last address that spoke), and we hear its heartbeats.
+        self.send(&keys.current, &companion_heartbeat())?;
+        self.observe(TICK)?;
         let lines = rotation::pending_lines(&self.dir)?;
         if keys.next.is_some() {
             let again = self.stuck_with.is_some_and(|n| n != lines);
@@ -281,7 +322,7 @@ impl<P: Port> Signer<P> {
             // Say it once, not every second.
             if self.last_wait.as_ref() != Some(&e) {
                 self.last_wait = Some(e.clone());
-                return Ok(vec![e]);
+                return Ok(vec![self.emit(e)]);
             }
             return Ok(Vec::new());
         }
@@ -293,7 +334,7 @@ impl<P: Port> Signer<P> {
     fn rotate(&mut self, current: SigningKey) -> Result<Vec<Event>> {
         let begun = rotation::begin(&self.dir)?;
         let g = begun.generation;
-        let mut events = vec![Event::Issued(g)];
+        let mut events = vec![self.emit(Event::Issued(g))];
         // Step 4: the initial timestamp is one more than the latest of our
         // clock and every signed timestamp we have seen.
         let seen = rotation::read_seen_ts(&self.dir).unwrap_or(0);
@@ -314,7 +355,7 @@ impl<P: Port> Signer<P> {
         self.observe(Duration::from_millis(200))?;
         if self.prove(&begun.key, PROVE_WAIT)? {
             rotation::commit(&self.dir, g, begun.consumed)?;
-            events.push(Event::Rotated(g));
+            events.push(self.emit(Event::Rotated(g)));
             return Ok(events);
         }
         events.extend(self.resolve()?);
@@ -333,21 +374,21 @@ impl<P: Port> Signer<P> {
         if current == next {
             // Switched on disk already; only the clean-up is left.
             self.finish(g)?;
-            return Ok(vec![Event::Rotated(g)]);
+            return Ok(vec![self.emit(Event::Rotated(g))]);
         }
         match self.which_key(&current, &next)? {
             Some(1) => {
                 self.finish(g)?;
-                Ok(vec![Event::Rotated(g)])
+                Ok(vec![self.emit(Event::Rotated(g))])
             }
             Some(_) => {
                 rotation::abandon(&self.dir)?;
                 self.retry_at = self.port.now() + RETRY_AFTER_FAILURE;
-                Ok(vec![Event::RolledBack(g)])
+                Ok(vec![self.emit(Event::RolledBack(g))])
             }
             None => {
                 self.stuck_with = Some(rotation::pending_lines(&self.dir)?);
-                Ok(vec![Event::Stuck])
+                Ok(vec![self.emit(Event::Stuck)])
             }
         }
     }

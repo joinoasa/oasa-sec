@@ -22,8 +22,9 @@ use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
     SendError, SourceLimiter, looks_like_handshake1,
 };
-use oasa_sec::mavguard::{Block, Guard};
+use oasa_sec::mavguard::{Block, Guard, max_signed_timestamp};
 use oasa_sec::removal::{LOG_FILE, REMOVED_FILE};
+use oasa_sec::rotation::{CURRENT_GEN_FILE, NEXT_KEY_FILE, write_seen_ts};
 use oasa_sec::signing::AUTOPILOT_KEY_FILE;
 use oasa_sec::store::{self, TRUST_FILE};
 
@@ -99,6 +100,11 @@ cannot be read it exits with code 1 (it fails closed). Control messages (removal
 between admins and devices) are handled here and never reach --plain-send; their drops
 count as bad_role, bad_control and peer_removed. Lines: removal_entry, not_admin_here,
 trust_reloaded, trust_migrated.
+Signing-key rotation (R-SEC2): on a drone, oasa-link sends its operator SIGNING_KEY_NEXT and
+_COMMIT from the key files (the signer, `oasa-pair signer`, makes the rotation); on a ground
+station it keeps the pending key and switches on the commit. Lines: signing_key_next,
+signing_key_commit, signing_key_commit_unknown, signing_key_acked. A drone also saves the
+highest signature time it forwards to mavlink-signing-ts.
 
 On exit prints {\"event\":\"stats\",...} and exits 0 (3 after peer_removed). Packet contents
 and keys are never printed.
@@ -529,7 +535,17 @@ struct Watch {
     dir: PathBuf,
     trust: [FileSig; 2],
     log: FileSig,
+    /// A drone's signing-key files: a rotation began, finished or was dropped.
+    signing: [FileSig; 3],
     next_check: Instant,
+}
+
+/// What changed since the last look.
+#[derive(Clone, Copy, Default)]
+struct Changed {
+    trust: bool,
+    log: bool,
+    signing: bool,
 }
 
 const WATCH_EVERY: Duration = Duration::from_millis(250);
@@ -540,33 +556,45 @@ impl Watch {
             dir: dir.to_path_buf(),
             trust: [None, None],
             log: None,
+            signing: [None, None, None],
             next_check: now + WATCH_EVERY,
         };
         w.read();
         w
     }
 
-    fn read(&mut self) -> (bool, bool) {
+    fn read(&mut self) -> Changed {
         let trust = [
             file_sig(&self.dir.join(TRUST_FILE)),
             file_sig(&self.dir.join(REMOVED_FILE)),
         ];
         let log = file_sig(&self.dir.join(LOG_FILE));
-        let changed = (trust != self.trust, log != self.log);
+        let signing = [
+            file_sig(&self.dir.join(AUTOPILOT_KEY_FILE)),
+            file_sig(&self.dir.join(NEXT_KEY_FILE)),
+            file_sig(&self.dir.join(CURRENT_GEN_FILE)),
+        ];
+        let changed = Changed {
+            trust: trust != self.trust,
+            log: log != self.log,
+            signing: signing != self.signing,
+        };
         self.trust = trust;
         self.log = log;
+        self.signing = signing;
         changed
     }
 
-    /// `(trust files changed, removal log changed)`, or `None` if it is not
-    /// time to look yet. `force` (SIGHUP) looks now and reports a reload.
-    fn check(&mut self, now: Instant, force: bool) -> Option<(bool, bool)> {
+    /// What changed, or `None` if it is not time to look yet. `force`
+    /// (SIGHUP) looks now and reports a trust reload.
+    fn check(&mut self, now: Instant, force: bool) -> Option<Changed> {
         if !force && now < self.next_check {
             return None;
         }
         self.next_check = now + WATCH_EVERY;
-        let (t, l) = self.read();
-        Some((t || force, l))
+        let mut c = self.read();
+        c.trust |= force;
+        Some(c)
     }
 }
 
@@ -585,6 +613,33 @@ struct Tunnel {
     /// Handshakes in a row refused as old or too far ahead.
     stale_run: u32,
     hinted: bool,
+    /// A drone saves the highest MAVLink signature time it forwards, as a
+    /// floor for the next signing-key change (at most every 10 s).
+    seen: SeenTs,
+}
+
+struct SeenTs {
+    dir: PathBuf,
+    drone: bool,
+    best: u64,
+    saved: u64,
+    last_save: Instant,
+}
+
+impl SeenTs {
+    fn note(&mut self, datagram: &[u8]) {
+        if !self.drone {
+            return;
+        }
+        self.best = self.best.max(max_signed_timestamp(datagram));
+        if self.best > self.saved && self.last_save.elapsed() >= Duration::from_secs(10) {
+            // A failed save only means a lower floor; the signer has its own clock.
+            if write_seen_ts(&self.dir, self.best).is_ok() {
+                self.saved = self.best;
+            }
+            self.last_save = Instant::now();
+        }
+    }
 }
 
 impl Tunnel {
@@ -656,6 +711,7 @@ impl Tunnel {
                         self.guard_drop(b);
                         continue;
                     }
+                    self.seen.note(&p);
                     let _ = self.plain_out.send_to(&p, self.plain_send);
                 }
                 Event::Control(bytes) => {
@@ -878,6 +934,13 @@ fn run(args: &[String]) -> R<u8> {
         drop_log: DropLog::new(Instant::now()),
         stale_run: 0,
         hinted: false,
+        seen: SeenTs {
+            dir: a.dir.clone(),
+            drone: a.dir.join(AUTOPILOT_KEY_FILE).exists(),
+            best: 0,
+            saved: 0,
+            last_save: Instant::now(),
+        },
     };
 
     if a.initiate {
@@ -945,8 +1008,8 @@ fn run(args: &[String]) -> R<u8> {
         t.run_actions(actions, now);
         // The trust files: looked at four times a second, and at once on SIGHUP.
         let hup = RELOAD.swap(false, Ordering::SeqCst);
-        if let Some((trust_changed, log_changed)) = watch.check(Instant::now(), hup) {
-            if trust_changed {
+        if let Some(changed) = watch.check(Instant::now(), hup) {
+            if changed.trust {
                 match reload(&a.dir, &peer, &mut t) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -962,8 +1025,12 @@ fn run(args: &[String]) -> R<u8> {
                     }
                 }
             }
-            if log_changed {
+            if changed.log {
                 let actions = t.control.log_changed(now);
+                t.run_actions(actions, now);
+            }
+            if changed.signing {
+                let actions = t.control.signing_changed(now);
                 t.run_actions(actions, now);
             }
         }

@@ -100,6 +100,9 @@ impl Port for FakePort {
 
     fn send(&mut self, key: Option<&SigningKey>, msg: &MavMessage, _min_ts: u64) -> Result<u64> {
         let mut ap = self.0.borrow_mut();
+        if matches!(msg, MavMessage::HEARTBEAT(_)) {
+            return Ok(7);
+        }
         ap.send_count += 1;
         if ap.crash_at_send == Some(ap.send_count) {
             return Err(Error::Link("power loss"));
