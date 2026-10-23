@@ -16,14 +16,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use oasa_sec::identity::Identity;
+use oasa_sec::control::{Action, Control, Note};
+use oasa_sec::identity::{Identity, fingerprint};
 use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
     SendError, SourceLimiter, looks_like_handshake1,
 };
 use oasa_sec::mavguard::{Block, Guard};
+use oasa_sec::removal::{LOG_FILE, REMOVED_FILE};
 use oasa_sec::signing::AUTOPILOT_KEY_FILE;
-use oasa_sec::store;
+use oasa_sec::store::{self, TRUST_FILE};
 
 const USAGE: &str = "\
 oasa-link: OASA-SEC encrypted link (wire version 1) over UDP (R-COM2). Do not fly with it.
@@ -88,39 +90,57 @@ Prints one JSON line per event: handshake_sent, session_established, rekey, drop
 mavlink_guard (at start), warning. A datagram stopped by the guard is a drop with reason
 mavlink_blocked, a why word, the message id and (for commands) the command id
 (never contents). The widening flags each print a warning at start.
-At most 10 drop lines a second are printed; a drops_suppressed line counts the rest. The
-trusted peers are read once at startup: restart oasa-link after `oasa-pair trust` or
-`remove`. On exit prints {\"event\":\"stats\",...} and exits 0. Packet contents and keys are never printed.
+At most 10 drop lines a second are printed; a drops_suppressed line counts the rest.
+
+Removal (R-SEC2): oasa-link watches trusted-peers.v1, removed and removal-log and reloads
+within a second (at once on SIGHUP). If its own --peer has been removed it prints
+{\"event\":\"peer_removed\",...}, then the stats, and exits with code 3. If those files
+cannot be read it exits with code 1 (it fails closed). Control messages (removal sync
+between admins and devices) are handled here and never reach --plain-send; their drops
+count as bad_role, bad_control and peer_removed. Lines: removal_entry, not_admin_here,
+trust_reloaded, trust_migrated.
+
+On exit prints {\"event\":\"stats\",...} and exits 0 (3 after peer_removed). Packet contents
+and keys are never printed.
 ";
 
 /// Handshake 1 packets let through per second from one source address.
 const SOURCE_HANDSHAKES_PER_SECOND: u32 = 3;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Set by SIGHUP: reload the trust files now.
+static RELOAD: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 mod signals {
-    use super::STOP;
+    use super::{RELOAD, STOP};
     use std::sync::atomic::Ordering;
 
     extern "C" fn on_signal(_: i32) {
         STOP.store(true, Ordering::SeqCst);
     }
 
+    extern "C" fn on_hup(_: i32) {
+        RELOAD.store(true, Ordering::SeqCst);
+    }
+
     unsafe extern "C" {
         fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
     }
 
-    /// Ask for SIGINT and SIGTERM to set the stop flag. The handler only
-    /// touches an atomic, which is safe in a signal handler.
+    /// Ask for SIGINT and SIGTERM to set the stop flag, and SIGHUP the
+    /// reload flag. The handlers only touch an atomic, which is safe in a
+    /// signal handler.
     pub fn install() {
+        const SIGHUP: i32 = 1;
         const SIGINT: i32 = 2;
         const SIGTERM: i32 = 15;
-        // SAFETY: `signal` is the C library function; the handler is
+        // SAFETY: `signal` is the C library function; the handlers are
         // async-signal-safe (one atomic store).
         unsafe {
             signal(SIGINT, on_signal);
             signal(SIGTERM, on_signal);
+            signal(SIGHUP, on_hup);
         }
     }
 }
@@ -133,7 +153,8 @@ mod signals {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -486,8 +507,72 @@ fn spawn_reader(sock: UdpSocket, tx: mpsc::SyncSender<Msg>, encrypted: bool) {
     });
 }
 
+/// How the program sees a file change: modified time, size and inode
+/// (an atomic replace gives a new inode even within one clock tick).
+type FileSig = Option<(SystemTime, u64, u64)>;
+
+fn file_sig(path: &std::path::Path) -> FileSig {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        m.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((m.modified().ok()?, m.len(), ino))
+}
+
+/// Watches the files that decide who is trusted. Checked every 250 ms, so a
+/// change is seen well inside a second.
+struct Watch {
+    dir: PathBuf,
+    trust: [FileSig; 2],
+    log: FileSig,
+    next_check: Instant,
+}
+
+const WATCH_EVERY: Duration = Duration::from_millis(250);
+
+impl Watch {
+    fn new(dir: &std::path::Path, now: Instant) -> Self {
+        let mut w = Self {
+            dir: dir.to_path_buf(),
+            trust: [None, None],
+            log: None,
+            next_check: now + WATCH_EVERY,
+        };
+        w.read();
+        w
+    }
+
+    fn read(&mut self) -> (bool, bool) {
+        let trust = [
+            file_sig(&self.dir.join(TRUST_FILE)),
+            file_sig(&self.dir.join(REMOVED_FILE)),
+        ];
+        let log = file_sig(&self.dir.join(LOG_FILE));
+        let changed = (trust != self.trust, log != self.log);
+        self.trust = trust;
+        self.log = log;
+        changed
+    }
+
+    /// `(trust files changed, removal log changed)`, or `None` if it is not
+    /// time to look yet. `force` (SIGHUP) looks now and reports a reload.
+    fn check(&mut self, now: Instant, force: bool) -> Option<(bool, bool)> {
+        if !force && now < self.next_check {
+            return None;
+        }
+        self.next_check = now + WATCH_EVERY;
+        let (t, l) = self.read();
+        Some((t || force, l))
+    }
+}
+
 struct Tunnel {
     link: Link,
+    control: Control,
     enc: UdpSocket,
     plain_out: UdpSocket,
     plain_send: SocketAddr,
@@ -550,7 +635,7 @@ impl Tunnel {
 
     /// Act on what the link asked for. `source` is where the packet being
     /// handled came from (None for timers and local packets).
-    fn apply(&mut self, events: Vec<Event>, source: Option<SocketAddr>) {
+    fn apply(&mut self, events: Vec<Event>, source: Option<SocketAddr>, now: Duration) {
         let ts = rfc3339(SystemTime::now());
         for e in events {
             match e {
@@ -573,7 +658,10 @@ impl Tunnel {
                     }
                     let _ = self.plain_out.send_to(&p, self.plain_send);
                 }
-                Event::Control(_) => {}
+                Event::Control(bytes) => {
+                    let actions = self.control.handle(now, unix_now(), &bytes);
+                    self.run_actions(actions, now);
+                }
                 Event::Authenticated => {
                     // Follow the peer if it moved, but only because a packet
                     // from the new address just passed every check.
@@ -585,6 +673,9 @@ impl Tunnel {
                     "{{\"ts\":\"{ts}\",\"event\":\"handshake_sent\",\"retry\":{retry},\"rekey\":{rekey}}}"
                 ),
                 Event::SessionEstablished { initiator, rekey } => {
+                    // A new session: unfinished removal sync starts over.
+                    let actions = self.control.session_started(now);
+                    self.run_actions(actions, now);
                     self.stale_run = 0;
                     self.hinted = false;
                     let role = if initiator { "initiator" } else { "responder" };
@@ -625,6 +716,28 @@ impl Tunnel {
         }
     }
 
+    /// Do what the control layer asked: send its messages on the link, count
+    /// its drops, log its notes. A message that cannot go now (no session
+    /// yet) is not lost: the control layer resends on its own timers.
+    fn run_actions(&mut self, actions: Vec<Action>, now: Duration) {
+        for a in actions {
+            match a {
+                Action::Send(bytes) => {
+                    if let Ok(packet) = self.link.send_control(now, &bytes) {
+                        match self.remote {
+                            Some(r) => {
+                                let _ = self.enc.send_to(&packet, r);
+                            }
+                            None => self.local_drop("no_remote"),
+                        }
+                    }
+                }
+                Action::Drop(reason) => self.local_drop(reason),
+                Action::Note(n) => print_note(&n),
+            }
+        }
+    }
+
     fn print_stats(&self) {
         let st = self.link.stats();
         let mut drops: Vec<(String, u64)> = st
@@ -640,19 +753,24 @@ impl Tunnel {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{{\"ts\":\"{}\",\"event\":\"stats\",\"sent\":{},\"received\":{},\"delivered\":{},\"drops\":{{{drops}}}}}",
+            "{{\"ts\":\"{}\",\"event\":\"stats\",\"sent\":{},\"received\":{},\"delivered\":{},\"control_sent\":{},\"control_received\":{},\"drops\":{{{drops}}}}}",
             rfc3339(SystemTime::now()),
             st.sent,
             st.received,
-            st.delivered
+            st.delivered,
+            st.control_sent,
+            st.control_received
         );
     }
 }
 
-fn run(args: &[String]) -> R {
+/// Exit code when this process's own `--peer` was removed (R-SEC2).
+const EXIT_PEER_REMOVED: u8 = 3;
+
+fn run(args: &[String]) -> R<u8> {
     let Some(a) = parse_args(args)? else {
         print!("{USAGE}");
-        return Ok(());
+        return Ok(0);
     };
     let me = Identity::load(&a.dir).map_err(|e| {
         format!(
@@ -660,10 +778,24 @@ fn run(args: &[String]) -> R {
             a.dir.display()
         )
     })?;
+    // An old trusted-peers file is converted once; say what came out.
+    if let Some(peers) = store::migrate_if_needed(&a.dir)? {
+        let ts = rfc3339(SystemTime::now());
+        for p in &peers {
+            println!(
+                "{{\"ts\":\"{ts}\",\"event\":\"trust_migrated\",\"key\":\"{}\",\"role\":\"{}\"}}",
+                p.fingerprint(),
+                p.role
+            );
+        }
+    }
+    // Look at the files before reading them, so a change in between is seen.
+    let mut watch = Watch::new(&a.dir, Instant::now());
     let peer = store::find(&a.dir, &a.peer)?.ok_or(format!(
         "no trusted peer named {}; pair first, or `oasa-pair trust`",
         a.peer
     ))?;
+    let own_public = *me.public_key();
     let start = Instant::now();
     let wall_base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -736,6 +868,7 @@ fn run(args: &[String]) -> R {
 
     let mut t = Tunnel {
         link,
+        control: Control::new(&a.dir, own_public, peer.public, Box::new(OsEntropy)),
         enc,
         plain_out,
         plain_send: a.plain_send,
@@ -748,9 +881,11 @@ fn run(args: &[String]) -> R {
     };
 
     if a.initiate {
-        let ev = t.link.start_handshake(start.elapsed())?;
-        t.apply(ev, None);
+        let now = start.elapsed();
+        let ev = t.link.start_handshake(now)?;
+        t.apply(ev, None, now);
     }
+    let mut exit_code = 0u8;
     let deadline = match a.duration {
         Some(d) => Some(start.checked_add(d).ok_or("--duration is too large")?),
         None => None,
@@ -780,7 +915,7 @@ fn run(args: &[String]) -> R {
                         continue;
                     }
                     let ev = t.link.handle_packet(now, &bytes);
-                    t.apply(ev, Some(from));
+                    t.apply(ev, Some(from), now);
                 }
                 Msg::Plain(bytes, from) => {
                     if !a.allow_remote_plain && from.ip() != a.plain_send.ip() {
@@ -803,13 +938,93 @@ fn run(args: &[String]) -> R {
                 }
             }
         }
-        let ev = t.link.poll_timers(start.elapsed());
-        t.apply(ev, None);
+        let now = start.elapsed();
+        let ev = t.link.poll_timers(now);
+        t.apply(ev, None, now);
+        let actions = t.control.poll(now);
+        t.run_actions(actions, now);
+        // The trust files: looked at four times a second, and at once on SIGHUP.
+        let hup = RELOAD.swap(false, Ordering::SeqCst);
+        if let Some((trust_changed, log_changed)) = watch.check(Instant::now(), hup) {
+            if trust_changed {
+                match reload(&a.dir, &peer, &mut t) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        exit_code = EXIT_PEER_REMOVED;
+                        break;
+                    }
+                    Err(e) => {
+                        // Fail closed: if the files cannot be read, a removal
+                        // might be in them. Stop rather than guess.
+                        t.flush_drop_summary(true);
+                        t.print_stats();
+                        return Err(format!("cannot read the trust files: {e}").into());
+                    }
+                }
+            }
+            if log_changed {
+                let actions = t.control.log_changed(now);
+                t.run_actions(actions, now);
+            }
+        }
         t.flush_drop_summary(false);
     }
     t.flush_drop_summary(true);
     t.print_stats();
-    Ok(())
+    Ok(exit_code)
+}
+
+/// Read the trust files again. `Ok(true)`: carry on. `Ok(false)`: our own
+/// peer is gone (removed, or no longer listed); the link to it is over, which
+/// the caller does by exiting. Unsent control messages for it are dropped.
+fn reload(dir: &std::path::Path, peer: &store::Peer, t: &mut Tunnel) -> oasa_sec::Result<bool> {
+    let snap = store::snapshot(dir)?;
+    let ts = rfc3339(SystemTime::now());
+    if snap.get(&peer.public).is_none() {
+        t.control.peer_removed();
+        let why = if snap.removed.is_removed(&peer.public) {
+            "removed"
+        } else {
+            "not_listed"
+        };
+        println!(
+            "{{\"ts\":\"{ts}\",\"event\":\"peer_removed\",\"peer\":\"{}\",\"why\":\"{why}\"}}",
+            fingerprint(&peer.public)
+        );
+        return Ok(false);
+    }
+    println!(
+        "{{\"ts\":\"{ts}\",\"event\":\"trust_reloaded\",\"peers\":{},\"removed\":{}}}",
+        snap.peers.len(),
+        snap.removed.removed_keys().len()
+    );
+    Ok(true)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// One log line for a control-layer note. Fingerprints and numbers only.
+fn print_note(n: &Note) {
+    let mut line = format!(
+        "{{\"ts\":\"{}\",\"event\":\"{}\"",
+        rfc3339(SystemTime::now()),
+        n.what
+    );
+    if let Some(k) = &n.key {
+        line.push_str(&format!(",\"key\":\"{k}\""));
+    }
+    if let Some(s) = n.seq {
+        line.push_str(&format!(",\"seq\":{s}"));
+    }
+    if let Some(d) = n.detail {
+        line.push_str(&format!(",\"detail\":\"{d}\""));
+    }
+    line.push('}');
+    println!("{line}");
 }
 
 /// `2026-10-23T12:34:56.789Z`

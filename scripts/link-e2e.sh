@@ -33,6 +33,7 @@ wait_for() { # secs pattern file
 }
 pubkey() { $B/oasa-pair show --dir "$1" | sed -E 's/.*"public_key":"([0-9a-f]{64})".*/\1/'; }
 n() { $CHECK count "$@"; }
+fp_of() { $B/oasa-pair show --dir "$T/$1" | sed -E 's/.*"fingerprint":"([^"]+)".*/\1/'; }
 jstat() { $CHECK stat "$@"; }
 
 # --- identities and trust (oasa-pair init + show + trust) ----------------
@@ -205,5 +206,110 @@ pass "--mavlink-guard together with --no-mavlink-guard is refused"
 cargo build --release --example mavguard_check >/dev/null 2>&1 || fail "could not build examples/mavguard_check"
 $PYTHON -I tests/interop/mavguard_diff.py --n 3000 || fail "the guard and pymavlink disagree"
 pass "guard and pymavlink agree on frame boundaries, ids and CRCs for everything the guard passes"
+
+# --- 7. Removal (R-SEC2) -------------------------------------------------
+wait_exit() { # pid secs: set EXIT_RC to the exit code, or "running" if it did not exit in time.
+  # Not for use in $(...): wait only works in the shell that started the process.
+  local i
+  EXIT_RC=running
+  for i in $(seq $(($2 * 10))); do
+    if ! kill -0 "$1" 2>/dev/null; then EXIT_RC=0; wait "$1" || EXIT_RC=$?; return 0; fi
+    sleep 0.1
+  done
+}
+link() { # logname dir peer encport [flags...]: plain ports are enc+100 (in) and enc+200 (out)
+  local name=$1 dir=$2 peer=$3 p=$4; shift 4
+  $B/oasa-link --dir "$T/$dir" --peer "$peer" --bind 127.0.0.1:$p \
+    --plain-listen 127.0.0.1:$((p+100)) --plain-send 127.0.0.1:$((p+200)) --duration 90 "$@" > "$T/$name.log" 2>&1 &
+  LAST=$!; PIDS+=($LAST)
+}
+trust_as() { # dir name peerdir role
+  $B/oasa-pair trust --dir "$T/$1" --name "$2" --key "$(pubkey "$T/$3")" --role "$4" >/dev/null
+}
+for d in rg rd rg2 rd2; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+
+# 7a. A removal mid-run: the link to the removed device ends with exit code 3.
+trust_as rd rg rg operator; trust_as rg rd rd peer
+link rd rd rg 7810; RD=$LAST
+link rg rg rd 7811 --remote 127.0.0.1:7810 --initiate; RG=$LAST
+wait_for 15 session_established "$T/rd.log" || fail "removal test: no session"
+wait_for 15 session_established "$T/rg.log" || fail "removal test: ground station has no session"
+$B/oasa-pair remove --dir "$T/rd" rg > "$T/remove.out" 2>&1 || { cat "$T/remove.out"; fail "oasa-pair remove failed"; }
+wait_exit "$RD" 5; [ "$EXIT_RC" = 3 ] || fail "the drone's link did not exit with code 3 after its peer was removed"
+grep -q '"event":"peer_removed".*"why":"removed"' "$T/rd.log" || fail "no peer_removed line"
+$CHECK check "$T/rd.log" || fail "removal log lines are not the agreed JSON"
+[ "$(jstat "$T/rd.log" delivered)" = 0 ] || fail "stats after peer_removed"
+pass "oasa-pair remove: the running oasa-link logs peer_removed and exits with code 3 within seconds (file watch, no restart)"
+if $B/oasa-link --dir "$T/rd" --peer rg --bind 127.0.0.1:7812 --plain-listen 127.0.0.1:7912 \
+  --plain-send 127.0.0.1:8012 --duration 1 >"$T/again.log" 2>&1; then fail "a removed peer was accepted again"; fi
+if $B/oasa-pair trust --dir "$T/rd" --name rg --key "$(pubkey "$T/rg")" >"$T/retrust.out" 2>&1; then fail "trust accepted a removed key"; fi
+grep -q "removed" "$T/retrust.out" || fail "no explanation when trusting a removed key"
+$B/oasa-pair removed --dir "$T/rd" | grep -q "by hand" || fail "removed does not list the tombstone"
+[ "$(stat -c %a "$T/rd/removed")" = 600 ] && [ "$(stat -c %a "$T/rd/trusted-peers.v1")" = 600 ] || fail "removal files are not owner-only"
+kill -TERM "$RG" 2>/dev/null || true
+pass "a removed key cannot be started with, trusted or paired again; tombstone file is 600"
+
+# 7b. SIGHUP reloads at once (even with nothing changed), and a removal by SIGHUP exits 3.
+trust_as rd2 rg2 rg2 operator; trust_as rg2 rd2 rd2 peer
+link rd2 rd2 rg2 7813; RD2=$LAST
+link rg2 rg2 rd2 7814 --remote 127.0.0.1:7813 --initiate; RG2=$LAST
+wait_for 15 session_established "$T/rd2.log" || fail "SIGHUP test: no session"
+kill -HUP "$RD2"
+wait_for 2 trust_reloaded "$T/rd2.log" || fail "SIGHUP did not reload the trust files"
+$B/oasa-pair remove --dir "$T/rd2" rg2 >/dev/null
+kill -HUP "$RD2"
+wait_exit "$RD2" 3; [ "$EXIT_RC" = 3 ] || fail "SIGHUP after a removal did not end the link with code 3"
+kill -TERM "$RG2" 2>/dev/null || true
+pass "SIGHUP reloads at once; after a removal it ends the link with code 3"
+
+# 7c. A revoke travels from an admin to a device, and on to the device's other link.
+for d in adm dev dev3 vic vic2; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+trust_as dev adm adm admin; trust_as dev vic vic peer; trust_as dev vic2 vic2 peer
+trust_as adm dev dev peer; trust_as adm vic vic peer; trust_as adm vic2 vic2 peer
+trust_as vic dev dev peer
+trust_as dev3 adm adm peer; trust_as adm dev3 dev3 peer   # dev3 does not list adm as admin
+link devA dev adm 7820; DEVA=$LAST          # dev, talking to the admin
+link devV dev vic 7821; DEVV=$LAST          # dev, talking to the device that will be revoked
+link vic vic dev 7822 --remote 127.0.0.1:7821 --initiate; VIC=$LAST
+link adm adm dev 7823 --remote 127.0.0.1:7820 --initiate; ADM=$LAST
+link dev3 dev3 adm 7824; DEV3=$LAST
+link adm3 adm dev3 7825 --remote 127.0.0.1:7824 --initiate; ADM3=$LAST
+for f in devA devV vic adm dev3 adm3; do wait_for 15 session_established "$T/$f.log" || fail "revoke test: $f has no session"; done
+$B/oasa-pair revoke --dir "$T/adm" vic > "$T/revoke.out" 2>&1 || { cat "$T/revoke.out"; fail "oasa-pair revoke failed"; }
+wait_exit "$DEVV" 8; [ "$EXIT_RC" = 3 ] || fail "the revoke did not reach the device (its link to the revoked peer is still running)"
+grep -q '"event":"removal_entry".*"detail":"removed"' "$T/devA.log" || fail "the device logged no removal_entry"
+$B/oasa-pair removed --dir "$T/dev" | grep -q "by admin" || fail "the device has no tombstone naming the admin"
+! $B/oasa-pair peers --dir "$T/dev" | grep -q " vic$" || fail "the revoked device is still in the device's list"
+pass "revoke: an admin's entry reaches the device over the link, tombstones the key there, and the device's other oasa-link (to the revoked peer) exits with code 3"
+# A device that does not list the sender as admin applies nothing and says so.
+sleep 1
+[ ! -e "$T/dev3/removed" ] || fail "a device applied a removal from a sender that is not its admin"
+grep -q '"event":"not_admin_here"' "$T/adm3.log" || fail "the sender was not told NOT_ADMIN"
+pass "a device that does not list the sender as admin answers NOT_ADMIN and changes nothing"
+
+# The admin is offline when it revokes the next device, and catches up when it reconnects.
+kill -TERM "$ADM"; wait "$ADM" || fail "admin link did not exit 0"
+$B/oasa-pair revoke --dir "$T/adm" vic2 >/dev/null
+VIC2FP=$(fp_of vic2)
+! $B/oasa-pair removed --dir "$T/dev" | grep -q "$VIC2FP" || fail "vic2 was removed on the device before the admin reconnected"
+link adm_b adm dev 7826 --remote 127.0.0.1:7820 --initiate
+wait_for 15 session_established "$T/adm_b.log" || fail "the admin could not reconnect"
+for i in $(seq 100); do $B/oasa-pair removed --dir "$T/dev" | grep -q "$VIC2FP" && break; sleep 0.1; done
+$B/oasa-pair removed --dir "$T/dev" | grep -q "$VIC2FP" || fail "the admin came back online but the device never got the entry"
+[ "$(grep -c '"event":"removal_entry"' "$T/devA.log")" -ge 2 ] || fail "the device logged too few removal entries"
+pass "an admin that was offline when it revoked catches the device up as soon as the link is back"
+
+# Every log line is the agreed JSON, nothing secret is printed, control is counted apart.
+kill -TERM "$DEVA" "$VIC" "$ADM3" "$DEV3" 2>/dev/null || true
+wait "$DEVA" || fail "device link did not exit 0 on SIGTERM"
+$CHECK check "$T/devA.log" && $CHECK check "$T/adm_b.log" || fail "removal log lines are not the agreed JSON"
+[ "$(jstat "$T/devA.log" control_received)" -ge 4 ] || fail "control messages not counted"
+[ "$(jstat "$T/devA.log" delivered)" = 0 ] || fail "a control message reached the application side"
+KEY=$(od -An -tx1 -v "$T/adm/identity.key" | tr -d ' \n')
+grep -q "$KEY" "$T"/*.log && fail "a private key is in a log"
+for f in "$T"/dev/removed "$T"/adm/removal-log "$T"/dev/removal-sync/*; do
+  [ "$(stat -c %a "$f")" = 600 ] || fail "$f is not owner-only"
+done
+pass "control messages are counted apart and never reach the application side; removal files are 600"
 
 echo "All link end-to-end checks passed."

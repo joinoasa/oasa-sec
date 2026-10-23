@@ -279,7 +279,9 @@ def check_lines(args):
         assert e["ts"].endswith("Z") and len(e["ts"]) == 24, e
         assert e["event"] in ("handshake_sent", "session_established", "rekey",
                               "drop", "drops_suppressed", "hint", "stats", "error",
-                              "mavlink_guard", "warning"), e
+                              "mavlink_guard", "warning", "peer_removed", "trust_reloaded",
+                              "trust_migrated", "removal_entry", "not_admin_here",
+                              "control_error", "signing_key_message_ignored"), e
     return 0
 
 
