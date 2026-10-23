@@ -18,10 +18,11 @@ One encrypted, authenticated link between two paired OASA devices, over any radi
 
 - **IK:** the initiator knows the responder's public key from `trusted-peers` and sends its own, encrypted. The responder looks it up in `trusted-peers` and **silently drops** the handshake if it isn't there.
 - Either side may initiate. Ground stations initiate by default.
-- **Message 1** (initiator → responder) payload: a 12-byte **timestamp** (8-byte seconds, 4-byte nanoseconds, big-endian). It must strictly increase per initiator. A device without a trusted clock uses `max(clock, last_sent + 1 ns)`, saving the last value so it survives reboots. The responder keeps the newest timestamp per peer and drops any handshake that isn't newer, so a recorded message 1 can't be replayed.
-- **Message 2** (responder → initiator) payload: empty.
+- **Message 1** (initiator → responder) payload: a 12-byte **timestamp** (8-byte seconds, 4-byte nanoseconds, big-endian), then the initiator's 2-byte sender index. It must strictly increase per initiator. A device without a trusted clock uses `max(clock, last_sent + 1 ns)`, saving the last value so it survives reboots. The responder keeps the newest timestamp per peer and drops any handshake that isn't newer, so a recorded message 1 can't be replayed.
+- **Message 2** (responder → initiator) payload: the responder's sender index, then the receiver index (2 bytes each).
+- **Indexes are authenticated:** the indexes in the clear header must equal the ones inside the encrypted payload, or the handshake is dropped as `bad_header`. Someone on the path can't change them to break a session.
 - **Limits:** cheap checks (header, size) come before any X25519. The responder handles at most 20 handshakes a second in total, and answers each peer at most once a second.
-- Sizes on the wire: handshake 1 is 111 bytes, handshake 2 is 53 bytes.
+- Sizes on the wire: handshake 1 is 113 bytes, handshake 2 is 57 bytes.
 
 The handshake gives two keys (one per direction) used with `snow`'s stateless transport: we pass the nonce ourselves.
 
@@ -43,7 +44,7 @@ Every packet starts with one header byte:
 - **Counter:** a 64-bit number per direction per session, starting at 0, used as the nonce. It never repeats under a key. Only its low 2 or 4 bytes are sent.
 - **Rebuilding the counter** (as DTLS 1.3, RFC 9147 §4.2.2): the receiver picks the 64-bit value closest to `highest seen + 1` whose low bytes match. This works while fewer than 32,768 packets in a row are lost or reordered, so the short counter is for links where that can't happen, and the long one for fast links.
 - **The tag is never shortened** (RFC 8439 forbids it).
-- **No separate header authentication:** every header field picks the key (type, index) or the nonce (counter). Changing any of them makes the tag check fail. Any field added later must keep this property or be covered as associated data.
+- **No separate header authentication for data:** every header field picks the key (type, index) or the nonce (counter). Changing any of them makes the tag check fail. Handshake indexes are covered by the Noise payload (§2). Any field added later must keep this property or be covered as associated data.
 - **Data payload:** the plaintext packet, unchanged. An empty payload is a **keepalive**.
 
 Overhead per data packet: 1 + 2 + 2 + 16 = **21 bytes** (23 with the long counter).
@@ -52,9 +53,9 @@ Overhead per data packet: 1 + 2 + 2 + 16 = **21 bytes** (23 with the long counte
 
 In this order, dropping silently on any failure:
 
-1. Header byte valid; packet long enough.
+1. Header byte valid; packet long enough and not over the MTU.
 2. Index matches a live session.
-3. Counter rebuilt; not older than the replay window.
+3. Counter rebuilt (a tie exactly half a range away takes the higher value); not older than the replay window.
 4. Tag verified (decrypt).
 5. **Replay window** (RFC 6479, 1024 packets): drop if already seen, otherwise mark it. Updated only after step 4, so forged packets can't move it.
 
@@ -70,8 +71,10 @@ Drops are counted by reason (`bad_header`, `unknown_index`, `too_old`, `bad_tag`
 | Keepalive if nothing sent for | 25 s (off by default on slow radios) |
 
 - The **initiator** may send data as soon as it gets message 2. It sends a keepalive at once so the responder learns the session works.
-- The **responder** sends on a new session only after a valid data packet arrives on it. Until then it keeps using the previous session. This stops a stale or replayed handshake from breaking a working link.
-- The previous session stays readable until the new one is confirmed, so a rekey loses no packets.
+- The **responder** sends on a new session only after a valid data packet arrives on it. Until then it keeps using the previous session. This stops a stale or replayed handshake from breaking a working link. When it switches, it sends one keepalive so the initiator knows the session is confirmed.
+- If the initiator hears nothing on a new session within the retry time, it starts another handshake. An unconfirmed session never replaces a working one.
+- The previous session stays readable until the new one is confirmed, or 10 s after its last packet, so a rekey loses no packets.
+- If both sides start a handshake at once, both sessions work; each side may send on a different one until the next rekey.
 - Rekey limits are set per radio from its airtime: a LoRa link may rekey hourly instead.
 - Keys and session state are wiped when a session ends.
 
