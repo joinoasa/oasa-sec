@@ -14,6 +14,9 @@ pub enum Error {
     BadKeyFile(String),
     /// The peer broke the pairing protocol.
     Protocol(&'static str),
+    /// The encrypted link was set up wrongly (bad settings, a peer that can't
+    /// be added).
+    Link(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -26,6 +29,7 @@ impl fmt::Display for Error {
             Error::BadCode(why) => write!(f, "bad pairing code: {why}"),
             Error::BadKeyFile(why) => write!(f, "bad key file: {why}"),
             Error::Protocol(why) => write!(f, "pairing protocol error: {why}"),
+            Error::Link(why) => write!(f, "link error: {why}"),
         }
     }
 }

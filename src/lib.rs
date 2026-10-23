@@ -18,6 +18,7 @@ pub mod code;
 pub mod error;
 mod files;
 pub mod identity;
+pub mod link;
 pub mod pairing;
 pub mod signing;
 pub mod store;
