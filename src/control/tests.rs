@@ -8,6 +8,7 @@ use crate::files::{tempdir, write_private_file};
 use crate::removal::{
     self, LOG_FILE, REMOVED_FILE, ROTATION_PENDING_FILE, SYNC_DIR, VOTES_FILE, load_removed,
 };
+use crate::signing::SigningKey;
 use crate::store::{Peer, TRUST_FILE};
 
 const DEVICE: [u8; 32] = [1; 32];
@@ -358,25 +359,42 @@ fn have_ack_and_not_admin_need_no_role_but_do_need_a_matching_request() {
     }
 }
 
+fn next_msg(id: u8, generation: u32, key: u8) -> Vec<u8> {
+    Message::SigningKeyNext {
+        id: [id; 4],
+        generation,
+        key: SecretKey::new([key; 32]),
+    }
+    .encode()
+    .to_vec()
+}
+
+fn commit_msg(id: u8, generation: u32) -> Vec<u8> {
+    Message::SigningKeyCommit {
+        id: [id; 4],
+        generation,
+    }
+    .encode()
+    .to_vec()
+}
+
+fn ack_of(out: &[Action]) -> Vec<(RequestId, u8)> {
+    sends(out)
+        .iter()
+        .filter_map(|b| match parsed(b) {
+            Message::Ack { id, acked } => Some((id, acked)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn signing_key_messages_only_from_a_known_drone_and_never_acked() {
+fn signing_key_messages_only_from_a_known_drone() {
     let dir = tempdir("ctl-signing");
     trust(&dir, PLAIN, "drone", Role::Peer);
     trust(&dir, ADMIN, "admin", Role::Admin);
     trust(&dir, OPERATOR, "operator", Role::Operator);
-    let next = Message::SigningKeyNext {
-        id: [1; 4],
-        generation: 3,
-        key: SecretKey::new([9; 32]),
-    }
-    .encode()
-    .to_vec();
-    let commit = Message::SigningKeyCommit {
-        id: [2; 4],
-        generation: 3,
-    }
-    .encode()
-    .to_vec();
+    let (next, commit) = (next_msg(1, 3, 9), commit_msg(2, 3));
     // No signing key held for the sender: dropped, whatever its role.
     for sender in [PLAIN, ADMIN, OPERATOR] {
         let mut c = control(&dir, DEVICE, sender, 1);
@@ -387,22 +405,333 @@ fn signing_key_messages_only_from_a_known_drone_and_never_acked() {
     // A ground station holding that drone's key accepts them from it only.
     write_private_file(&peer_key_path(&dir, &fingerprint(&PLAIN)), &[1u8; 40]).unwrap();
     let mut c = control(&dir, DEVICE, PLAIN, 1);
-    for m in [&next, &commit] {
-        let out = c.handle(secs(1), 1, m);
-        assert_eq!(notes(&out), vec!["signing_key_message_ignored"]);
-        assert!(
-            sends(&out).is_empty(),
-            "phase A does not claim to have stored it"
-        );
-    }
+    let out = c.handle(secs(1), 1, &next);
+    assert_eq!(notes(&out), vec!["signing_key_next"]);
+    assert_eq!(ack_of(&out), vec![([1; 4], SIGNING_KEY_NEXT)]);
     let mut c = control(&dir, DEVICE, ADMIN, 1);
     assert_eq!(drops(&c.handle(secs(1), 1, &next)), vec!["bad_role"]);
     // A drone itself (it holds an autopilot key) takes none: the flow is drone to operators.
     write_private_file(&dir.join(AUTOPILOT_KEY_FILE), &[2u8; 40]).unwrap();
     let mut c = control(&dir, DEVICE, PLAIN, 1);
     assert_eq!(drops(&c.handle(secs(1), 1, &next)), vec!["bad_role"]);
-    // Nothing was written anywhere.
+    assert_eq!(drops(&c.handle(secs(1), 1, &commit)), vec!["bad_role"]);
     assert!(!dir.join(ROTATION_PENDING_FILE).exists());
+}
+
+fn ground_with_drone() -> (PathBuf, Control) {
+    let dir = tempdir("ctl-ground");
+    trust(&dir, PLAIN, "drone", Role::Peer);
+    write_private_file(&peer_key_path(&dir, &fingerprint(&PLAIN)), &[1u8; 40]).unwrap();
+    let c = control(&dir, DEVICE, PLAIN, 1);
+    (dir, c)
+}
+
+#[test]
+fn an_operator_stores_acks_and_switches_only_on_commit_and_every_reply_echoes_the_id() {
+    let (dir, mut c) = ground_with_drone();
+    let fp = fingerprint(&PLAIN);
+    let held = || SigningKey::load(&peer_key_path(&dir, &fp)).unwrap();
+    let out = c.handle(secs(1), 1, &next_msg(5, 1, 9));
+    assert_eq!(ack_of(&out), vec![([5; 4], SIGNING_KEY_NEXT)]);
+    assert_ne!(held().as_bytes(), &[9u8; 32], "not switched by NEXT");
+    // A repeat is acked again (the ack may have been lost) and changes nothing.
+    let out = c.handle(secs(2), 1, &next_msg(6, 1, 9));
+    assert_eq!(ack_of(&out), vec![([6; 4], SIGNING_KEY_NEXT)]);
+    let out = c.handle(secs(3), 1, &commit_msg(7, 1));
+    assert_eq!(ack_of(&out), vec![([7; 4], SIGNING_KEY_COMMIT)]);
+    assert_eq!(held().as_bytes(), &[9u8; 32]);
+    // Replays after the switch: acked, and nothing moves.
+    for m in [commit_msg(8, 1), next_msg(9, 1, 9), next_msg(10, 0, 3)] {
+        let out = c.handle(secs(4), 1, &m);
+        assert_eq!(ack_of(&out).len(), 1, "{out:?}");
+        assert_eq!(held().as_bytes(), &[9u8; 32]);
+    }
+}
+
+#[test]
+fn hostile_signing_messages_change_nothing() {
+    let (dir, mut c) = ground_with_drone();
+    let fp = fingerprint(&PLAIN);
+    let before = std::fs::read(peer_key_path(&dir, &fp)).unwrap();
+    c.handle(secs(1), 1, &next_msg(1, 2, 9));
+    // The same generation with another key: refused, not acked.
+    let out = c.handle(secs(1), 1, &next_msg(2, 2, 8));
+    assert_eq!(drops(&out), vec!["bad_control"]);
+    assert!(sends(&out).is_empty());
+    // An all-zero key would turn signing off.
+    let out = c.handle(secs(1), 1, &next_msg(3, 3, 0));
+    assert_eq!(drops(&out), vec!["bad_control"]);
+    // A commit for a generation never sent: noted, not acked, nothing switched.
+    for g in [1, 3, u32::MAX] {
+        let out = c.handle(secs(1), 1, &commit_msg(4, g));
+        assert_eq!(notes(&out), vec!["signing_key_commit_unknown"]);
+        assert!(sends(&out).is_empty());
+    }
+    assert_eq!(std::fs::read(peer_key_path(&dir, &fp)).unwrap(), before);
+    // Truncated and padded messages are not messages.
+    let mut long = next_msg(1, 2, 9);
+    long.push(0);
+    for bad in [
+        next_msg(1, 2, 9)[..40].to_vec(),
+        long,
+        commit_msg(1, 2)[..8].to_vec(),
+    ] {
+        assert_eq!(drops(&c.handle(secs(1), 1, &bad)), vec!["bad_control"]);
+    }
+    // A removed drone's messages go nowhere.
+    c.peer_removed();
+    assert_eq!(
+        drops(&c.handle(secs(1), 1, &commit_msg(1, 2))),
+        vec!["peer_removed"]
+    );
+}
+
+/// A drone with one operator.
+fn drone_with_operator() -> (PathBuf, Control) {
+    let dir = tempdir("ctl-drone");
+    write_private_file(&dir.join(AUTOPILOT_KEY_FILE), &{
+        let mut b = [7u8; 40];
+        b[32..].fill(0);
+        b
+    })
+    .unwrap();
+    trust(&dir, OPERATOR, "operator", Role::Operator);
+    let c = control(&dir, DEVICE, OPERATOR, 1);
+    (dir, c)
+}
+
+fn only_send(out: &[Action]) -> Message {
+    let s = sends(out);
+    assert_eq!(s.len(), 1, "{out:?}");
+    parsed(&s[0])
+}
+
+#[test]
+fn a_drone_sends_next_then_commit_and_remembers_what_was_acked() {
+    let (dir, mut d) = drone_with_operator();
+    let fp = fingerprint(&OPERATOR);
+    // Nothing owed for the key from pairing.
+    assert!(sends(&d.session_started(secs(0))).is_empty());
+    // A rotation begins: the pending key goes out at once.
+    let b = rotation::begin(&dir).unwrap();
+    let Message::SigningKeyNext {
+        id,
+        generation,
+        key,
+    } = only_send(&d.signing_changed(secs(1)))
+    else {
+        panic!()
+    };
+    assert_eq!(
+        (generation, key.as_bytes()),
+        (b.generation, b.key.as_bytes())
+    );
+    // No second message while it waits for its ack; an ack for another id or type is ignored.
+    assert!(sends(&d.signing_changed(secs(1))).is_empty());
+    assert!(
+        d.handle(
+            secs(1),
+            1,
+            &Message::Ack {
+                id: [9; 4],
+                acked: SIGNING_KEY_NEXT
+            }
+            .encode()
+        )
+        .is_empty()
+    );
+    assert!(
+        d.handle(
+            secs(1),
+            1,
+            &Message::Ack {
+                id,
+                acked: SIGNING_KEY_COMMIT
+            }
+            .encode()
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        rotation::read_acked(&dir, &fp).unwrap(),
+        rotation::Acked::default()
+    );
+    // Its ack: remembered. And no commit yet: the autopilot has not taken it.
+    let out = d.handle(
+        secs(1),
+        1,
+        &Message::Ack {
+            id,
+            acked: SIGNING_KEY_NEXT,
+        }
+        .encode(),
+    );
+    assert_eq!(notes(&out), vec!["signing_key_acked"]);
+    assert!(sends(&out).is_empty());
+    assert_eq!(rotation::read_acked(&dir, &fp).unwrap().next, 1);
+    // The autopilot took it: the commit.
+    rotation::commit(&dir, 1, 0).unwrap();
+    let Message::SigningKeyCommit { id, generation } = only_send(&d.signing_changed(secs(2)))
+    else {
+        panic!()
+    };
+    assert_eq!(generation, 1);
+    d.handle(
+        secs(2),
+        1,
+        &Message::Ack {
+            id,
+            acked: SIGNING_KEY_COMMIT,
+        }
+        .encode(),
+    );
+    assert_eq!(
+        rotation::read_acked(&dir, &fp).unwrap(),
+        rotation::Acked { next: 1, commit: 1 }
+    );
+    assert!(sends(&d.signing_changed(secs(3))).is_empty());
+    // A new session starts over from the files: nothing owed.
+    assert!(sends(&d.session_started(secs(4))).is_empty());
+}
+
+#[test]
+fn a_drone_and_an_operator_talk_through_a_rotation_even_with_a_lost_message() {
+    let (ddir, mut d) = drone_with_operator();
+    let (odir, mut o) = ground_with_drone_fp(&fingerprint(&DEVICE));
+    // The operator pairs with the drone: holds its current key (same bytes).
+    d.session_started(secs(0));
+    o.session_started(secs(0));
+    let b = rotation::begin(&ddir).unwrap();
+    let first = d.signing_changed(secs(1));
+    // The first NEXT is lost. The retry (2 s later) arrives.
+    assert_eq!(sends(&first).len(), 1);
+    let retry = d.poll(secs(3));
+    let seen = pump(&mut d, &mut o, retry, secs(3));
+    assert!(
+        seen.iter()
+            .any(|(_, m)| matches!(m, Message::Ack { acked, .. } if *acked == SIGNING_KEY_NEXT))
+    );
+    assert_eq!(
+        rotation::operator_pending(&odir, &fingerprint(&DEVICE))
+            .unwrap()
+            .unwrap()
+            .0,
+        1
+    );
+    // The autopilot took it.
+    rotation::commit(&ddir, b.generation, 0).unwrap();
+    let out = d.signing_changed(secs(4));
+    pump(&mut d, &mut o, out, secs(4));
+    assert_eq!(
+        SigningKey::load(&peer_key_path(&odir, &fingerprint(&DEVICE)))
+            .unwrap()
+            .as_bytes(),
+        b.key.as_bytes()
+    );
+    assert_eq!(
+        rotation::operator_gen(&odir, &fingerprint(&DEVICE)).unwrap(),
+        1
+    );
+    assert!(
+        sends(&d.poll(secs(1000))).is_empty(),
+        "nothing left to resend"
+    );
+}
+
+fn ground_with_drone_fp(drone_fp: &str) -> (PathBuf, Control) {
+    let dir = tempdir("ctl-ground2");
+    trust(&dir, DEVICE, "drone", Role::Peer);
+    write_private_file(&peer_key_path(&dir, drone_fp), &[7u8; 40]).unwrap();
+    // This ground station is the drone's OPERATOR key.
+    let c = control(&dir, OPERATOR, DEVICE, 2);
+    (dir, c)
+}
+
+#[test]
+fn a_reconnecting_operator_that_missed_a_rotation_catches_up() {
+    let (ddir, mut d) = drone_with_operator();
+    let dfp = fingerprint(&DEVICE);
+    let (odir, mut o) = ground_with_drone_fp(&dfp);
+    // Two rotations happen while the operator is away.
+    for g in 1..=2 {
+        let b = rotation::begin(&ddir).unwrap();
+        assert_eq!(b.generation, g);
+        rotation::commit(&ddir, g, 0).unwrap();
+    }
+    // It comes back: NEXT(2) for the current key, then COMMIT(2).
+    let start = d.session_started(secs(10));
+    let seen = pump(&mut d, &mut o, start, secs(10));
+    let kinds: Vec<u8> = seen.iter().map(|(_, m)| m.type_byte()).collect();
+    assert_eq!(kinds, vec![SIGNING_KEY_NEXT, ACK, SIGNING_KEY_COMMIT, ACK]);
+    assert_eq!(rotation::operator_gen(&odir, &dfp).unwrap(), 2);
+    let cur = rotation::load_drone_keys(&ddir).unwrap().unwrap().current;
+    assert_eq!(SigningKey::load(&peer_key_path(&odir, &dfp)).unwrap(), cur);
+}
+
+#[test]
+fn only_operators_get_keys_and_a_removed_one_never_does() {
+    let (dir, mut d) = drone_with_operator();
+    let _ = rotation::begin(&dir).unwrap();
+    // A peer or an admin on the same link gets nothing.
+    for (key, role) in [(PLAIN, Role::Peer), (ADMIN, Role::Admin)] {
+        trust(&dir, key, "x", role);
+        let mut c = control(&dir, DEVICE, key, 3);
+        assert!(sends(&c.session_started(secs(0))).is_empty());
+    }
+    assert_eq!(sends(&d.session_started(secs(0))).len(), 1);
+    // The operator is removed: the very next call sends nothing, and retries stop.
+    removal::remove_local(&dir, &DEVICE, &OPERATOR, 5).unwrap();
+    assert!(sends(&d.signing_changed(secs(1))).is_empty());
+    d.peer_removed();
+    assert!(sends(&d.poll(secs(100))).is_empty());
+    // A new Control for the removed key (a restart) sends nothing either.
+    let mut c = control(&dir, DEVICE, OPERATOR, 4);
+    assert!(sends(&c.session_started(secs(0))).is_empty());
+    // And removing the operator asked for a rotation.
+    assert!(dir.join(ROTATION_PENDING_FILE).exists());
+}
+
+#[test]
+fn an_unacked_commit_starts_over_with_next_and_retries_back_off() {
+    let (dir, mut d) = drone_with_operator();
+    d.session_started(secs(0));
+    let b = rotation::begin(&dir).unwrap();
+    let Message::SigningKeyNext { id, .. } = only_send(&d.signing_changed(secs(0))) else {
+        panic!()
+    };
+    d.handle(
+        secs(0),
+        1,
+        &Message::Ack {
+            id,
+            acked: SIGNING_KEY_NEXT,
+        }
+        .encode(),
+    );
+    rotation::commit(&dir, b.generation, 0).unwrap();
+    assert!(matches!(
+        only_send(&d.signing_changed(secs(1))),
+        Message::SigningKeyCommit { .. }
+    ));
+    // Resends at 2 s, then 4, 8, 16 ...
+    let mut t = 1;
+    let mut gaps = Vec::new();
+    let mut last = 1;
+    let mut restarted = false;
+    while t < 400 && !restarted {
+        t += 1;
+        let out = d.poll(secs(t));
+        for m in sends(&out) {
+            gaps.push(t - last);
+            last = t;
+            restarted |= matches!(parsed(&m), Message::SigningKeyNext { .. });
+        }
+    }
+    assert_eq!(&gaps[..3], &[2u64, 4, 8][..], "{gaps:?}");
+    assert!(
+        restarted,
+        "after four resends it sends NEXT again, then the commit follows its ack"
+    );
 }
 
 #[test]

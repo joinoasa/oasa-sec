@@ -24,6 +24,8 @@ pub mod mavguard;
 mod mavlens;
 pub mod pairing;
 pub mod removal;
+pub mod rotation;
+pub mod signer;
 pub mod signing;
 pub mod store;
 

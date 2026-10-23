@@ -42,6 +42,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::identity::{check_peer_public, fingerprint};
 use crate::link::Entropy;
 use crate::removal::{self, Applied, Entry, LogId};
+use crate::rotation::{self, CommitOutcome, NextOutcome};
 use crate::signing::{AUTOPILOT_KEY_FILE, peer_key_path};
 use crate::store::{self, Role};
 
@@ -335,10 +336,25 @@ impl fmt::Debug for Action {
 /// A message waiting for an answer or an ack.
 struct Outgoing {
     id: RequestId,
-    bytes: Vec<u8>,
+    /// Wiped when dropped: a `SIGNING_KEY_NEXT` holds a key.
+    bytes: Zeroizing<Vec<u8>>,
     next_try: Duration,
     backoff: Duration,
+    /// How many times it was sent again.
+    resends: u32,
 }
+
+/// What our one signing-key message in flight is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SigningKind {
+    Next(u32),
+    Commit(u32),
+}
+
+/// A commit that stays unacked this many resends makes the drone start over
+/// with the current key's `SIGNING_KEY_NEXT`: the operator may have lost or
+/// replaced its pending key, and a commit alone would never be understood.
+const COMMIT_RESENDS_BEFORE_RESTART: u32 = 4;
 
 /// What belongs to one link session; forgotten when the next one starts.
 #[derive(Default)]
@@ -356,6 +372,8 @@ struct SessionState {
     acked: BTreeSet<u32>,
     /// The peer's last `REMOVE_HAVE`.
     held: Option<u32>,
+    /// A `SIGNING_KEY_NEXT` or `_COMMIT` waiting for its ack (drone side).
+    signing: Option<(Outgoing, SigningKind)>,
 }
 
 /// The control layer for one peer (one `oasa-link` process).
@@ -403,14 +421,16 @@ impl Control {
     }
 
     fn outgoing(&mut self, now: Duration, msg: Message) -> (Outgoing, Action) {
-        let bytes = msg.encode().to_vec();
+        let bytes = Zeroizing::new(msg.encode().to_vec());
+        let send = Action::Send(bytes.to_vec());
         let out = Outgoing {
             id: msg.id(),
-            bytes: bytes.clone(),
+            bytes,
             next_try: now + RETRY_INITIAL,
             backoff: RETRY_INITIAL,
+            resends: 0,
         };
-        (out, Action::Send(bytes))
+        (out, send)
     }
 
     /// The peer's role here, fresh from the files. `None`: not trusted.
@@ -428,7 +448,71 @@ impl Control {
         if self.peer_gone {
             return Vec::new();
         }
-        self.send_head(now)
+        let mut out = self.send_head(now);
+        out.extend(self.send_signing(now));
+        out
+    }
+
+    /// The drone's signing-key files changed (a rotation began, finished or
+    /// was dropped): send what this operator is now owed.
+    pub fn signing_changed(&mut self, now: Duration) -> Vec<Action> {
+        if !self.session.active || self.peer_gone {
+            return Vec::new();
+        }
+        self.send_signing(now)
+    }
+
+    /// Drone side: what does our operator still need? A pending key goes out
+    /// at once; the commit only after the autopilot took the key. Nothing for
+    /// anyone who is not an operator here (read fresh from the files, so a
+    /// removed operator is never sent a key) or if we are not a drone.
+    fn send_signing(&mut self, now: Duration) -> Vec<Action> {
+        if self.session.signing.is_some() {
+            return Vec::new(); // one at a time; the ack brings the next
+        }
+        match self.peer_role() {
+            Ok(Some(Role::Operator)) => {}
+            Ok(_) => return Vec::new(),
+            Err(_) => return vec![Action::Note(Note::new("control_error"))],
+        }
+        let (keys, acked) = match (
+            rotation::load_drone_keys(&self.dir),
+            rotation::read_acked(&self.dir, &self.peer_fp),
+        ) {
+            (Ok(Some(k)), Ok(a)) => (k, a),
+            (Ok(None), _) => return Vec::new(), // not a drone
+            _ => return vec![Action::Note(Note::new("control_error"))],
+        };
+        let (msg, kind) = match rotation::owed(&keys, acked) {
+            rotation::Owed::Nothing => return Vec::new(),
+            rotation::Owed::Next(g) => {
+                let key = if keys.next.as_ref().is_some_and(|n| n.0 == g) {
+                    keys.next.as_ref().map(|n| n.1.as_bytes())
+                } else {
+                    Some(keys.current.as_bytes())
+                };
+                let Some(key) = key else { return Vec::new() };
+                let id = self.new_id();
+                (
+                    Message::SigningKeyNext {
+                        id,
+                        generation: g,
+                        key: SecretKey::new(*key),
+                    },
+                    SigningKind::Next(g),
+                )
+            }
+            rotation::Owed::Commit(g) => {
+                let id = self.new_id();
+                (
+                    Message::SigningKeyCommit { id, generation: g },
+                    SigningKind::Commit(g),
+                )
+            }
+        };
+        let (o, send) = self.outgoing(now, msg);
+        self.session.signing = Some((o, kind));
+        vec![send]
     }
 
     /// The removal log may have grown (an admin ran `revoke` while the link
@@ -479,10 +563,32 @@ impl Control {
             }
             o.backoff = (o.backoff * 2).min(RETRY_MAX);
             o.next_try = now + o.backoff;
-            Some(Action::Send(o.bytes.clone()))
+            Some(Action::Send(o.bytes.to_vec()))
         };
         if let Some(a) = self.session.head.as_mut().and_then(due) {
             out.push(a);
+        }
+        let mut restart = false;
+        if let Some((o, kind)) = self.session.signing.as_mut()
+            && let Some(a) = due(o)
+        {
+            o.resends += 1;
+            if matches!(kind, SigningKind::Commit(_)) && o.resends >= COMMIT_RESENDS_BEFORE_RESTART
+            {
+                restart = true;
+            } else {
+                out.push(a);
+            }
+        }
+        if restart {
+            // Forget that the operator took the pending key; it is sent again.
+            self.session.signing = None;
+            match rotation::read_acked(&self.dir, &self.peer_fp).and_then(|a| {
+                rotation::write_acked(&self.dir, &self.peer_fp, rotation::Acked { next: 0, ..a })
+            }) {
+                Ok(()) => out.extend(self.send_signing(now)),
+                Err(_) => out.push(Action::Note(Note::new("control_error"))),
+            }
         }
         for o in self.session.entries.values_mut() {
             if let Some(a) = due(o) {
@@ -535,8 +641,12 @@ impl Control {
                     time,
                 },
             ),
-            Message::SigningKeyNext { generation, .. } => self.on_signing_key(generation),
-            Message::SigningKeyCommit { generation, .. } => self.on_signing_key(generation),
+            Message::SigningKeyNext {
+                id,
+                generation,
+                key,
+            } => self.on_signing_next(id, generation, &key),
+            Message::SigningKeyCommit { id, generation } => self.on_signing_commit(id, generation),
         }
     }
 
@@ -610,6 +720,9 @@ impl Control {
     }
 
     fn on_ack(&mut self, now: Duration, id: RequestId, acked: u8) -> Vec<Action> {
+        if acked == SIGNING_KEY_NEXT || acked == SIGNING_KEY_COMMIT {
+            return self.on_signing_ack(now, id, acked);
+        }
         if acked != REMOVE_ENTRY {
             return Vec::new();
         }
@@ -668,20 +781,105 @@ impl Control {
         out
     }
 
-    /// `SIGNING_KEY_NEXT` and `_COMMIT`: phase A only checks who sent them.
-    /// They are accepted from a drone this ground station holds a signing
-    /// key for, and from no one else. Nothing is done with them yet, and they
-    /// are not acked, so a sender is never told they were stored.
-    fn on_signing_key(&mut self, generation: u32) -> Vec<Action> {
-        let from_known_drone = peer_key_path(&self.dir, &self.peer_fp).exists()
-            && !self.dir.join(AUTOPILOT_KEY_FILE).exists();
-        if !from_known_drone {
+    /// The drone's signing messages are accepted from a drone this ground
+    /// station holds a signing key for, and from no one else. A device that
+    /// is itself a drone (holds an autopilot key) never takes them.
+    fn sender_is_a_known_drone(&self) -> bool {
+        peer_key_path(&self.dir, &self.peer_fp).exists()
+            && !self.dir.join(AUTOPILOT_KEY_FILE).exists()
+    }
+
+    /// `SIGNING_KEY_NEXT`: keep the key as pending. Acked once it is saved (or
+    /// was already, or is old news), so the drone can stop; never switched
+    /// before the commit. The same generation with another key is refused.
+    fn on_signing_next(&mut self, id: RequestId, generation: u32, key: &SecretKey) -> Vec<Action> {
+        if !self.sender_is_a_known_drone() {
             return vec![Action::Drop("bad_role")];
         }
-        let mut note = Note::new("signing_key_message_ignored");
-        note.seq = Some(generation);
-        note.detail = Some("signing-key rotation is not built yet");
-        vec![Action::Note(note)]
+        if key.as_bytes() == &[0u8; 32] {
+            // All zeros means "signing off" in MAVLink; never a real key.
+            return vec![Action::Drop("bad_control")];
+        }
+        match rotation::operator_on_next(&self.dir, &self.peer_fp, generation, key.as_bytes()) {
+            Ok(NextOutcome::Conflict) => vec![Action::Drop("bad_control")],
+            Ok(outcome) => {
+                let mut note = Note::new("signing_key_next");
+                note.seq = Some(generation);
+                note.detail = Some(match outcome {
+                    NextOutcome::Stored => "stored",
+                    NextOutcome::Known => "known",
+                    _ => "old",
+                });
+                vec![Action::Note(note), self.ack(id, SIGNING_KEY_NEXT)]
+            }
+            Err(_) => vec![Action::Note(Note::new("control_error"))],
+        }
+    }
+
+    /// `SIGNING_KEY_COMMIT`: switch to the pending key of that generation. A
+    /// commit for a generation we hold no key for is not acked.
+    fn on_signing_commit(&mut self, id: RequestId, generation: u32) -> Vec<Action> {
+        if !self.sender_is_a_known_drone() {
+            return vec![Action::Drop("bad_role")];
+        }
+        match rotation::operator_on_commit(&self.dir, &self.peer_fp, generation) {
+            Ok(CommitOutcome::NoPending) => {
+                let mut note = Note::new("signing_key_commit_unknown");
+                note.seq = Some(generation);
+                vec![Action::Note(note)]
+            }
+            Ok(outcome) => {
+                let mut note = Note::new("signing_key_commit");
+                note.seq = Some(generation);
+                note.detail = Some(if outcome == CommitOutcome::Switched {
+                    "switched"
+                } else {
+                    "already"
+                });
+                vec![Action::Note(note), self.ack(id, SIGNING_KEY_COMMIT)]
+            }
+            Err(_) => vec![Action::Note(Note::new("control_error"))],
+        }
+    }
+
+    /// Drone side: the operator acked our `NEXT` or `COMMIT`.
+    fn on_signing_ack(&mut self, now: Duration, id: RequestId, acked: u8) -> Vec<Action> {
+        let Some((o, kind)) = self.session.signing.as_ref() else {
+            return Vec::new();
+        };
+        let want = match kind {
+            SigningKind::Next(_) => SIGNING_KEY_NEXT,
+            SigningKind::Commit(_) => SIGNING_KEY_COMMIT,
+        };
+        if o.id != id || acked != want {
+            return Vec::new();
+        }
+        let kind = *kind;
+        self.session.signing = None;
+        let mut a = match rotation::read_acked(&self.dir, &self.peer_fp) {
+            Ok(a) => a,
+            Err(_) => return vec![Action::Note(Note::new("control_error"))],
+        };
+        match kind {
+            SigningKind::Next(g) => a.next = g,
+            SigningKind::Commit(g) => a.commit = g,
+        }
+        if rotation::write_acked(&self.dir, &self.peer_fp, a).is_err() {
+            return vec![Action::Note(Note::new("control_error"))];
+        }
+        let mut out = vec![Action::Note({
+            let mut n = Note::new("signing_key_acked");
+            n.seq = Some(match kind {
+                SigningKind::Next(g) | SigningKind::Commit(g) => g,
+            });
+            n.detail = Some(match kind {
+                SigningKind::Next(_) => "next",
+                SigningKind::Commit(_) => "commit",
+            });
+            n
+        })];
+        out.extend(self.send_signing(now));
+        out
     }
 }
 
