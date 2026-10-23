@@ -90,6 +90,12 @@ pub struct Config {
     pub handshakes_per_second: u32,
     /// Shortest gap between accepted handshakes from one peer.
     pub peer_handshake_gap: Duration,
+    /// Only for devices with a trusted clock. A handshake 1 whose timestamp
+    /// is more than this far ahead of the wall clock is refused and not
+    /// recorded. `None` (the default) is off: a device with a slow or unset
+    /// clock must not refuse every handshake. The wall clock is read at
+    /// each check from the clock given to `set_wall_clock`.
+    pub max_future: Option<Duration>,
 }
 
 impl Default for Config {
@@ -108,6 +114,7 @@ impl Default for Config {
             previous_grace: Duration::from_secs(10),
             handshakes_per_second: 20,
             peer_handshake_gap: Duration::from_secs(1),
+            max_future: None,
         }
     }
 }
@@ -148,6 +155,7 @@ impl Config {
             self.stale_after,
             self.previous_grace,
             self.peer_handshake_gap,
+            self.max_future.unwrap_or_default(),
             self.keepalive.unwrap_or_default(),
         ]
         .iter()
@@ -159,6 +167,19 @@ impl Config {
             return bad("keepalive must be above zero (use None for off)");
         }
         Ok(())
+    }
+}
+
+/// The current Unix time (since 1970), read when asked. For the
+/// `max_future` check only; the caller says how to read its clock. Any
+/// `FnMut() -> Duration` works.
+pub trait WallClock {
+    fn now(&mut self) -> Duration;
+}
+
+impl<F: FnMut() -> Duration> WallClock for F {
+    fn now(&mut self) -> Duration {
+        self()
     }
 }
 
@@ -398,6 +419,12 @@ impl Link {
     /// the events that go with it. Calling it again restarts the attempt.
     pub fn start_handshake(&mut self, now: Duration) -> Result<Vec<Event>> {
         self.ep.start_handshake(self.id, now)
+    }
+
+    /// Give the clock that `Config::max_future` is checked against. Without
+    /// one, the check uses `wall_base` plus the monotonic time.
+    pub fn set_wall_clock(&mut self, clock: Box<dyn WallClock>) {
+        self.ep.set_wall_clock(clock);
     }
 
     /// Process one received packet.

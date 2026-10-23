@@ -347,10 +347,21 @@ fn link_from(
     store: Box<dyn TimestampStore>,
     wall: Duration,
 ) -> Link {
+    link_cfg(my_key, peer_pub, seed, store, wall, Config::default())
+}
+
+fn link_cfg(
+    my_key: &[u8; 32],
+    peer_pub: [u8; 32],
+    seed: u64,
+    store: Box<dyn TimestampStore>,
+    wall: Duration,
+    cfg: Config,
+) -> Link {
     Link::new(
         &Identity::from_private_bytes(my_key).unwrap(),
         peer_pub,
-        Config::default(),
+        cfg,
         Box::new(TestRng(seed)),
         wall,
         store,
@@ -1240,7 +1251,7 @@ fn a_timestamp_far_in_the_future_is_refused_when_there_is_a_clock() {
         (Duration::from_secs(500), true, true),
         (Duration::from_secs(700), true, false),
         (hour * 24 * 365, true, false),
-        // A device with no clock (wall_base zero) cannot judge.
+        // The check is off by default: a device with a bad clock must connect.
         (hour * 24 * 365, false, true),
     ] {
         let mut a = link_from(
@@ -1250,13 +1261,17 @@ fn a_timestamp_far_in_the_future_is_refused_when_there_is_a_clock() {
             Box::new(MemoryTimestampStore::default()),
             base + ahead,
         );
-        let wall_b = if has_clock { base } else { Duration::ZERO };
-        let mut b = link_from(
+        let cfg = Config {
+            max_future: has_clock.then_some(Duration::from_secs(600)),
+            ..Config::default()
+        };
+        let mut b = link_cfg(
             &b_key,
             pub_of(&a_key),
             2,
             Box::new(MemoryTimestampStore::default()),
-            wall_b,
+            base,
+            cfg,
         );
         let hs1 = sends(&a.start_handshake(ms(10)).unwrap()).remove(0);
         let ev = b.handle_packet(ms(10), &hs1);
@@ -1273,12 +1288,16 @@ fn a_timestamp_far_in_the_future_is_refused_when_there_is_a_clock() {
 fn a_future_timestamp_that_was_refused_does_not_lock_the_peer_out() {
     let (a_key, b_key) = (random_key(), random_key());
     let base = Duration::from_secs(1_700_000_000);
-    let mut b = link_from(
+    let mut b = link_cfg(
         &b_key,
         pub_of(&a_key),
         2,
         Box::new(MemoryTimestampStore::default()),
         base,
+        Config {
+            max_future: Some(Duration::from_secs(600)),
+            ..Config::default()
+        },
     );
     // A's clock is a year ahead: refused, and B's saved state is untouched.
     let mut bad = link_from(
@@ -1374,4 +1393,95 @@ fn the_previous_session_grace_counts_from_the_last_packet_on_it() {
     p.b.poll_timers(t4);
     let ev = p.b.handle_packet(t4, &old_packets[2]);
     assert_eq!(drops(&ev), vec![DropReason::UnknownIndex]);
+}
+
+#[test]
+fn the_future_check_reads_the_clock_at_each_check() {
+    let (a_key, b_key) = (random_key(), random_key());
+    let base = Duration::from_secs(1_700_000_000);
+    let clock = std::rc::Rc::new(std::cell::Cell::new(base));
+    let mut b = link_cfg(
+        &b_key,
+        pub_of(&a_key),
+        2,
+        Box::new(MemoryTimestampStore::default()),
+        base,
+        Config {
+            max_future: Some(Duration::from_secs(600)),
+            ..Config::default()
+        },
+    );
+    let c = clock.clone();
+    b.set_wall_clock(Box::new(move || c.get()));
+    let mut a = link_from(
+        &a_key,
+        pub_of(&b_key),
+        1,
+        Box::new(MemoryTimestampStore::default()),
+        base + Duration::from_secs(3600),
+    );
+    let hs1 = sends(&a.start_handshake(ms(10)).unwrap()).remove(0);
+    // B's clock is an hour behind: refused, and not recorded.
+    assert_eq!(
+        drops(&b.handle_packet(ms(10), &hs1)),
+        vec![DropReason::StaleHandshake]
+    );
+    // B's clock gets set (by NTP, say): the same message now passes.
+    clock.set(base + Duration::from_secs(3600));
+    assert_eq!(sends(&b.handle_packet(ms(20), &hs1)).len(), 1);
+}
+
+#[test]
+fn a_handshake_2_with_a_different_encrypted_receiver_index_is_bad_header() {
+    // A real responder key, hand-built message 2: the receiver index in the
+    // clear is ours, the one inside the encrypted payload is not.
+    let me = Identity::generate().unwrap();
+    let their_key = random_key();
+    for variant in 0..3u16 {
+        // A fresh handshake each time: a read that succeeds uses it up.
+        let mut ep = Endpoint::new(
+            &me,
+            Config::default(),
+            Box::new(TestRng(1 + u64::from(variant))),
+            Duration::from_secs(1_000_000),
+        )
+        .unwrap();
+        let id = ep
+            .add_peer(
+                pub_of(&their_key),
+                Box::new(MemoryTimestampStore::default()),
+            )
+            .unwrap();
+        let hs1 = sends(&ep.start_handshake(id, ms(0)).unwrap()).remove(0);
+        let mine = ep.live_indexes()[0];
+        let wrong = [mine ^ 1, mine.wrapping_add(7), mine ^ 0x8000][variant as usize];
+        let mut hs = snow::Builder::new(LINK_NOISE.parse().unwrap())
+            .local_private_key(&their_key)
+            .unwrap()
+            .prologue(LINK_PROLOGUE)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut payload = [0u8; 32];
+        hs.read_message(&hs1[1..111], &mut payload).unwrap();
+        let mut body = [0u8; 4];
+        body[..2].copy_from_slice(&0x1234u16.to_be_bytes());
+        body[2..].copy_from_slice(&wrong.to_be_bytes());
+        let mut msg = [0u8; 64];
+        let n = hs.write_message(&body, &mut msg).unwrap();
+        let hs2 = packet::encode_handshake2(mine, &msg[..n]);
+        assert_eq!(hs2.len(), 55);
+        let ev: Vec<Event> = ep
+            .handle_packet(ms(5), &hs2)
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        assert_eq!(drops(&ev), vec![DropReason::BadHeader], "{wrong}");
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, Event::SessionEstablished { .. }))
+        );
+        assert!(sends(&ev).is_empty());
+        assert_eq!(ep.send(id, ms(6), b"x"), Err(SendError::NoSession));
+    }
 }

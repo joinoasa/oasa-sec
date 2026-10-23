@@ -135,6 +135,8 @@ struct Sim {
     tamper_hs2: u32,
     /// This side's application sends nothing.
     mute: Option<Side>,
+    /// Neither side's application sends anything (keepalives still go).
+    mute_both: bool,
     cfgs: (Config, Config),
 }
 
@@ -149,23 +151,34 @@ impl Sim {
 
     /// Each side with its own settings (a misconfigured pair).
     fn new_with(seed: u64, cfg_a: Config, cfg_b: Config, channel: Channel) -> Self {
+        let wall = Duration::from_secs(1_700_000_000);
+        Self::new_clocks(seed, (cfg_a, wall), (cfg_b, wall), channel)
+    }
+
+    /// Each side with its own settings and its own wall clock at time zero.
+    fn new_clocks(
+        seed: u64,
+        (cfg_a, wall_a): (Config, Duration),
+        (cfg_b, wall_b): (Config, Duration),
+        channel: Channel,
+    ) -> Self {
         let mut rng = Rng(seed);
         let ka = key(&mut rng);
         let kb = key(&mut rng);
-        let mk = |own: &[u8; 32], peer: [u8; 32], seed: u64, cfg: &Config| {
+        let mk = |own: &[u8; 32], peer: [u8; 32], seed: u64, cfg: &Config, wall: Duration| {
             Link::new(
                 &Identity::from_private_bytes(own).unwrap(),
                 peer,
                 cfg.clone(),
                 Box::new(Rng(seed)),
-                Duration::from_secs(1_700_000_000),
+                wall,
                 Box::new(MemoryTimestampStore::default()),
             )
             .unwrap()
         };
         let mut links = HashMap::new();
-        links.insert(Side::A, mk(&ka, pub_of(&kb), seed ^ 0xA, &cfg_a));
-        links.insert(Side::B, mk(&kb, pub_of(&ka), seed ^ 0xB, &cfg_b));
+        links.insert(Side::A, mk(&ka, pub_of(&kb), seed ^ 0xA, &cfg_a, wall_a));
+        links.insert(Side::B, mk(&kb, pub_of(&ka), seed ^ 0xB, &cfg_b, wall_b));
         let mut keys = HashMap::new();
         keys.insert(Side::A, ka);
         keys.insert(Side::B, kb);
@@ -186,6 +199,7 @@ impl Sim {
             blackout: false,
             tamper_hs2: 0,
             mute: None,
+            mute_both: false,
             cfgs: (cfg_a, cfg_b),
         }
     }
@@ -193,6 +207,11 @@ impl Sim {
     /// The device on `side` reboots: all session state is gone, the key and
     /// the settings stay, the wall clock has moved on.
     fn restart(&mut self, side: Side) {
+        let wall = Duration::from_secs(1_700_000_000) + self.now;
+        self.restart_with_wall(side, wall);
+    }
+
+    fn restart_with_wall(&mut self, side: Side, wall: Duration) {
         let cfg = if side == Side::A {
             self.cfgs.0.clone()
         } else {
@@ -206,7 +225,7 @@ impl Sim {
             peer,
             cfg,
             Box::new(Rng(seed)),
-            Duration::from_secs(1_700_000_000) + self.now,
+            wall,
             Box::new(MemoryTimestampStore::default()),
         )
         .unwrap();
@@ -341,7 +360,7 @@ impl Sim {
             if self.now >= next_send {
                 next_send += send_every;
                 for side in [Side::A, Side::B] {
-                    if self.mute != Some(side) {
+                    if self.mute != Some(side) && !self.mute_both {
                         self.app_send(side);
                     }
                 }
@@ -1105,4 +1124,66 @@ fn mismatched_expiry_settings_cost_seconds_and_recover_by_themselves() {
         let gap = longest_gap(&sim, side, Duration::from_secs(5), Duration::from_secs(400));
         assert!(gap < 8.0, "{side:?} was silent for {gap:.1}s");
     }
+}
+
+#[test]
+fn a_clock_a_day_behind_connects_unless_the_future_check_is_on() {
+    let day = Duration::from_secs(86_400);
+    let base = Duration::from_secs(1_700_000_000);
+    // Check off (the default): the initiator is a day ahead, still fine.
+    let cfg = config(CounterLen::Short);
+    let mut sim = Sim::new_clocks(61, (cfg.clone(), base + day), (cfg, base), Channel::clean());
+    sim.start();
+    sim.run(Duration::from_secs(5), ms(10), ms(100), |_| {});
+    assert!(sim.link(Side::A).can_send() && sim.link(Side::B).can_send());
+    sim.check_delivery_integrity();
+    // Check on, at the responder: refused, and not recorded.
+    let mut strict = config(CounterLen::Short);
+    strict.max_future = Some(Duration::from_secs(600));
+    let mut sim = Sim::new_clocks(
+        62,
+        (config(CounterLen::Short), base + day),
+        (strict, base),
+        Channel::clean(),
+    );
+    // Only A's application sends: B would otherwise dial A itself.
+    sim.mute = Some(Side::B);
+    sim.start();
+    sim.run(Duration::from_secs(20), ms(10), ms(100), |_| {});
+    assert!(!sim.link(Side::B).can_send() && !sim.link(Side::A).can_send());
+    assert!(sim.stats(Side::B).dropped(DropReason::StaleHandshake) >= 2);
+    assert_eq!(sim.stats(Side::B).handshakes_accepted, 0);
+    // B's clock is corrected (it is read at each check, here by a restart
+    // with a right clock; nothing was recorded, so the same peer gets in).
+    sim.cfgs.1.max_future = Some(Duration::from_secs(600));
+    sim.restart_with_wall(Side::B, base + day);
+    sim.mute = None;
+    sim.run(Duration::from_secs(20), ms(10), ms(100), |_| {});
+    assert!(sim.link(Side::A).can_send() && sim.link(Side::B).can_send());
+    sim.check_delivery_integrity();
+}
+
+#[test]
+fn a_restarted_peer_is_found_even_when_only_keepalives_flow() {
+    let mut cfg = config(CounterLen::Short);
+    cfg.keepalive = Some(Duration::from_secs(25));
+    cfg.rekey_after = Duration::from_secs(600);
+    cfg.reject_after = Duration::from_secs(900);
+    let mut sim = Sim::new(71, cfg, Channel::clean());
+    sim.mute_both = true;
+    sim.start();
+    sim.run(Duration::from_secs(30), ms(100), ms(100), |_| {});
+    sim.restart(Side::B);
+    let at = sim.now;
+    sim.run(Duration::from_secs(150), ms(100), ms(100), |_| {});
+    let back = sim.logs[&Side::B]
+        .established
+        .iter()
+        .map(|(t, ..)| *t)
+        .filter(|t| *t > at)
+        .min()
+        .expect("A started a new handshake");
+    // Keepalive at 25 s, then 2 x 30 s without an answer.
+    assert!(back - at >= Duration::from_secs(55), "{:?}", back - at);
+    assert!(back - at <= Duration::from_secs(100), "{:?}", back - at);
 }

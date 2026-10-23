@@ -55,6 +55,7 @@ struct Shared {
     cfg: Config,
     rng: Box<dyn Entropy>,
     wall_base: Duration,
+    clock: Option<Box<dyn super::WallClock>>,
     limiter: Bucket,
     stats: Stats,
 }
@@ -116,6 +117,9 @@ struct PeerLink {
     /// When we first sent a payload packet after the last authenticated
     /// packet we received (None: nothing is waiting for an answer).
     awaiting_since: Option<Duration>,
+    /// Since when we have sent anything (payload or keepalive) without
+    /// hearing an authenticated packet.
+    silent_since: Option<Duration>,
     /// When we first received payload after the last packet we sent (we owe
     /// the peer a sign of life).
     owe_ack_since: Option<Duration>,
@@ -140,9 +144,6 @@ impl std::fmt::Debug for Endpoint {
     }
 }
 
-/// How far ahead of our clock a handshake 1 timestamp may be (10 minutes).
-const MAX_FUTURE_SECS: u64 = 600;
-
 fn noise_params() -> NoiseParams {
     LINK_NOISE.parse().expect("valid Noise name")
 }
@@ -165,6 +166,7 @@ impl Endpoint {
                 cfg: config,
                 rng: entropy,
                 wall_base,
+                clock: None,
                 limiter,
                 stats: Stats::default(),
             },
@@ -196,6 +198,7 @@ impl Endpoint {
             hold_until: Duration::ZERO,
             unconfirmed_rounds: 0,
             awaiting_since: None,
+            silent_since: None,
             owe_ack_since: None,
             wants_session: None,
             hs: None,
@@ -204,6 +207,11 @@ impl Endpoint {
             pending: None,
         }));
         Ok(PeerId(self.peers.len() - 1))
+    }
+
+    /// See [`super::Link::set_wall_clock`].
+    pub fn set_wall_clock(&mut self, clock: Box<dyn super::WallClock>) {
+        self.sh.clock = Some(clock);
     }
 
     /// Stop trusting a peer and wipe its sessions (spec section 6).
@@ -416,6 +424,7 @@ impl Endpoint {
             }
         };
         peer.awaiting_since.get_or_insert(now);
+        peer.silent_since.get_or_insert(now);
         peer.owe_ack_since = None;
         self.sh.stats.sent += 1;
         Ok(packet)
@@ -546,9 +555,13 @@ impl PeerLink {
         // With a real clock, a timestamp far in the future is refused. It
         // would otherwise lock the peer out until that time (one forged by
         // nobody, but sent by a peer whose clock was wrong): spec section 6.
-        if !sh.wall_base.is_zero() {
-            let now_wall = (sh.wall_base + now).as_secs();
-            if ts.secs > now_wall.saturating_add(MAX_FUTURE_SECS) {
+        if let Some(max) = sh.cfg.max_future {
+            let now_wall = match sh.clock.as_mut() {
+                Some(c) => c.now(),
+                None => sh.wall_base + now,
+            }
+            .as_secs();
+            if ts.secs > now_wall.saturating_add(max.as_secs()) {
                 drop_with(DropReason::StaleHandshake);
                 return;
             }
@@ -674,6 +687,7 @@ impl PeerLink {
     fn install_current(&mut self, session: Session, now: Duration, from_handshake_2: bool) -> bool {
         let rekey = self.current.is_some();
         self.awaiting_since = None;
+        self.silent_since = None;
         self.wants_session = None;
         if let Some(old) = self.current.take()
             && (old.confirmed || self.previous.is_none() || !from_handshake_2)
@@ -750,6 +764,7 @@ impl PeerLink {
         let session_is_initiator = session.initiator;
         session.confirmed = true;
         self.awaiting_since = None;
+        self.silent_since = None;
         if !plain.is_empty() {
             self.owe_ack_since.get_or_insert(now);
         }
@@ -822,7 +837,11 @@ impl PeerLink {
             // one-way loss). Either side may start over.
             let stale = self
                 .awaiting_since
-                .is_some_and(|t| now.saturating_sub(t) >= sh.cfg.stale_after);
+                .is_some_and(|t| now.saturating_sub(t) >= sh.cfg.stale_after)
+                // Only keepalives sent, and still nothing back: twice as long.
+                || self.silent_since.is_some_and(|t| {
+                    now.saturating_sub(t) >= sh.cfg.stale_after.saturating_mul(2)
+                });
             // Whoever made the current session renews it; a side with no
             // session starts one if it is the dialing side or has data to send.
             match &self.current {
@@ -869,6 +888,10 @@ impl PeerLink {
         if let (Some(every), Some(cur)) = (sh.cfg.keepalive, self.current.as_ref())
             && now.saturating_sub(cur.last_sent) >= every
         {
+            // An idle-link keepalive that nobody answers for twice the stale
+            // time means the peer is gone (or lost its session). Keepalives
+            // sent as confirmations or acks do not count.
+            self.silent_since.get_or_insert(now);
             self.send_keepalive(sh, now, out);
         }
         // We received payload and have sent nothing since: say we are alive,

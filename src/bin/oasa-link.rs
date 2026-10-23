@@ -29,15 +29,20 @@ oasa-link: OASA-SEC v0 encrypted link over UDP (R-COM2). Do not fly with it.
 USAGE:
   oasa-link --dir DIR --peer PEERNAME --bind HOST:PORT
             --plain-listen HOST:PORT --plain-send HOST:PORT
-            [--remote HOST:PORT] [--initiate] [--allow-remote-plain]
+            [--remote HOST:PORT] [--initiate] [--allow-remote-plain] [--trusted-clock]
             [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N]
             [--mtu BYTES] [--duration SECS]
 
   --dir            Device folder made by `oasa-pair init`.
   --peer           Name of a trusted peer (see `oasa-pair peers`, `oasa-pair trust`).
   --bind           UDP address for the encrypted link.
-  --remote         Where the peer is. A responder without it learns the address from
+  --remote         Where the peer is. Give it whenever you know it: without it a device
+                   cannot start a handshake itself (after a restart it must wait for the
+                   peer to notice, up to 90 s). A device without it learns the address from
                    the first packet that authenticates, and follows the peer if it moves.
+  --trusted-clock  Only if this device has a trusted clock (RTC or NTP, set before start):
+                   refuse a handshake whose timestamp is over 10 minutes ahead of it.
+                   Off by default, so a drone with a slow or unset clock still connects.
   --initiate       Start the handshake (needs --remote). Without it, wait for the peer.
   --plain-listen   Local programs send plaintext packets here. Must be a loopback
                    address (127.0.0.1 or ::1) unless --allow-remote-plain is given.
@@ -117,6 +122,7 @@ struct Args {
     remote: Option<SocketAddr>,
     initiate: bool,
     allow_remote_plain: bool,
+    trusted_clock: bool,
     plain_listen: SocketAddr,
     plain_send: SocketAddr,
     counter: CounterLen,
@@ -133,12 +139,14 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
     let mut named: BTreeMap<String, String> = BTreeMap::new();
     let mut initiate = false;
     let mut allow_remote_plain = false;
+    let mut trusted_clock = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" | "help" => return Ok(None),
             "--initiate" => initiate = true,
             "--allow-remote-plain" => allow_remote_plain = true,
+            "--trusted-clock" => trusted_clock = true,
             _ => {
                 let k = a
                     .strip_prefix("--")
@@ -227,6 +235,7 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         remote,
         initiate,
         allow_remote_plain,
+        trusted_clock,
         plain_listen,
         plain_send: addr("plain-send")?,
         counter,
@@ -254,6 +263,9 @@ fn config_from(a: &Args) -> R<Config> {
     }
     if let Some(n) = a.keepalive_secs {
         c.keepalive = (n > 0).then(|| Duration::from_secs(n));
+    }
+    if a.trusted_clock {
+        c.max_future = Some(Duration::from_secs(600));
     }
     c.validate()?;
     Ok(c)
@@ -496,6 +508,15 @@ fn run(args: &[String]) -> R {
         Box::new(FileTimestampStore::new(&a.dir, &peer.public)),
     )?;
     drop(me);
+    let mut link = link;
+    if a.trusted_clock {
+        // Read at each check, not once at startup.
+        link.set_wall_clock(Box::new(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+        }));
+    }
 
     let enc = UdpSocket::bind(a.bind)?;
     let plain_in = UdpSocket::bind(a.plain_listen)?;
@@ -676,6 +697,19 @@ mod tests {
         let v6 = "--dir d --peer p --bind 127.0.0.1:1 --plain-listen [::1]:2 --plain-send [::1]:3";
         assert!(parse_args(&v(v6)).unwrap().is_some());
         assert!(!parse_args(&v(BASE)).unwrap().unwrap().allow_remote_plain);
+    }
+
+    #[test]
+    fn the_future_check_is_off_unless_asked_for() {
+        let off = parse_args(&v(BASE)).unwrap().unwrap();
+        assert_eq!(config_from(&off).unwrap().max_future, None);
+        let on = parse_args(&v(&format!("{BASE} --trusted-clock")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config_from(&on).unwrap().max_future,
+            Some(Duration::from_secs(600))
+        );
     }
 
     #[test]
