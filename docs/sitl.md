@@ -109,7 +109,7 @@ It takes about 8 minutes: it restarts SITL several times, waits through ArduPilo
 
 ## Signing-key rotation (R-SEC2 phase B)
 
-Both scripts now also run `oasa-pair signer` against the real autopilot: a rotation after removing an operator, the armed wait, power loss between the key change and the commit, and generations. Results from 2026-10-23, same builds as above (PX4 `d4d4c154`, ArduPilot `2badacc9a607`), `oasa-pair` at the commit that added them.
+Both scripts now also run `oasa-pair signer` against the real autopilot: a rotation after removing an operator, the armed wait, power loss between the key change and the commit, and generations. Results from 2026-10-23, same builds as above (PX4 `d4d4c154`, ArduPilot `2badacc9a607`), `oasa-pair` at the commit that added them. Both scripts were run again on 2026-10-24 after code review 1 changed the signer (only the autopilot's own frames count, an old-key answer must be a `COMMAND_ACK` that names the signer, only signed heartbeats once the autopilot signs, timestamps checked and capped): PX4 39 of 39 and ArduPilot 42 of 42 pass. The real autopilots set the `COMMAND_ACK` target fields as the stricter proof needs. One script change: the PX4 silent-probe step now waits 3 s so a fresh signed heartbeat has arrived before the gate drops everything (the signer needs one to start).
 
 ### PX4 (39 of 39 checks pass: the 11 above and 28 new, about 12 minutes)
 

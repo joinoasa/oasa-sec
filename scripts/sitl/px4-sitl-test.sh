@@ -43,7 +43,7 @@ stop_px4() {
 cleanup() {
   [ -n "$DRONE_PID" ] && kill "$DRONE_PID" 2>/dev/null
   stop_px4
-  rm -rf "$W"
+  [ -n "${KEEP:-}" ] && echo "kept $W" || rm -rf "$W"
 }
 trap cleanup EXIT
 
@@ -211,6 +211,7 @@ same_key "$DK" "$K" && op2_has "$(cat "$W/drone/mavlink-signing-key.gen")" && ok
 # 4. Neither key answers for the whole probe: both files stay, rotation_stuck, and a new ask resolves it.
 settle
 T0=$(cnt rotation_stuck "$W/signer1.log"); D0=$(cnt rotation_done "$W/signer1.log")
+sleep 3   # the signer needs a fresh (signed) heartbeat before it will start, so let one through first
 echo all > "$MODE"
 "$OASA" rotate-signing --dir "$W/drone" > /dev/null
 wait_more 130 rotation_stuck "$W/signer1.log" $T0 && ok "silent for the whole probe: rotation_stuck reported" || bad "no rotation_stuck"

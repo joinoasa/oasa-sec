@@ -262,6 +262,27 @@ wait_exit "$RD2" 3; [ "$EXIT_RC" = 3 ] || fail "SIGHUP after a removal did not e
 kill -TERM "$RG2" 2>/dev/null || true
 pass "SIGHUP reloads at once; after a removal it ends the link with code 3"
 
+# 7b2. A trust file that becomes unreadable while the link runs: it says so and keeps the
+# last good state (it does not exit and take the link down); when the file is fixed it recovers.
+for d in rg3 rd3; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+trust_as rd3 rg3 rg3 operator; trust_as rg3 rd3 rd3 peer
+link rd3 rd3 rg3 7815; RD3=$LAST
+link rg3 rg3 rd3 7816 --remote 127.0.0.1:7815 --initiate; RG3=$LAST
+wait_for 15 session_established "$T/rd3.log" || fail "unreadable-file test: no session"
+printf 'this is not a record\n' > "$T/rd3/removed"; chmod 600 "$T/rd3/removed"
+kill -HUP "$RD3"
+wait_for 3 trust_unreadable "$T/rd3.log" || fail "an unreadable removed file was not reported"
+sleep 1
+kill -0 "$RD3" 2>/dev/null || fail "the link exited when a trust file became unreadable"
+rm -f "$T/rd3/removed"
+kill -HUP "$RD3"
+sleep 1
+$B/oasa-pair remove --dir "$T/rd3" rg3 >/dev/null
+kill -HUP "$RD3"
+wait_exit "$RD3" 5; [ "$EXIT_RC" = 3 ] || fail "after the file was fixed, a removal did not end the link with code 3"
+kill -TERM "$RG3" 2>/dev/null || true
+pass "an unreadable trust file while running: trust_unreadable is logged, the link keeps running on the last good state, and it works again once the file is fixed"
+
 # 7c. A revoke travels from an admin to a device, and on to the device's other link.
 for d in adm dev dev3 vic vic2; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
 trust_as dev adm adm admin; trust_as dev vic vic peer; trust_as dev vic2 vic2 peer
