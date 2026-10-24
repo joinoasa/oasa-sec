@@ -179,6 +179,10 @@ pub struct Signer<P: Port> {
     /// The autopilot has been seen signing under a key we hold: from now on
     /// only signed heartbeats say whether it is armed.
     keyed: bool,
+    /// A frame other than a `COMMAND_ACK` from the autopilot has verified
+    /// under a key we hold: it signs what it sends. Without that, an old-key
+    /// answer could be a forgery and is not enough to roll back.
+    seen_signing: bool,
     tidied: bool,
     retry_at: Duration,
     last_wait: Option<Event>,
@@ -199,6 +203,7 @@ impl<P: Port> Signer<P> {
             stuck_with: None,
             stuck_retry_at: None,
             keyed: false,
+            seen_signing: false,
             tidied: false,
             retry_at: Duration::ZERO,
             last_wait: None,
@@ -257,6 +262,9 @@ impl<P: Port> Signer<P> {
             self.max_ts = self.max_ts.max(s.timestamp);
             if self.sent_by_autopilot(f) {
                 self.keyed = true;
+                if !matches!(&f.msg, MavMessage::COMMAND_ACK(_)) {
+                    self.seen_signing = true;
+                }
             }
         }
         if self.sent_by_autopilot(f)
@@ -498,7 +506,15 @@ impl<P: Port> Signer<P> {
         loop {
             let now = self.port.now();
             match old_answer {
-                Some(t) if now >= t + SETTLE => return Ok(Probe::Current),
+                Some(t) if now >= t + SETTLE => {
+                    // An autopilot never seen signing could be answered for
+                    // by anyone holding the old key: not enough.
+                    return Ok(if self.seen_signing {
+                        Probe::Current
+                    } else {
+                        Probe::Neither
+                    });
+                }
                 None if now >= end => return Ok(Probe::Neither),
                 _ => {}
             }

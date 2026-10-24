@@ -681,6 +681,45 @@ fn evidence_for_both_keys_is_stuck_not_a_guess() {
 }
 
 #[test]
+fn a_new_key_frame_within_3_s_of_an_old_key_answer_is_stuck_not_rolled_back() {
+    let mut r = crashed_rig("sg-quiet", false);
+    let next = *r.keys().next.unwrap().1.as_bytes();
+    // The old-key answer comes about 4 s in; this arrives about 2 s later.
+    let mut f = frame(&r, COMP, heartbeat(false), Some(next));
+    f.at += Duration::from_millis(6_000);
+    r.ap.borrow_mut().push(f);
+    let ev = r.run(1);
+    assert_eq!(ev, vec![Event::Stuck], "{ev:?}");
+    assert!(r.keys().next.is_some());
+}
+
+#[test]
+fn a_forged_old_key_ack_does_not_roll_back_an_autopilot_never_seen_signing() {
+    // The autopilot took the new key, never signs its own frames and loses
+    // every answer; someone with the old key forges answers from its ids.
+    let mut r = crashed_rig("sg-forged", true);
+    {
+        let mut a = r.ap.borrow_mut();
+        a.sign_own = false;
+        a.drop_acks = 1000;
+    }
+    let old = *r.old.as_bytes();
+    for s in 1..40u64 {
+        let mut f = frame(&r, COMP, ack(), Some(old));
+        f.at += Duration::from_secs(s);
+        r.ap.borrow_mut().push(f);
+    }
+    let ev = r.run(1);
+    assert_eq!(ev, vec![Event::Stuck], "{ev:?}");
+    let keys = r.keys();
+    assert_eq!(
+        r.ap.borrow().key,
+        keys.next.as_ref().map(|n| *n.1.as_bytes()),
+        "the key the autopilot took is still on disk"
+    );
+}
+
+#[test]
 fn a_new_key_frame_from_the_autopilot_settles_it() {
     let mut r = crashed_rig("sg-newframe", true);
     // Quiet autopilot, deaf to requests, but its heartbeat is under the new key.

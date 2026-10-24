@@ -461,56 +461,56 @@ fn migrating_on_a_drone_makes_everyone_an_operator_and_says_so_loudly() {
     assert!(se.contains("trust --role peer"), "{se}");
 }
 
-#[test]
-fn a_second_signer_on_one_folder_is_refused() {
-    use std::io::{BufRead, BufReader};
+/// Kill `pid` after 30 s, so a regression (a signer that never stops, or
+/// never prints) fails the test instead of hanging it.
+fn watchdog(pid: u32) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    });
+}
+
+fn start_signer(d: &Path, port: u16) -> std::process::Child {
     use std::process::Stdio;
-    let d = make_drone("onesigner");
-    let mut first = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+    let c = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
         .args([
             "signer",
             "--dir",
-            s(&d),
+            s(d),
             "--autopilot",
-            "udpout:127.0.0.1:14999",
+            &format!("udpout:127.0.0.1:{port}"),
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    watchdog(c.id());
+    c
+}
+
+#[test]
+fn a_second_signer_on_one_folder_is_refused() {
+    use std::io::{BufRead, BufReader};
+    let d = make_drone("onesigner");
+    let mut first = start_signer(&d, 14999);
     let mut line = String::new();
     BufReader::new(first.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
     assert!(line.contains("signer_started"), "{line}");
-    let e = err(&[
-        "signer",
-        "--dir",
-        s(&d),
-        "--autopilot",
-        "udpout:127.0.0.1:14998",
-    ]);
+    let second = start_signer(&d, 14998).wait_with_output().unwrap();
+    assert!(!second.status.success(), "the second signer must not run");
+    let e = String::from_utf8_lossy(&second.stderr);
     assert!(e.contains("already running"), "{e}");
     first.kill().unwrap();
     first.wait().unwrap();
     // Once the first is gone, the folder is free again.
-    let mut second = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
-        .args([
-            "signer",
-            "--dir",
-            s(&d),
-            "--autopilot",
-            "udpout:127.0.0.1:14999",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut again = start_signer(&d, 14999);
     let mut line = String::new();
-    BufReader::new(second.stdout.take().unwrap())
+    BufReader::new(again.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
     assert!(line.contains("signer_started"), "{line}");
-    second.kill().unwrap();
-    second.wait().unwrap();
+    again.kill().unwrap();
+    again.wait().unwrap();
 }

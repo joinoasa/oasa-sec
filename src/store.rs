@@ -283,9 +283,10 @@ pub fn add(dir: &Path, peer: &Peer) -> Result<()> {
     let before = peers.iter().find(|p| p.public == peer.public).cloned();
     peers.retain(|p| p.public != peer.public);
     peers.push(peer.clone());
-    write_entries(dir, &lock, &peers)?;
     // An operator that is no longer one has held the drone's signing key and
-    // may hold a pending one: the key must change, as for a removal.
+    // may hold a pending one: the key must change, as for a removal. The
+    // request is written first, so a failure leaves no demoted operator
+    // without a rotation (an extra request is harmless).
     if before.is_some_and(|b| b.role == Role::Operator)
         && peer.role != Role::Operator
         && std::fs::symlink_metadata(dir.join(crate::signing::AUTOPILOT_KEY_FILE)).is_ok()
@@ -301,7 +302,7 @@ pub fn add(dir: &Path, peer: &Peer) -> Result<()> {
             unix,
         )?;
     }
-    Ok(())
+    write_entries(dir, &lock, &peers)
 }
 
 /// Refuse a removed key. For pairing, before anything is shared with it.
@@ -375,6 +376,20 @@ mod tests {
         add(&ground, &peer(1, "a", Role::Operator)).unwrap();
         add(&ground, &peer(1, "a", Role::Peer)).unwrap();
         assert!(!ground.join(crate::rotation::PENDING_FILE).exists());
+    }
+
+    #[test]
+    fn the_rotation_request_is_written_before_the_role_changes() {
+        let drone = tempdir("store-order");
+        crate::signing::SigningKey::generate()
+            .unwrap()
+            .save(&drone.join(crate::signing::AUTOPILOT_KEY_FILE))
+            .unwrap();
+        add(&drone, &peer(1, "a", Role::Operator)).unwrap();
+        // The request cannot be written: nothing may change.
+        std::fs::create_dir(drone.join(crate::rotation::PENDING_FILE)).unwrap();
+        assert!(add(&drone, &peer(1, "a", Role::Peer)).is_err());
+        assert_eq!(load(&drone).unwrap()[0].role, Role::Operator);
     }
 
     #[test]
