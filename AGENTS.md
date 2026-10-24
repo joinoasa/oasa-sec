@@ -1,6 +1,6 @@
 # AGENTS.md: working in oasa-sec
 
-Read by AI coding agents (Claude Code, Codex, Cursor and others) and useful for people too. This repo is **OASA-SEC**: device identity, encrypted pairing and link keys for OASA systems. It covers tech tree nodes R-SEC1 (identity, keys, pairing) and R-COM2 (the encrypted link), and later R-SEC2.
+Read by AI coding agents (Claude Code, Codex, Cursor and others) and useful for people too. This repo is **OASA-SEC**: device identity, encrypted pairing and link keys for OASA systems. It covers tech tree nodes R-SEC1 (identity, keys, pairing) and R-COM2 (the encrypted link), and R-SEC2 (roles, device removal and signing-key rotation).
 
 ## Rules that never bend
 
@@ -20,7 +20,14 @@ Follow the [OASA software standard](https://joinoasa.org/docs/software-standard/
 | `cargo test` | Unit tests |
 | `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` | Format and lint (CI fails otherwise) |
 | `scripts/e2e.sh` | End-to-end check of pairing with no hardware (needs `pip install pymavlink`, or set `PYTHON` to a venv python) |
+| `scripts/sitl/px4-sitl-test.sh`, `scripts/sitl/ardupilot-sitl-test.sh` | Pairing and key rotation against real PX4 and ArduPilot simulators (not in CI; see `docs/sitl.md`) |
 | `scripts/link-e2e.sh` | End-to-end check of the encrypted link: real `oasa-link` processes over localhost UDP (needs `cargo build --bins`) |
+
+## Trust files and removal
+
+Files in a device folder: `trusted-peers.v1` (roles), `removed` (append-only tombstones, decide over the list), `removal-log`, `removal-sync/`, `admin-votes`. Change them only through `store` and `removal`, which take the `.lock` and write atomically. The control layer (`src/control.rs`) is sans-IO like the link and reads roles fresh from the files. Roles are set only by `oasa-pair`, never by a message. Spec: `docs/oasa-sec-v0-rotation.md`. The MSRV is 1.89 (`File::lock`).
+
+Signing-key rotation: `src/rotation.rs` holds the key files and generations (`mavlink-signing-gen` is the highest ever issued and is never lowered; save the number before the key). `src/signer.rs` is the state machine, sans-IO like the link: its autopilot link is the `Port` trait, with the clock, so tests run it against a simulated autopilot in virtual time (`src/signer/tests.rs`). Never delete a key that might be the autopilot's; the probe decides (only the autopilot's own frames count; an old-key answer must be a `COMMAND_ACK` that names the signer), and `rotation_stuck` keeps both. Rotation requests carry the generation, never a time. Timestamps from the wire count only if the signature verifies, capped at the clock plus 60 s. Signing keys never go in logs, `Debug` or errors, and buffers that carry one are `Zeroizing`.
 
 ## Pull requests
 

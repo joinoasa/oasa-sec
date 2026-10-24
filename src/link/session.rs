@@ -2,11 +2,12 @@
 //! replay window for what we receive.
 
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 use snow::StatelessTransportState;
 
 use super::counter::{ReplayWindow, rebuild_counter};
-use super::packet::{CounterLen, TAG_LEN, data_header, data_overhead};
+use super::packet::{CounterLen, TAG_LEN, data_header, keepalive_len};
 use super::{Config, DropReason, SendError};
 
 pub(crate) struct Session {
@@ -65,14 +66,23 @@ impl Session {
             || self.send_counter >= cfg.rekey_after_packets
     }
 
-    /// Encrypt `plaintext` (empty for a keepalive) into a data packet.
+    /// Encrypt `content` into a data packet: the content type byte, then
+    /// `body`. `None` makes a keepalive: an empty plaintext with no type byte.
     pub fn encrypt(
         &mut self,
         now: Duration,
         cfg: &Config,
-        plaintext: &[u8],
+        content: Option<(u8, &[u8])>,
     ) -> Result<Vec<u8>, SendError> {
-        if data_overhead(cfg.counter_len) + plaintext.len() > cfg.mtu {
+        // May hold a signing key (a control message): wiped when dropped.
+        let mut plaintext = Zeroizing::new(Vec::new());
+        if let Some((kind, body)) = content {
+            plaintext.reserve(1 + body.len());
+            plaintext.push(kind);
+            plaintext.extend_from_slice(body);
+        }
+        let plaintext = &plaintext[..];
+        if keepalive_len(cfg.counter_len) + plaintext.len() > cfg.mtu {
             return Err(SendError::TooLarge);
         }
         if self.expired(now, cfg) {
@@ -102,7 +112,7 @@ impl Session {
         counter_len: CounterLen,
         low: u64,
         ciphertext: &[u8],
-    ) -> Result<Vec<u8>, DropReason> {
+    ) -> Result<Zeroizing<Vec<u8>>, DropReason> {
         if self.expired(now, cfg) {
             return Err(DropReason::UnknownIndex);
         }
@@ -114,7 +124,7 @@ impl Session {
         if self.recv.is_too_old(counter) {
             return Err(DropReason::TooOld);
         }
-        let mut out = vec![0u8; ciphertext.len().saturating_sub(TAG_LEN)];
+        let mut out = Zeroizing::new(vec![0u8; ciphertext.len().saturating_sub(TAG_LEN)]);
         let n = self
             .transport
             .read_message(counter, ciphertext, &mut out)

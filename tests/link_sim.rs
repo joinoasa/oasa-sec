@@ -10,11 +10,16 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
 
-use oasa_sec::identity::Identity;
+use std::path::{Path, PathBuf};
+
+use oasa_sec::control::{Action, Control, Message};
+use oasa_sec::identity::{Identity, fingerprint};
 use oasa_sec::link::{
     Config, CounterLen, DropReason, Entropy, Event, Link, MemoryTimestampStore, SendError,
-    SourceLimiter, data_overhead, looks_like_handshake1,
+    SourceLimiter, data_overhead, keepalive_len, looks_like_handshake1,
 };
+use oasa_sec::removal;
+use oasa_sec::store::{self, Peer, Role};
 
 /// splitmix64: small, fast, good enough for test randomness.
 #[derive(Clone)]
@@ -138,7 +143,17 @@ struct Sim {
     /// Neither side's application sends anything (keepalives still go).
     mute_both: bool,
     cfgs: (Config, Config),
+    /// The control layer on a side, if the test attached one (a real device
+    /// runs one next to its link, in `oasa-link`).
+    ctl: HashMap<Side, Control>,
+    /// Every control message a side sent, parsed.
+    ctl_sent: HashMap<Side, Vec<Message>>,
+    /// Every drop the control layer asked to be counted.
+    ctl_drops: HashMap<Side, Vec<&'static str>>,
 }
+
+/// Wall clock at virtual time zero, for the control layer's records.
+const WALL: u64 = 1_700_000_000;
 
 fn pub_of(k: &[u8; 32]) -> [u8; 32] {
     *Identity::from_private_bytes(k).unwrap().public_key()
@@ -158,13 +173,27 @@ impl Sim {
     /// Each side with its own settings and its own wall clock at time zero.
     fn new_clocks(
         seed: u64,
+        cfgs_a: (Config, Duration),
+        cfgs_b: (Config, Duration),
+        channel: Channel,
+    ) -> Self {
+        Self::new_keyed(seed, cfgs_a, cfgs_b, channel, None)
+    }
+
+    /// Like `new_clocks`, with the two private keys given (so a device can
+    /// have the same identity in two simulations).
+    fn new_keyed(
+        seed: u64,
         (cfg_a, wall_a): (Config, Duration),
         (cfg_b, wall_b): (Config, Duration),
         channel: Channel,
+        keys: Option<([u8; 32], [u8; 32])>,
     ) -> Self {
         let mut rng = Rng(seed);
-        let ka = key(&mut rng);
-        let kb = key(&mut rng);
+        let (ka, kb) = match keys {
+            Some(k) => k,
+            None => (key(&mut rng), key(&mut rng)),
+        };
         let mk = |own: &[u8; 32], peer: [u8; 32], seed: u64, cfg: &Config, wall: Duration| {
             Link::new(
                 &Identity::from_private_bytes(own).unwrap(),
@@ -201,7 +230,48 @@ impl Sim {
             mute: None,
             mute_both: false,
             cfgs: (cfg_a, cfg_b),
+            ctl: HashMap::new(),
+            ctl_sent: HashMap::new(),
+            ctl_drops: HashMap::new(),
         }
+    }
+
+    /// Run the control layer on `side`, as `oasa-link` does, with its device
+    /// folder at `dir`. Replaces an earlier one (a restarted process).
+    fn attach_control(&mut self, side: Side, dir: &Path, seed: u64) {
+        let own = pub_of(&self.keys[&side]);
+        let peer = pub_of(&self.keys[&side.other()]);
+        self.ctl
+            .insert(side, Control::new(dir, own, peer, Box::new(Rng(seed))));
+    }
+
+    fn unix(&self) -> u64 {
+        WALL + self.now.as_secs()
+    }
+
+    /// Do what the control layer asked: send, count drops.
+    fn run_ctl(&mut self, side: Side, actions: Vec<Action>) {
+        let now = self.now;
+        for a in actions {
+            match a {
+                Action::Send(bytes) => {
+                    self.ctl_sent
+                        .entry(side)
+                        .or_default()
+                        .push(Message::parse(&bytes).expect("we only send what parses"));
+                    if let Ok(pkt) = self.link(side).send_control(now, &bytes) {
+                        self.transmit(side, pkt);
+                    }
+                }
+                Action::Drop(r) => self.ctl_drops.entry(side).or_default().push(r),
+                Action::Note(_) => {}
+            }
+        }
+    }
+
+    /// Control messages of one kind that `side` sent, in order.
+    fn ctl_messages(&self, side: Side) -> &[Message] {
+        self.ctl_sent.get(&side).map_or(&[], |v| v.as_slice())
     }
 
     /// The device on `side` reboots: all session state is gone, the key and
@@ -241,7 +311,7 @@ impl Sim {
 
     /// Put `bytes`, sent by `from`, on the channel towards the other side.
     fn transmit(&mut self, from: Side, mut bytes: Vec<u8>) {
-        if self.tamper_hs2 > 0 && bytes[0] == 0x20 {
+        if self.tamper_hs2 > 0 && bytes[0] == 0x21 {
             self.tamper_hs2 -= 1;
             bytes[1] ^= 0x5A; // not covered by any tag
         }
@@ -278,6 +348,17 @@ impl Sim {
                 Event::SessionEstablished { initiator, rekey } => {
                     let now = self.now;
                     self.log(side).established.push((now, initiator, rekey));
+                    if let Some(c) = self.ctl.get_mut(&side) {
+                        let acts = c.session_started(now);
+                        self.run_ctl(side, acts);
+                    }
+                }
+                Event::Control(bytes) => {
+                    let (now, unix) = (self.now, self.unix());
+                    if let Some(c) = self.ctl.get_mut(&side) {
+                        let acts = c.handle(now, unix, &bytes);
+                        self.run_ctl(side, acts);
+                    }
                 }
                 Event::HandshakeSent { .. } => self.log(side).handshakes_sent += 1,
                 Event::Failure(_) => self.log(side).failures += 1,
@@ -311,6 +392,10 @@ impl Sim {
             let now = self.now;
             let ev = self.link(s).poll_timers(now);
             self.apply(s, ev);
+            if let Some(c) = self.ctl.get_mut(&s) {
+                let acts = c.poll(now);
+                self.run_ctl(s, acts);
+            }
         }
     }
 
@@ -437,6 +522,7 @@ impl Sim {
             let st = self.stats(side);
             let arrived = self.logs[&side].packets_arrived;
             let counted = st.received
+                + st.control_received
                 + st.keepalives_received
                 + st.total_dropped()
                 + st.handshakes_accepted
@@ -607,7 +693,7 @@ fn untrusted_identity_gets_no_reply_and_is_counted() {
                         vec![DropReason::UntrustedPeer]
                     );
                     // ...and sprays data packets with guessed indexes.
-                    let mut junk = vec![0x30u8, 0, 0];
+                    let mut junk = vec![0x31u8, 0, 0];
                     junk.extend_from_slice(&(s.rng.next() as u32).to_be_bytes());
                     junk.extend_from_slice(&[7u8; 40]);
                     let idx = (s.rng.next() as u16).to_be_bytes();
@@ -646,14 +732,14 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
     let hs1_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 119)
+        .find(|(to, p)| *to == Side::B && p[0] == 0x11 && p.len() == 119)
         .unwrap()
         .1
         .clone();
     let hs2_first = sim
         .wire
         .iter()
-        .find(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 55)
+        .find(|(to, p)| *to == Side::A && p[0] == 0x21 && p.len() == 55)
         .unwrap()
         .1
         .clone();
@@ -667,7 +753,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs1s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::B && p[0] == 0x10 && p.len() == 119)
+                .filter(|(to, p)| *to == Side::B && p[0] == 0x11 && p.len() == 119)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs1s {
@@ -685,7 +771,7 @@ fn replayed_handshakes_are_stale_and_the_session_survives() {
             let hs2s: Vec<_> = s
                 .wire
                 .iter()
-                .filter(|(to, p)| *to == Side::A && p[0] == 0x20 && p.len() == 55)
+                .filter(|(to, p)| *to == Side::A && p[0] == 0x21 && p.len() == 55)
                 .map(|(_, p)| p.clone())
                 .collect();
             for h in hs2s {
@@ -879,7 +965,7 @@ fn forged_handshake_2_does_not_spoil_the_real_one() {
     let mut r = Rng(1);
     let (mut bad_tag, mut unknown) = (0, 0);
     for idx in 0..=u16::MAX {
-        let mut forged = vec![0x20u8];
+        let mut forged = vec![0x21u8];
         forged.extend_from_slice(&idx.to_be_bytes());
         let mut noise = [0u8; 52];
         r.fill(&mut noise);
@@ -916,7 +1002,7 @@ fn hostile_flood_changes_nothing() {
             let mut p = vec![0u8; len];
             s.rng.fill(&mut p);
             if !p.is_empty() && s.rng.chance(0.5) {
-                p[0] = [0x10u8, 0x20, 0x30, 0x38][s.rng.below(4) as usize];
+                p[0] = [0x11u8, 0x21, 0x31, 0x39][s.rng.below(4) as usize];
             }
             let to = if s.rng.chance(0.5) { Side::A } else { Side::B };
             s.inject(to, &p);
@@ -940,28 +1026,44 @@ fn hostile_flood_changes_nothing() {
 
 #[test]
 fn sizes_on_the_wire_match_the_spec() {
-    for (len, overhead) in [(CounterLen::Short, 21usize), (CounterLen::Long, 23)] {
+    for (len, overhead, keepalive) in [
+        (CounterLen::Short, 22usize, 21usize),
+        (CounterLen::Long, 24, 23),
+    ] {
         assert_eq!(data_overhead(len), overhead);
+        assert_eq!(keepalive_len(len), keepalive);
         let mut sim = Sim::new(3, config(len), Channel::clean());
         sim.start();
         sim.run(Duration::from_secs(2), ms(10), ms(100), |_| {});
         let handshakes: Vec<usize> = sim
             .wire
             .iter()
-            .filter(|(_, p)| p[0] == 0x10 || p[0] == 0x20)
+            .filter(|(_, p)| p[0] == 0x11 || p[0] == 0x21)
             .map(|(_, p)| p.len())
             .collect();
         assert_eq!(handshakes, vec![119, 55]);
         let min_data = sim
             .wire
             .iter()
-            .filter(|(_, p)| p[0] == 0x30 || p[0] == 0x38)
+            .filter(|(_, p)| p[0] == 0x31 || p[0] == 0x39)
             .map(|(_, p)| p.len())
             .min()
             .unwrap();
         assert_eq!(
-            min_data, overhead,
-            "a keepalive is header + index + counter + tag"
+            min_data, keepalive,
+            "a keepalive is header + index + counter + tag, no content type byte"
+        );
+        // Application packets carry the content type byte on top.
+        let min_app = sim
+            .wire
+            .iter()
+            .filter(|(_, p)| (p[0] == 0x31 || p[0] == 0x39) && p.len() > keepalive)
+            .map(|(_, p)| p.len())
+            .min()
+            .unwrap();
+        assert!(
+            min_app >= overhead + 12,
+            "payload is at least 12 bytes here"
         );
         assert!(sim.wire.iter().all(|(_, p)| p.len() <= 128));
     }
@@ -1032,7 +1134,7 @@ fn handshake_flood(use_source_limit: bool) -> (usize, u64, u64) {
         // Junk: right size and header, wrong mac1. From address Y.
         let mut junk = vec![0u8; recorded.len()];
         s.rng.fill(&mut junk);
-        junk[0] = 0x10;
+        junk[0] = 0x11;
         s.inject(Side::B, &junk);
         // A recorded real handshake 1, replayed from address Z.
         if !use_source_limit || limiter.allow(s.now, "Z") {
@@ -1186,4 +1288,547 @@ fn a_restarted_peer_is_found_even_when_only_keepalives_flow() {
     // Keepalive at 25 s, then 2 x 30 s without an answer.
     assert!(back - at >= Duration::from_secs(55), "{:?}", back - at);
     assert!(back - at <= Duration::from_secs(100), "{:?}", back - at);
+}
+
+// ---- removal sync (R-SEC2) through the simulated channel ---------------------
+//
+// Each side runs the real control layer next to its link, with a real device
+// folder in a temporary directory, exactly as `oasa-link` does.
+
+fn tmpdir(tag: &str) -> PathBuf {
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).unwrap();
+    let d = std::env::temp_dir().join(format!(
+        "oasa-sim-{tag}-{}",
+        data_encoding::HEXLOWER.encode(&r)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    d
+}
+
+fn trust(dir: &Path, key: [u8; 32], name: &str, role: Role) {
+    store::add(
+        dir,
+        &Peer {
+            public: key,
+            name: name.into(),
+            role,
+        },
+    )
+    .unwrap();
+}
+
+fn victim(i: usize) -> [u8; 32] {
+    [60 + i as u8; 32]
+}
+
+fn is_removed(dir: &Path, key: &[u8; 32]) -> bool {
+    removal::load_removed(dir).unwrap().is_removed(key)
+}
+
+fn is_listed(dir: &Path, key: &[u8; 32]) -> bool {
+    store::get(dir, key).unwrap().is_some()
+}
+
+/// An admin on side A with `n` revoked victims in its log, and a device on
+/// side B that lists the admin as `admin` and every victim as a peer.
+struct Fleet {
+    sim: Sim,
+    admin: PathBuf,
+    device: PathBuf,
+    admin_key: [u8; 32],
+    device_key: [u8; 32],
+}
+
+fn fleet(seed: u64, channel: Channel, n: usize) -> Fleet {
+    let mut sim = Sim::new(seed, config(CounterLen::Short), channel);
+    let (admin_key, device_key) = (pub_of(&sim.keys[&Side::A]), pub_of(&sim.keys[&Side::B]));
+    let (admin, device) = (tmpdir("admin"), tmpdir("device"));
+    trust(&admin, device_key, "device", Role::Peer);
+    trust(&device, admin_key, "admin", Role::Admin);
+    for i in 0..n {
+        trust(&device, victim(i), &format!("victim-{i}"), Role::Peer);
+        removal::revoke(&admin, &admin_key, &victim(i), 1000 + i as u64).unwrap();
+    }
+    sim.attach_control(Side::A, &admin, seed ^ 0xAD);
+    sim.attach_control(Side::B, &device, seed ^ 0xDE);
+    Fleet {
+        sim,
+        admin,
+        device,
+        admin_key,
+        device_key,
+    }
+}
+
+impl Fleet {
+    fn revoke(&mut self, i: usize) {
+        trust(&self.device, victim(i), &format!("victim-{i}"), Role::Peer);
+        removal::revoke(&self.admin, &self.admin_key, &victim(i), 2000 + i as u64).unwrap();
+        // oasa-link notices the log file changed and announces it.
+        let now = self.sim.now;
+        let acts = self.sim.ctl.get_mut(&Side::A).unwrap().log_changed(now);
+        self.sim.run_ctl(Side::A, acts);
+    }
+
+    fn all_removed(&self, n: usize) -> bool {
+        (0..n).all(|i| is_removed(&self.device, &victim(i)) && !is_listed(&self.device, &victim(i)))
+    }
+
+    fn held(&self) -> Option<u32> {
+        removal::sync_state(&self.device, &fingerprint(&self.admin_key))
+            .unwrap()
+            .map(|(_, h)| h)
+    }
+
+    /// Nothing is waiting for an answer on the admin side: polling far in the
+    /// future would resend anything still pending, and sends nothing.
+    fn admin_has_nothing_pending(&mut self) -> bool {
+        let far = self.sim.now + Duration::from_secs(100_000);
+        self.sim.ctl.get_mut(&Side::A).unwrap().poll(far).is_empty()
+    }
+
+    fn entries_sent(&self) -> Vec<u32> {
+        self.sim
+            .ctl_messages(Side::A)
+            .iter()
+            .filter_map(|m| match m {
+                Message::RemoveEntry { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn removal_sync_converges_through_a_lossy_reordering_channel_on_many_seeds() {
+    for seed in 1..=8u64 {
+        let mut f = fleet(seed, Channel::rough(0.30), 6);
+        f.sim.start();
+        f.sim.run(Duration::from_secs(400), ms(10), ms(250), |s| {
+            if s.rng.chance(0.02) {
+                s.replay_random();
+            }
+        });
+        assert!(
+            f.all_removed(6),
+            "seed {seed}: not every victim was removed"
+        );
+        assert_eq!(f.held(), Some(6), "seed {seed}");
+        assert!(f.admin_has_nothing_pending(), "seed {seed}");
+        // Only the victims went: the admin itself is still trusted.
+        assert!(is_listed(&f.device, &f.admin_key));
+        assert!(!is_removed(&f.device, &f.admin_key));
+        // Control never reached the application, and the books still add up.
+        f.sim.check_delivery_integrity();
+        f.sim.check_accounting();
+        f.sim.check_no_plaintext_on_the_wire();
+        assert!(f.sim.stats(Side::B).control_received >= 6, "seed {seed}");
+        assert!(
+            f.sim.stats(Side::A).control_received >= 6,
+            "seed {seed}: acks came back"
+        );
+    }
+}
+
+#[test]
+fn an_admin_that_was_offline_catches_the_device_up_and_only_sends_what_is_missing() {
+    let mut f = fleet(11, Channel::rough(0.10), 3);
+    f.sim.start();
+    f.sim.run(Duration::from_secs(60), ms(10), ms(500), |_| {});
+    assert!(f.all_removed(3));
+    assert_eq!(f.held(), Some(3));
+    // The admin is cut off and revokes four more devices meanwhile.
+    f.sim.blackout = true;
+    f.sim.run(Duration::from_secs(10), ms(10), ms(500), |_| {});
+    for i in 3..7 {
+        f.revoke(i);
+    }
+    f.sim.run(Duration::from_secs(150), ms(10), ms(500), |_| {});
+    assert!(
+        !is_removed(&f.device, &victim(3)),
+        "nothing can arrive in a blackout"
+    );
+    // The link comes back; the stale rule and the handshake retries find it.
+    f.sim.blackout = false;
+    let mark = f.entries_sent().len();
+    f.sim.run(Duration::from_secs(300), ms(10), ms(500), |_| {});
+    assert!(f.all_removed(7));
+    assert_eq!(f.held(), Some(7));
+    assert!(f.admin_has_nothing_pending());
+    let after: Vec<u32> = f.entries_sent()[mark..].to_vec();
+    assert!(
+        after.iter().all(|seq| *seq >= 4),
+        "entries 1 to 3 were already held and must not be sent again: {after:?}"
+    );
+    assert!(after.contains(&7));
+    f.sim.check_delivery_integrity();
+    f.sim.check_accounting();
+}
+
+#[test]
+fn a_restarted_admin_and_a_restarted_device_resume_from_the_saved_state() {
+    let mut f = fleet(13, Channel::rough(0.15), 5);
+    f.sim.start();
+    f.sim.run(Duration::from_secs(4), ms(10), ms(500), |_| {});
+    // The device's process dies part-way (new link, new control, same folder).
+    f.sim.restart(Side::B);
+    f.sim.attach_control(Side::B, &f.device, 91);
+    f.sim.run(Duration::from_secs(200), ms(10), ms(500), |_| {});
+    assert!(f.all_removed(5));
+    let held_before = f.held();
+    assert_eq!(held_before, Some(5));
+    // The admin's process restarts: it sends a head, the device says 5, and
+    // not one entry goes out again.
+    f.sim.restart(Side::A);
+    f.sim.attach_control(Side::A, &f.admin, 92);
+    let mark = f.entries_sent().len();
+    f.sim.run(Duration::from_secs(200), ms(10), ms(500), |_| {});
+    assert_eq!(f.entries_sent()[mark..], [] as [u32; 0]);
+    assert!(
+        f.sim
+            .ctl_messages(Side::A)
+            .iter()
+            .any(|m| matches!(m, Message::RemoveHead { .. }))
+    );
+    f.sim.check_delivery_integrity();
+}
+
+#[test]
+fn an_admin_that_lost_its_folder_starts_a_new_log_and_the_device_takes_it_whole() {
+    let mut f = fleet(17, Channel::rough(0.10), 3);
+    f.sim.start();
+    f.sim.run(Duration::from_secs(100), ms(10), ms(500), |_| {});
+    assert!(f.all_removed(3));
+    // New folder, same key: a new log with a new id and one entry.
+    std::fs::remove_file(f.admin.join(removal::LOG_FILE)).unwrap();
+    f.sim.restart(Side::A);
+    f.sim.attach_control(Side::A, &f.admin, 93);
+    trust(&f.device, victim(9), "victim-9", Role::Peer);
+    removal::revoke(&f.admin, &f.admin_key, &victim(9), 5).unwrap();
+    f.sim.run(Duration::from_secs(300), ms(10), ms(500), |_| {});
+    assert!(is_removed(&f.device, &victim(9)));
+    // Union: the earlier removals stand.
+    assert!(f.all_removed(3));
+    assert_eq!(f.held(), Some(1));
+}
+
+#[test]
+fn after_a_device_removes_its_admin_nothing_more_from_it_applies() {
+    let mut f = fleet(19, Channel::clean(), 1);
+    f.sim.start();
+    f.sim.run(Duration::from_secs(30), ms(10), ms(500), |_| {});
+    assert!(f.all_removed(1));
+    // A person at the device removes the admin (it was stolen). The device's
+    // oasa-link for it would exit; here its control is told, as the program does.
+    removal::remove_local(&f.device, &f.device_key, &f.admin_key, 9).unwrap();
+    f.sim.ctl.get_mut(&Side::B).unwrap().peer_removed();
+    trust(&f.device, victim(5), "victim-5", Role::Peer);
+    removal::revoke(&f.admin, &f.admin_key, &victim(5), 10).unwrap();
+    let now = f.sim.now;
+    let acts = f.sim.ctl.get_mut(&Side::A).unwrap().log_changed(now);
+    f.sim.run_ctl(Side::A, acts);
+    f.sim.run(Duration::from_secs(60), ms(10), ms(500), |_| {});
+    assert!(!is_removed(&f.device, &victim(5)));
+    assert!(is_listed(&f.device, &victim(5)));
+    assert!(f.sim.ctl_drops[&Side::B].contains(&"peer_removed"));
+}
+
+/// Two admins on two links into one device (two `oasa-link` processes on one
+/// folder), and an admin target listed on the device.
+fn two_admin_device(seed: u64) -> (Sim, Sim, PathBuf, [u8; 32], [u8; 32], [u8; 32]) {
+    let (kd, k1, k2) = {
+        let mut r = Rng(seed);
+        (key(&mut r), key(&mut r), key(&mut r))
+    };
+    let wall = Duration::from_secs(WALL);
+    let mk = |s: u64, ka: [u8; 32]| {
+        Sim::new_keyed(
+            s,
+            (config(CounterLen::Short), wall),
+            (config(CounterLen::Short), wall),
+            Channel::rough(0.20),
+            Some((ka, kd)),
+        )
+    };
+    let (s1, s2) = (mk(seed, k1), mk(seed + 1, k2));
+    let device = tmpdir("two-admin-device");
+    let (p1, p2, pd) = (pub_of(&k1), pub_of(&k2), pub_of(&kd));
+    trust(&device, p1, "admin-1", Role::Admin);
+    trust(&device, p2, "admin-2", Role::Admin);
+    (s1, s2, device, p1, p2, pd)
+}
+
+fn admin_dir(admin: [u8; 32], device_pub: [u8; 32], targets: &[[u8; 32]]) -> PathBuf {
+    let d = tmpdir("two-admin-admin");
+    trust(&d, device_pub, "device", Role::Peer);
+    for (i, t) in targets.iter().enumerate() {
+        removal::revoke(&d, &admin, t, 50 + i as u64).unwrap();
+    }
+    d
+}
+
+#[test]
+fn removing_an_admin_takes_entries_from_two_admins_on_two_links() {
+    let (mut s1, mut s2, device, p1, p2, pd) = two_admin_device(23);
+    let third = pub_of(&key(&mut Rng(777)));
+    trust(&device, third, "admin-3", Role::Admin);
+    let (d1, d2) = (admin_dir(p1, pd, &[third]), admin_dir(p2, pd, &[third]));
+    s1.attach_control(Side::A, &d1, 1);
+    s1.attach_control(Side::B, &device, 2);
+    s2.attach_control(Side::A, &d2, 3);
+    s2.attach_control(Side::B, &device, 4);
+    s1.start();
+    s1.run(Duration::from_secs(200), ms(10), ms(500), |_| {});
+    assert!(is_listed(&device, &third), "one admin is not enough");
+    assert!(!is_removed(&device, &third));
+    assert!(device.join(removal::VOTES_FILE).exists());
+    s2.start();
+    s2.run(Duration::from_secs(200), ms(10), ms(500), |_| {});
+    assert!(
+        is_removed(&device, &third),
+        "the second admin's entry completes it"
+    );
+    assert!(!is_listed(&device, &third));
+    s1.check_accounting();
+    s2.check_accounting();
+}
+
+#[test]
+fn a_vote_from_an_admin_removed_before_the_second_arrives_is_lost() {
+    let (mut s1, mut s2, device, p1, p2, pd) = two_admin_device(29);
+    let third = pub_of(&key(&mut Rng(778)));
+    trust(&device, third, "admin-3", Role::Admin);
+    let (d1, d2) = (admin_dir(p1, pd, &[third]), admin_dir(p2, pd, &[third]));
+    s1.attach_control(Side::A, &d1, 1);
+    s1.attach_control(Side::B, &device, 2);
+    s2.attach_control(Side::A, &d2, 3);
+    s2.attach_control(Side::B, &device, 4);
+    s1.start();
+    s1.run(Duration::from_secs(200), ms(10), ms(500), |_| {});
+    assert!(device.join(removal::VOTES_FILE).exists());
+    // Admin 1 turns out to be the stolen one, and is removed on the device by hand.
+    removal::remove_local(&device, &pd, &p1, 77).unwrap();
+    s2.start();
+    s2.run(Duration::from_secs(200), ms(10), ms(500), |_| {});
+    assert!(
+        is_listed(&device, &third),
+        "admin 1's vote was dropped, so admin 2 alone is not enough"
+    );
+    assert!(!is_removed(&device, &third));
+}
+
+#[test]
+fn the_same_entry_needs_one_vote_for_a_peer_and_two_for_an_admin() {
+    let (mut s1, _s2, device, p1, _p2, pd) = two_admin_device(31);
+    let as_admin = pub_of(&key(&mut Rng(779)));
+    let as_peer = pub_of(&key(&mut Rng(780)));
+    trust(&device, as_admin, "target-admin", Role::Admin);
+    trust(&device, as_peer, "target-peer", Role::Peer);
+    let d1 = admin_dir(p1, pd, &[as_admin, as_peer]);
+    s1.attach_control(Side::A, &d1, 1);
+    s1.attach_control(Side::B, &device, 2);
+    s1.start();
+    s1.run(Duration::from_secs(200), ms(10), ms(500), |_| {});
+    assert!(
+        is_removed(&device, &as_peer),
+        "a peer goes on one admin's word"
+    );
+    assert!(is_listed(&device, &as_admin), "an admin needs a second");
+}
+
+// ---- signing-key rotation through the simulated channel (R-SEC2 phase B) ------
+//
+// Side A is the drone (it holds an autopilot key), side B its operator.
+
+struct Pair {
+    sim: Sim,
+    drone: PathBuf,
+    operator: PathBuf,
+    drone_fp: String,
+}
+
+fn rotation_pair(seed: u64, channel: Channel) -> Pair {
+    let mut sim = Sim::new(seed, config(CounterLen::Short), channel);
+    let (a, b) = (pub_of(&sim.keys[&Side::A]), pub_of(&sim.keys[&Side::B]));
+    let (drone, operator) = (tmpdir("rot-drone"), tmpdir("rot-operator"));
+    // Both start with the key from pairing.
+    let key = oasa_sec::signing::SigningKey::generate().unwrap();
+    key.save(&drone.join(oasa_sec::signing::AUTOPILOT_KEY_FILE))
+        .unwrap();
+    let drone_fp = fingerprint(&a);
+    key.save(&oasa_sec::signing::peer_key_path(&operator, &drone_fp))
+        .unwrap();
+    trust(&drone, b, "operator", Role::Operator);
+    trust(&operator, a, "drone", Role::Peer);
+    sim.attach_control(Side::A, &drone, seed ^ 1);
+    sim.attach_control(Side::B, &operator, seed ^ 2);
+    Pair {
+        sim,
+        drone,
+        operator,
+        drone_fp,
+    }
+}
+
+impl Pair {
+    fn tell_drone(&mut self) {
+        let now = self.sim.now;
+        let acts = self.sim.ctl.get_mut(&Side::A).unwrap().signing_changed(now);
+        self.sim.run_ctl(Side::A, acts);
+    }
+
+    /// The signer's side of a rotation, without an autopilot: issue, and commit.
+    fn issue(&mut self) -> oasa_sec::rotation::Begun {
+        let b = oasa_sec::rotation::begin(&self.drone).unwrap();
+        self.tell_drone();
+        b
+    }
+
+    fn commit(&mut self, g: u32) {
+        oasa_sec::rotation::commit(&self.drone, g).unwrap();
+        self.tell_drone();
+    }
+
+    fn operator_key(&self) -> oasa_sec::signing::SigningKey {
+        oasa_sec::signing::SigningKey::load(&oasa_sec::signing::peer_key_path(
+            &self.operator,
+            &self.drone_fp,
+        ))
+        .unwrap()
+    }
+
+    fn operator_gen(&self) -> u32 {
+        oasa_sec::rotation::operator_gen(&self.operator, &self.drone_fp).unwrap()
+    }
+}
+
+#[test]
+fn a_rotation_reaches_the_operator_through_a_lossy_channel_on_many_seeds() {
+    for seed in 1..=8u64 {
+        let mut p = rotation_pair(seed, Channel::rough(0.30));
+        p.sim.start();
+        p.sim.run(Duration::from_secs(20), ms(10), ms(250), |_| {});
+        let b = p.issue();
+        p.sim.run(Duration::from_secs(300), ms(10), ms(250), |s| {
+            if s.rng.chance(0.02) {
+                s.replay_random();
+            }
+        });
+        // The pending key arrived; the operator still uses the old one.
+        let pending = oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+            .unwrap()
+            .unwrap_or_else(|| panic!("seed {seed}: no pending key"));
+        assert_eq!((pending.0, pending.1.as_bytes()), (1, b.key.as_bytes()));
+        assert_eq!(
+            p.operator_gen(),
+            0,
+            "seed {seed}: switched before the commit"
+        );
+        p.commit(1);
+        p.sim.run(Duration::from_secs(300), ms(10), ms(250), |_| {});
+        assert_eq!(p.operator_gen(), 1, "seed {seed}");
+        assert_eq!(p.operator_key().as_bytes(), b.key.as_bytes(), "seed {seed}");
+        let acked =
+            oasa_sec::rotation::read_acked(&p.drone, &fingerprint(&pub_of(&p.sim.keys[&Side::B])))
+                .unwrap();
+        assert_eq!(
+            acked,
+            oasa_sec::rotation::Acked { next: 1, commit: 1 },
+            "seed {seed}"
+        );
+        // Nothing left to send, and the key was never on the wire in the clear.
+        let far = p.sim.now + Duration::from_secs(100_000);
+        assert!(p.sim.ctl.get_mut(&Side::A).unwrap().poll(far).is_empty());
+        for (_, w) in &p.sim.wire {
+            assert!(
+                !w.windows(32).any(|x| x == b.key.as_bytes()),
+                "seed {seed}: the key is on the wire"
+            );
+        }
+        p.sim.check_accounting();
+        p.sim.check_delivery_integrity();
+    }
+}
+
+#[test]
+fn an_operator_that_was_away_for_two_rotations_catches_up_when_it_returns() {
+    let mut p = rotation_pair(41, Channel::rough(0.15));
+    p.sim.blackout = true;
+    p.sim.start();
+    p.sim.run(Duration::from_secs(10), ms(10), ms(500), |_| {});
+    for g in 1..=2 {
+        let b = p.issue();
+        assert_eq!(b.generation, g);
+        p.commit(g);
+    }
+    p.sim.run(Duration::from_secs(60), ms(10), ms(500), |_| {});
+    assert_eq!(p.operator_gen(), 0, "nothing gets through a blackout");
+    p.sim.blackout = false;
+    p.sim.run(Duration::from_secs(400), ms(10), ms(500), |_| {});
+    assert_eq!(p.operator_gen(), 2);
+    let cur = oasa_sec::rotation::load_drone_keys(&p.drone)
+        .unwrap()
+        .unwrap()
+        .current;
+    assert_eq!(p.operator_key(), cur);
+    p.sim.check_accounting();
+}
+
+#[test]
+fn a_new_next_replaces_a_pending_one_after_a_dropped_rotation() {
+    let mut p = rotation_pair(43, Channel::clean());
+    p.sim.start();
+    p.sim.run(Duration::from_secs(10), ms(10), ms(500), |_| {});
+    let first = p.issue();
+    p.sim.run(Duration::from_secs(20), ms(10), ms(500), |_| {});
+    assert_eq!(
+        oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+            .unwrap()
+            .unwrap()
+            .0,
+        1
+    );
+    // The autopilot kept the old key: the signer drops it and tries again.
+    oasa_sec::rotation::abandon(&p.drone).unwrap();
+    let second = p.issue();
+    assert_eq!(second.generation, 2);
+    p.sim.run(Duration::from_secs(20), ms(10), ms(500), |_| {});
+    let (g, k) = oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+        .unwrap()
+        .unwrap();
+    assert_eq!((g, k.as_bytes()), (2, second.key.as_bytes()));
+    p.commit(2);
+    p.sim.run(Duration::from_secs(20), ms(10), ms(500), |_| {});
+    assert_eq!(p.operator_gen(), 2);
+    assert_ne!(p.operator_key().as_bytes(), first.key.as_bytes());
+}
+
+#[test]
+fn a_removed_operator_is_never_sent_the_new_key() {
+    let mut p = rotation_pair(47, Channel::clean());
+    let (a, b) = (pub_of(&p.sim.keys[&Side::A]), pub_of(&p.sim.keys[&Side::B]));
+    p.sim.start();
+    p.sim.run(Duration::from_secs(10), ms(10), ms(500), |_| {});
+    // The operator is removed on the drone; its link process learns of it.
+    removal::remove_local(&p.drone, &a, &b, 5).unwrap();
+    p.sim.ctl.get_mut(&Side::A).unwrap().peer_removed();
+    assert!(p.drone.join("rotation-pending").exists());
+    let issued = p.issue();
+    p.commit(issued.generation);
+    p.sim.run(Duration::from_secs(60), ms(10), ms(500), |_| {});
+    assert!(
+        oasa_sec::rotation::operator_pending(&p.operator, &p.drone_fp)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(p.operator_gen(), 0);
+    for (_, w) in &p.sim.wire {
+        assert!(!w.windows(32).any(|x| x == issued.key.as_bytes()));
+    }
 }

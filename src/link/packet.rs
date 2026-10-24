@@ -3,8 +3,9 @@
 
 use super::DropReason;
 
-/// Wire version. Anything else is dropped.
-pub const VERSION: u8 = 0;
+/// Wire version. Anything else is dropped. Version 1 added the content
+/// type byte inside every data plaintext (spec section 3); it replaced v0.
+pub const VERSION: u8 = 1;
 
 const TYPE_HANDSHAKE1: u8 = 1;
 const TYPE_HANDSHAKE2: u8 = 2;
@@ -56,8 +57,16 @@ impl CounterLen {
     }
 }
 
-/// Bytes a data packet adds to the plaintext: header, index, counter, tag.
+/// Bytes a data packet adds to an application or control payload: header,
+/// index, counter, content type byte, tag. (A keepalive has no content type
+/// byte and is [`keepalive_len`] bytes.)
 pub fn data_overhead(len: CounterLen) -> usize {
+    keepalive_len(len) + 1
+}
+
+/// Size of an empty data packet (a keepalive): header, index, counter, tag.
+/// Also the shortest data packet that parses.
+pub fn keepalive_len(len: CounterLen) -> usize {
     1 + 2 + len.bytes() + TAG_LEN
 }
 
@@ -125,7 +134,7 @@ pub fn parse(buf: &[u8], mtu: usize) -> Result<Packet<'_>, DropReason> {
             } else {
                 CounterLen::Long
             };
-            if buf.len() < data_overhead(counter_len) {
+            if buf.len() < keepalive_len(counter_len) {
                 return Err(bad);
             }
             let n = counter_len.bytes();
@@ -159,6 +168,11 @@ pub(crate) fn encode_handshake1(responder_public: &[u8; 32], noise: &[u8]) -> Ve
     v
 }
 
+#[cfg(test)]
+pub(crate) fn encode_handshake2_for_tests() -> Vec<u8> {
+    encode_handshake2(0x0102, &[5u8; NOISE2_LEN])
+}
+
 pub(crate) fn encode_handshake2(receiver: u16, noise: &[u8]) -> Vec<u8> {
     debug_assert_eq!(noise.len(), NOISE2_LEN);
     let mut v = Vec::with_capacity(HANDSHAKE2_LEN);
@@ -175,7 +189,7 @@ pub(crate) fn encode_handshake2(receiver: u16, noise: &[u8]) -> Vec<u8> {
 pub(crate) fn mac1_key(responder_public: &[u8; 32]) -> [u8; 32] {
     use blake2::{Blake2s256, Digest};
     let mut h = Blake2s256::new();
-    h.update(b"OASA-SEC v0 mac1");
+    h.update(b"OASA-SEC v1 mac1");
     h.update(responder_public);
     h.finalize().into()
 }
@@ -221,8 +235,11 @@ mod tests {
     fn sizes_match_the_spec() {
         assert_eq!(HANDSHAKE1_LEN, 119);
         assert_eq!(HANDSHAKE2_LEN, 55);
-        assert_eq!(data_overhead(CounterLen::Short), 21);
-        assert_eq!(data_overhead(CounterLen::Long), 23);
+        assert_eq!(data_overhead(CounterLen::Short), 22);
+        assert_eq!(data_overhead(CounterLen::Long), 24);
+        assert_eq!(keepalive_len(CounterLen::Short), 21);
+        assert_eq!(keepalive_len(CounterLen::Long), 23);
+        assert_eq!(VERSION, 1);
     }
 
     #[test]
@@ -291,17 +308,17 @@ mod tests {
         ok.extend_from_slice(&[0u8; 16]);
         assert!(parse(&ok, MTU).is_ok());
         // All 256 header bytes against a data-shaped body: only the data
-        // headers (type 3, version 0, either flag) may pass, and only when
+        // headers (type 3, version 1, short flag) may pass, and only when
         // the length fits that flag.
         for h in 0..=255u8 {
             let mut p = ok.clone();
             p[0] = h;
             let got = parse(&p, MTU);
-            let valid = h == 0x30; // data, short counter, version 0
+            let valid = h == 0x31; // data, short counter, version 1
             assert_eq!(got.is_ok(), valid, "header byte {h:#04x}");
         }
         // Flag bit on handshakes.
-        for h in [0x18u8, 0x28] {
+        for h in [0x19u8, 0x29] {
             let mut p = vec![h];
             p.extend_from_slice(&[0u8; 120]);
             assert!(parse(&p, MTU).is_err());
@@ -309,13 +326,13 @@ mod tests {
         let mut hs1 = encode_handshake1(&[1; 32], &[0; NOISE1_LEN]);
         hs1[0] |= 0x08;
         assert!(parse(&hs1, MTU).is_err());
-        // Wrong version on each type.
+        // Wrong version on each type, version 0 (the old wire) included.
         for p in [
             encode_handshake1(&[1; 32], &[0; NOISE1_LEN]),
             encode_handshake2(2, &[0; NOISE2_LEN]),
             ok.clone(),
         ] {
-            for v in 1..8u8 {
+            for v in (0..8u8).filter(|v| *v != VERSION) {
                 let mut q = p.clone();
                 q[0] = (q[0] & !7) | v;
                 assert_eq!(parse(&q, MTU), Err(DropReason::BadHeader));

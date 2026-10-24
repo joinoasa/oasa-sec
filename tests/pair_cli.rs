@@ -108,7 +108,7 @@ fn trust_adds_a_peer_and_prints_its_fingerprint() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(a.join("trusted-peers"))
+        let mode = std::fs::metadata(a.join("trusted-peers.v1"))
             .unwrap()
             .permissions()
             .mode();
@@ -146,7 +146,7 @@ fn trust_refuses_bad_input() {
     // Its own key.
     assert!(err(&["trust", "--dir", s(&a), "--name", "me", "--key", &ka]).contains("own key"));
     // Nothing was written by any of the failures.
-    assert!(!a.join("trusted-peers").exists());
+    assert!(!a.join("trusted-peers.v1").exists());
     // Clashes with an existing entry.
     ok(&["trust", "--dir", s(&a), "--name", "relay", "--key", &kb]);
     let same_name = err(&["trust", "--dir", s(&a), "--name", "relay", "--key", &kc]);
@@ -186,7 +186,7 @@ fn trust_refuses_small_order_keys_and_fingerprint_shaped_names() {
     let fp = field(&ok(&["show", "--dir", s(&b)]), "fingerprint").to_string();
     let e = err(&["trust", "--dir", s(&a), "--name", &fp, "--key", &kb]);
     assert!(e.contains("fingerprint"), "{e}");
-    assert!(!a.join("trusted-peers").exists());
+    assert!(!a.join("trusted-peers.v1").exists());
 }
 
 #[test]
@@ -236,4 +236,281 @@ fn reset_stamp_forgets_saved_timestamps() {
         ])
         .contains("--which")
     );
+}
+
+// ---- roles, removal and the lock (R-SEC2) -------------------------------------
+
+fn make(tag: &str) -> (PathBuf, String, String) {
+    let d = tempdir(tag);
+    ok(&["init", "--dir", s(&d), "--name", tag]);
+    let j = ok(&["show", "--dir", s(&d)]);
+    (
+        d,
+        field(&j, "public_key").to_string(),
+        field(&j, "fingerprint").to_string(),
+    )
+}
+
+#[test]
+fn trust_sets_roles_and_peers_shows_them() {
+    let (a, _, _) = make("ra");
+    let (_, kb, fb) = make("rb");
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    assert!(ok(&["peers", "--dir", s(&a)]).contains("peer"));
+    // Same key and name again with a role changes the role.
+    ok(&[
+        "trust",
+        "--dir",
+        s(&a),
+        "--name",
+        "b",
+        "--key",
+        &kb,
+        "--role",
+        "admin",
+    ]);
+    let peers = ok(&["peers", "--dir", s(&a)]);
+    assert!(peers.contains("admin") && peers.contains(&fb), "{peers}");
+    assert_eq!(peers.lines().count(), 1);
+    err(&[
+        "trust",
+        "--dir",
+        s(&a),
+        "--name",
+        "b",
+        "--key",
+        &kb,
+        "--role",
+        "root",
+    ]);
+}
+
+#[test]
+fn remove_is_permanent_until_restore_and_restore_does_not_trust() {
+    let (a, _, _) = make("rma");
+    let (_, kb, fb) = make("rmb");
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    let out = ok(&["remove", "--dir", s(&a), "b"]);
+    assert!(out.contains(&fb), "{out}");
+    assert!(ok(&["peers", "--dir", s(&a)]).contains("No paired devices"));
+    assert!(ok(&["removed", "--dir", s(&a)]).contains(&fb));
+    // A removed key can not be trusted again, by name or by key.
+    err(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    // Restore lifts the tombstone but trusts nothing.
+    ok(&["restore", "--dir", s(&a), &fb]);
+    assert!(ok(&["peers", "--dir", s(&a)]).contains("No paired devices"));
+    assert!(ok(&["removed", "--dir", s(&a)]).contains("Nothing removed"));
+    err(&["restore", "--dir", s(&a), &fb]);
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    assert!(ok(&["peers", "--dir", s(&a)]).contains(&fb));
+}
+
+#[test]
+fn revoke_removes_and_writes_a_removal_log() {
+    let (a, _, _) = make("rva");
+    let (_, kb, fb) = make("rvb");
+    ok(&["trust", "--dir", s(&a), "--name", "b", "--key", &kb]);
+    let out = ok(&["revoke", "--dir", s(&a), &fb]);
+    assert!(out.contains("entry 1"), "{out}");
+    assert!(ok(&["removed", "--dir", s(&a)]).contains(&fb));
+    // Again: still one entry.
+    let again = ok(&["revoke", "--dir", s(&a), &fb]);
+    assert!(again.contains("already"), "{again}");
+    let log = std::fs::read_to_string(a.join("removal-log")).unwrap();
+    assert_eq!(log.lines().count(), 2, "log id plus one entry: {log}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in ["removal-log", "removed"] {
+            let m = std::fs::metadata(a.join(f)).unwrap().permissions().mode();
+            assert_eq!(m & 0o777, 0o600, "{f}");
+        }
+    }
+    err(&["remove", "--dir", s(&a), "nobody"]);
+    err(&["remove", "--dir", s(&a)]);
+}
+
+#[test]
+fn an_old_trusted_peers_file_is_converted_and_reported() {
+    let a = tempdir("mig");
+    ok(&["init", "--dir", s(&a), "--name", "old"]);
+    let key = data_encoding::BASE32_NOPAD.encode(&[9u8; 32]);
+    std::fs::write(
+        a.join("trusted-peers"),
+        format!("# OASA-SEC v0 trusted peers: <public key> <name>\n{key} friend\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            a.join("trusted-peers"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let o = pair(&["peers", "--dir", s(&a)]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let (so, se) = (
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr),
+    );
+    assert!(se.contains("Converted") && se.contains("friend"), "{se}");
+    assert!(so.contains("friend") && so.contains("peer"), "{so}");
+    assert!(a.join("trusted-peers.v0-migrated").exists());
+    assert!(!a.join("trusted-peers").exists());
+    // Second run: nothing to say.
+    let o = pair(&["peers", "--dir", s(&a)]);
+    assert!(o.stderr.is_empty());
+}
+
+#[test]
+fn many_processes_changing_one_folder_lose_nothing() {
+    let n = 24usize;
+    let keys: Vec<String> = (0..n)
+        .map(|i| data_encoding::HEXLOWER.encode(&[(i as u8) + 20; 32]))
+        .collect();
+    // Spawn them all first, then wait: they really overlap.
+    let b = tempdir("lock2");
+    ok(&["init", "--dir", s(&b), "--name", "b"]);
+    let procs: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+                .args([
+                    "trust",
+                    "--dir",
+                    s(&b),
+                    "--name",
+                    &format!("p{i}"),
+                    "--key",
+                    k,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for p in procs {
+        let o = p.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert_eq!(ok(&["peers", "--dir", s(&b)]).lines().count(), n);
+}
+
+fn make_drone(tag: &str) -> PathBuf {
+    let (d, _, _) = make(tag);
+    oasa_sec::signing::SigningKey::generate()
+        .unwrap()
+        .save(&d.join("mavlink-signing-key.bin"))
+        .unwrap();
+    d
+}
+
+#[test]
+fn demoting_an_operator_on_a_drone_asks_for_a_new_signing_key_and_says_so() {
+    let drone = make_drone("demote");
+    let (_, kb, _) = make("demote-b");
+    let t = |role: &str| {
+        pair(&[
+            "trust",
+            "--dir",
+            s(&drone),
+            "--name",
+            "b",
+            "--key",
+            &kb,
+            "--role",
+            role,
+        ])
+    };
+    for role in ["peer", "operator"] {
+        assert!(t(role).status.success());
+    }
+    // peer -> operator asked for nothing; operator -> peer does.
+    assert!(!drone.join("rotation-pending").exists());
+    let out = t("peer");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("new key was requested"), "{text}");
+    let pending = std::fs::read_to_string(drone.join("rotation-pending")).unwrap();
+    assert!(pending.contains("operator-role-changed"), "{pending}");
+}
+
+#[test]
+fn migrating_on_a_drone_makes_everyone_an_operator_and_says_so_loudly() {
+    let a = make_drone("migdrone");
+    let key = data_encoding::BASE32_NOPAD.encode(&[9u8; 32]);
+    let old = a.join("trusted-peers");
+    std::fs::write(
+        &old,
+        format!("# OASA-SEC v0 trusted peers: <public key> <name>\n{key} friend\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let o = pair(&["peers", "--dir", s(&a)]);
+    assert!(o.status.success());
+    let se = String::from_utf8_lossy(&o.stderr);
+    assert!(se.contains("CHECK THIS") && se.contains("OPERATOR"), "{se}");
+    assert!(se.contains("trust --role peer"), "{se}");
+}
+
+/// Kill `pid` after 30 s, so a regression (a signer that never stops, or
+/// never prints) fails the test instead of hanging it.
+fn watchdog(pid: u32) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    });
+}
+
+fn start_signer(d: &Path, port: u16) -> std::process::Child {
+    use std::process::Stdio;
+    let c = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+        .args([
+            "signer",
+            "--dir",
+            s(d),
+            "--autopilot",
+            &format!("udpout:127.0.0.1:{port}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    watchdog(c.id());
+    c
+}
+
+#[test]
+fn a_second_signer_on_one_folder_is_refused() {
+    use std::io::{BufRead, BufReader};
+    let d = make_drone("onesigner");
+    let mut first = start_signer(&d, 14999);
+    let mut line = String::new();
+    BufReader::new(first.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("signer_started"), "{line}");
+    let second = start_signer(&d, 14998).wait_with_output().unwrap();
+    assert!(!second.status.success(), "the second signer must not run");
+    let e = String::from_utf8_lossy(&second.stderr);
+    assert!(e.contains("already running"), "{e}");
+    first.kill().unwrap();
+    first.wait().unwrap();
+    // Once the first is gone, the folder is free again.
+    let mut again = start_signer(&d, 14999);
+    let mut line = String::new();
+    BufReader::new(again.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("signer_started"), "{line}");
+    again.kill().unwrap();
+    again.wait().unwrap();
 }

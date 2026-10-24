@@ -46,7 +46,7 @@ Names are 1–32 characters of `A-Z a-z 0-9 - _ .`.
 
 ## 4. Trust
 
-Each side saves the other's public key and name in an owner-only `trusted-peers` file. In v0 this list is a record, not yet a gate: nothing checks it before acting. R-COM2 will use it to decide who may open an encrypted link. Removing a peer edits the list only; locking a lost device out needs key rotation (R-SEC2).
+Each side saves the other's public key and name in an owner-only `trusted-peers` file. The file is `trusted-peers.v1` and each peer has a role (admin, operator or peer; the drone saves the ground station as operator, the ground station saves the drone as peer). It is a gate: `oasa-link` talks only to listed peers, and a key in the `removed` list is never trusted. Removal and its sync between devices are in the [roles and removal spec](oasa-sec-v0-rotation.md).
 
 ## 5. MAVLink signing
 

@@ -33,8 +33,8 @@ use super::packet::{self, CounterLen, Packet};
 use super::session::Session;
 use super::stamp::{StoredStamps, Timestamp, TimestampStore};
 use super::{
-    Config, Dest, DropReason, Entropy, Event, LINK_NOISE, LINK_PROLOGUE, SendError, Stats,
-    private_copy,
+    CONTENT_APP, CONTENT_CONTROL, Config, Dest, DropReason, Entropy, Event, LINK_NOISE,
+    LINK_PROLOGUE, SendError, Stats, private_copy,
 };
 use crate::identity::Identity;
 use crate::{Error, Result};
@@ -397,7 +397,8 @@ impl Endpoint {
         out.extend(ev.into_iter().map(|e| (Some(PeerId(i)), e)));
     }
 
-    /// Encrypt `plaintext` for `id` on its current session.
+    /// Encrypt an application packet for `id` on its current session. The
+    /// link adds the content type byte.
     pub fn send(
         &mut self,
         id: PeerId,
@@ -407,6 +408,33 @@ impl Endpoint {
         if plaintext.is_empty() {
             return Err(SendError::Empty);
         }
+        let packet = self.send_content(id, now, CONTENT_APP, plaintext)?;
+        self.sh.stats.sent += 1;
+        Ok(packet)
+    }
+
+    /// Encrypt a control message (`[type][request id][body]`) for `id`.
+    pub fn send_control(
+        &mut self,
+        id: PeerId,
+        now: Duration,
+        message: &[u8],
+    ) -> std::result::Result<Vec<u8>, SendError> {
+        if message.is_empty() {
+            return Err(SendError::Empty);
+        }
+        let packet = self.send_content(id, now, CONTENT_CONTROL, message)?;
+        self.sh.stats.control_sent += 1;
+        Ok(packet)
+    }
+
+    pub(crate) fn send_content(
+        &mut self,
+        id: PeerId,
+        now: Duration,
+        kind: u8,
+        body: &[u8],
+    ) -> std::result::Result<Vec<u8>, SendError> {
         let Some(Some(peer)) = self.peers.get_mut(id.0) else {
             return Err(SendError::UnknownPeer);
         };
@@ -414,7 +442,7 @@ impl Endpoint {
             peer.wants_session.get_or_insert(now);
             return Err(SendError::NoSession);
         };
-        let packet = match cur.encrypt(now, &self.sh.cfg, plaintext) {
+        let packet = match cur.encrypt(now, &self.sh.cfg, Some((kind, body))) {
             Ok(p) => p,
             Err(e) => {
                 if e == SendError::NoSession {
@@ -426,7 +454,6 @@ impl Endpoint {
         peer.awaiting_since.get_or_insert(now);
         peer.silent_since.get_or_insert(now);
         peer.owe_ack_since = None;
-        self.sh.stats.sent += 1;
         Ok(packet)
     }
 
@@ -700,7 +727,7 @@ impl PeerLink {
 
     fn send_keepalive(&mut self, sh: &mut Shared, now: Duration, out: &mut Vec<Event>) {
         if let Some(cur) = self.current.as_mut()
-            && let Ok(packet) = cur.encrypt(now, &sh.cfg, &[])
+            && let Ok(packet) = cur.encrypt(now, &sh.cfg, None)
         {
             sh.stats.keepalives_sent += 1;
             self.owe_ack_since = None;
@@ -794,12 +821,24 @@ impl PeerLink {
                 self.send_keepalive(sh, now, out);
             }
         }
-        if plain.is_empty() {
-            sh.stats.keepalives_received += 1;
-        } else {
-            sh.stats.received += 1;
-            sh.stats.delivered += 1;
-            out.push(Event::Deliver(plain));
+        // Authenticated, so the peer is real whatever it sent. Then sort
+        // out what it sent: nothing (a keepalive), an application packet, a
+        // control message, or something we do not know (spec section 3).
+        match plain.split_first() {
+            None => sh.stats.keepalives_received += 1,
+            Some((&CONTENT_APP, body)) if !body.is_empty() => {
+                sh.stats.received += 1;
+                sh.stats.delivered += 1;
+                out.push(Event::Deliver(body.to_vec()));
+            }
+            Some((&CONTENT_CONTROL, body)) if !body.is_empty() => {
+                sh.stats.control_received += 1;
+                out.push(Event::Control(Zeroizing::new(body.to_vec())));
+            }
+            Some(_) => {
+                sh.stats.count_drop(DropReason::BadContent);
+                out.push(Event::Dropped(DropReason::BadContent));
+            }
         }
     }
 
