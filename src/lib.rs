@@ -15,6 +15,7 @@
 //! This is a prototype. Do not fly with it.
 
 pub mod code;
+pub mod control;
 pub mod error;
 mod files;
 pub mod identity;
@@ -22,6 +23,9 @@ pub mod link;
 pub mod mavguard;
 mod mavlens;
 pub mod pairing;
+pub mod removal;
+pub mod rotation;
+pub mod signer;
 pub mod signing;
 pub mod store;
 

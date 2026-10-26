@@ -13,12 +13,15 @@ use mavlink::dialects::common::{COMMAND_LONG_DATA, MavCmd, MavMessage, MavResult
 use mavlink::{MavConnection, MavHeader};
 use oasa_sec::code::PairingCode;
 use oasa_sec::identity::{self, Identity, fingerprint};
-use oasa_sec::pairing::{DeadlineStream, check_name, pair_as_drone, pair_as_ground};
+use oasa_sec::pairing::{DeadlineStream, check_name, pair_as_drone_checked, pair_as_ground};
+use oasa_sec::removal;
+use oasa_sec::rotation;
+use oasa_sec::signer::{self, port::UdpPort};
 use oasa_sec::signing::{AUTOPILOT_KEY_FILE, SigningKey, peer_key_path};
-use oasa_sec::store;
+use oasa_sec::store::{self, Role};
 
 const USAGE: &str = "\
-oasa-pair: OASA-SEC v0 pairing prototype (R-SEC1). Do not fly with it.
+oasa-pair: OASA-SEC pairing, roles and device removal (R-SEC1, R-SEC2). Do not fly with it.
 
 USAGE:
   oasa-pair init     --dir DIR [--name NAME]
@@ -27,10 +30,15 @@ USAGE:
   oasa-pair ground   --dir DIR --name NAME --connect HOST:PORT
                      [--code-file FILE | --code -] [--expect-drone FINGERPRINT]
   oasa-pair show     --dir DIR
-  oasa-pair trust    --dir DIR --name PEERNAME --key HEX64
+  oasa-pair trust    --dir DIR --name PEERNAME --key HEX64 [--role admin|operator|peer]
   oasa-pair reset-stamp --dir DIR --peer NAME|FINGERPRINT [--which sent|seen|both]
   oasa-pair peers    --dir DIR
-  oasa-pair remove   --dir DIR FINGERPRINT
+  oasa-pair remove   --dir DIR PEER
+  oasa-pair revoke   --dir DIR PEER
+  oasa-pair restore  --dir DIR KEY
+  oasa-pair removed  --dir DIR
+  oasa-pair signer   --dir DIR --autopilot MAVLINK_ADDR [--target SYS:COMP] [--link-id N]
+  oasa-pair rotate-signing --dir DIR
   oasa-pair command  --dir DIR --to MAVLINK_ADDR [--peer NAME|FINGERPRINT]
                      [--target SYS:COMP] [--link-id N] [--wait SECONDS]
 
@@ -42,7 +50,11 @@ USAGE:
   trust     Trust a device without pairing, like adding a WireGuard peer: give its
             name and public key (from its `show`), and compare the printed fingerprint
             with the one on that device, out loud, before using the link. For relays and
-            test nodes that have no autopilot to pair with.
+            test nodes that have no autopilot to pair with. --role sets what the peer may
+            do here (default peer). admin: its removal log is obeyed (1 to 3 owner devices,
+            ideally kept at base). operator: a ground station that flies this drone. peer:
+            link traffic only. Roles are set only here, never by a message. Running it again
+            for a trusted key with the same name changes its role.
   drone     Show a one-time pairing code (text and QR) and wait for a ground station
             to pair. The first ground station sends a new signing key; with
             --autopilot the drone loads it into the autopilot, checks that it works,
@@ -60,9 +72,34 @@ USAGE:
             `seen` lets one recorded old handshake from that peer be accepted again
             until a newer one arrives; do it only for a peer you trust. Restart
             oasa-link afterwards.
-  peers     List paired devices.
-  remove    Remove a device from the list. This does not lock it out: that needs
-            key rotation, which is the next node (R-SEC2).
+  peers     List paired devices with their roles.
+  remove    Remove a device on this device (PEER: fingerprint, name or 64-hex key). It
+            goes into the permanent `removed` file (a tombstone: it is never trusted
+            again, even if an old trusted-peers comes back), out of the list, and its
+            handshake timestamps are deleted. A running oasa-link notices within a
+            second; the one talking to the removed device exits with code 3. On a drone,
+            removing an operator marks its signing key for rotation (`oasa-pair signer`
+            does it). On a ground station, removing a drone deletes its signing
+            key files.
+  revoke    Like remove, and also add the device to this device's removal log, which
+            devices that list this one as admin pick up over the link. Cannot revoke itself.
+  restore   Undo a removal on this device (KEY: fingerprint of a removed device, or
+            64-hex key). It is not trusted again until you pair or trust it again.
+            Entries already received for it are not applied again; a new one removes
+            it again.
+  removed   List removed devices (the tombstones).
+  signer    On a drone: own a dedicated link to the autopilot (its own UDP/TCP port, never
+            a router endpoint) and run signing-key rotations. It waits until the autopilot
+            is disarmed, issues a new key and generation, sends SETUP_SIGNING signed with
+            the current key, proves the new key with a signed command and a signed
+            acknowledgment, then commits. At every start, and after any failed step, it
+            works out which key the autopilot has before it does anything (listens, then
+            asks under each key for 75 s) and never deletes a key that might be in use.
+            Prints one JSON line per event: rotation_waiting_armed, rotation_started,
+            rotation_done, rotation_rolled_back, rotation_stuck, rotation_refused. Keep it running.
+  rotate-signing
+            Ask the signer to change the drone's signing key (it also does this by itself
+            after an operator is removed). Writes rotation-pending.
   command   Send one signed test command (request AUTOPILOT_VERSION) and wait for
             a signed, matching acknowledgment. On a ground station, --peer picks
             which drone's key to use (optional if only one is paired).
@@ -96,6 +133,9 @@ fn run(args: &[String]) -> R {
         return Ok(());
     };
     let opts = Opts::parse(&args[1..])?;
+    if let Some(d) = opts.get("dir") {
+        report_migration(Path::new(d))?;
+    }
     match cmd.as_str() {
         "init" => init(&opts),
         "drone" => drone(&opts),
@@ -105,6 +145,11 @@ fn run(args: &[String]) -> R {
         "reset-stamp" => reset_stamp(&opts),
         "peers" => peers(&opts),
         "remove" => remove(&opts),
+        "revoke" => revoke(&opts),
+        "restore" => restore(&opts),
+        "removed" => removed(&opts),
+        "signer" => signer(&opts),
+        "rotate-signing" => rotate_signing(&opts),
         "command" => command(&opts),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
@@ -152,36 +197,41 @@ fn show(o: &Opts) -> R {
 fn trust(o: &Opts) -> R {
     let dir = o.dir()?;
     let name = o.name()?;
+    let role = match o.get("role") {
+        None => Role::Peer,
+        Some(r) => Role::parse(r).ok_or("--role must be admin, operator or peer")?,
+    };
     let hex = o.req("key")?.trim().to_ascii_lowercase();
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(
-            "--key must be 64 hexadecimal characters (the public_key from `oasa-pair show`)".into(),
-        );
-    }
-    let bytes = data_encoding::HEXLOWER.decode(hex.as_bytes())?;
-    let public: [u8; 32] = bytes.try_into().map_err(|_| "--key must be 32 bytes")?;
+    let public = parse_hex_key(&hex)
+        .ok_or("--key must be 64 hexadecimal characters (the public_key from `oasa-pair show`)")?;
     let me = Identity::load(&dir)
         .map_err(|e| format!("{e} (run `oasa-pair init --dir {}` first)", dir.display()))?;
     if &public == me.public_key() {
         return Err("that is this device's own key; a device cannot trust itself".into());
     }
-    let peer = store::Peer { public, name };
+    let peer = store::Peer { public, name, role };
+    let mut changed_from = None;
     for p in store::load(&dir)? {
         if p == peer {
-            println!("Already trusted: {} {}", peer.name, peer.fingerprint());
+            println!(
+                "Already trusted: {} {} ({})",
+                peer.name,
+                peer.fingerprint(),
+                peer.role
+            );
             return Ok(());
         }
         if p.public == peer.public {
-            return Err(format!(
-                "that key is already trusted as {}; remove it first (oasa-pair remove {})",
-                p.name,
-                p.fingerprint()
-            )
-            .into());
+            if p.name != peer.name {
+                return Err(format!(
+                    "that key is already trusted as {}; use that name to change its role, or remove it first (oasa-pair remove {})",
+                    p.name,
+                    p.fingerprint()
+                )
+                .into());
+            }
+            changed_from = Some(p.role);
+            continue;
         }
         if p.name == peer.name {
             return Err(format!(
@@ -192,12 +242,103 @@ fn trust(o: &Opts) -> R {
             .into());
         }
     }
-    store::add(&dir, &peer)?;
-    println!(
-        "Trusted {} {}\nCheck that this fingerprint matches the one shown on that device.",
-        peer.name,
-        peer.fingerprint()
-    );
+    store::add(&dir, &peer).map_err(|e| match e {
+        oasa_sec::Error::Removed => {
+            "that device was removed here; a removed device must make a new identity and pair again (or undo it with `oasa-pair restore`)".to_string()
+        }
+        other => other.to_string(),
+    })?;
+    match changed_from {
+        Some(old) => {
+            println!(
+                "Changed the role of {} {} from {old} to {}.",
+                peer.name,
+                peer.fingerprint(),
+                peer.role
+            );
+            if old == Role::Operator
+                && peer.role != Role::Operator
+                && dir.join(AUTOPILOT_KEY_FILE).exists()
+            {
+                println!(
+                    "It may hold this drone's signing key, so a new key was requested. `oasa-pair signer` changes it once the autopilot is disarmed."
+                );
+            }
+        }
+        None => println!(
+            "Trusted {} {} as {}\nCheck that this fingerprint matches the one shown on that device.",
+            peer.name,
+            peer.fingerprint(),
+            peer.role
+        ),
+    }
+    Ok(())
+}
+
+fn parse_hex_key(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    data_encoding::HEXLOWER
+        .decode(hex.as_bytes())
+        .ok()?
+        .try_into()
+        .ok()
+}
+
+/// If this folder still has an old `trusted-peers`, convert it and say what
+/// came out, so a person can fix the roles (spec R-SEC2 section 3).
+fn report_migration(dir: &Path) -> R {
+    if let Some(peers) = store::migrate_if_needed(dir)? {
+        eprintln!(
+            "Converted the old trusted-peers to {} (the old file is now {}).",
+            store::TRUST_FILE,
+            store::MIGRATED_FILE
+        );
+        let on_drone = dir.join(AUTOPILOT_KEY_FILE).exists();
+        for p in &peers {
+            eprintln!("  {}  {}  {}", p.fingerprint(), p.role, p.name);
+        }
+        if on_drone {
+            eprintln!();
+            eprintln!(
+                "*** CHECK THIS: this is a drone, so every device above is now an OPERATOR. ***"
+            );
+            eprintln!(
+                "An operator is sent the drone's MAVLink signing key and can then command the autopilot."
+            );
+            eprintln!(
+                "For each device that should not command this drone, run (use its name from the list):"
+            );
+            eprintln!(
+                "  oasa-pair trust --role peer --name NAME --key PUBLIC_KEY --dir {}",
+                dir.display()
+            );
+            eprintln!(
+                "  (the key is in {}). Demoting an operator asks for a new signing key.",
+                store::TRUST_FILE
+            );
+            eprintln!(
+                "Admins: `trust --role admin` for the devices that may remove others. Roles: admin, operator, peer."
+            );
+        } else {
+            eprintln!(
+                "Every device became {} (this device holds no autopilot key). Fix any role with `oasa-pair trust --role admin|operator|peer` (same name).",
+                peers.first().map_or(Role::Peer, |p| p.role)
+            );
+        }
+    }
+    if dir.join(store::OLD_TRUST_FILE).exists() && dir.join(store::TRUST_FILE).exists() {
+        eprintln!(
+            "note: an old {} file is still here and is ignored; {} is the list in use.",
+            store::OLD_TRUST_FILE,
+            store::TRUST_FILE
+        );
+    }
     Ok(())
 }
 
@@ -279,12 +420,15 @@ fn drone(o: &Opts) -> R {
         // Each attempt gets at most 15 s, and never past the window.
         let mut stream = DeadlineStream::new(stream, left.min(Duration::from_secs(15)))?;
         let install = |key: &SigningKey| install_key(o, key, &key_path);
-        match pair_as_drone(
+        // A removed key gets nothing: no reply, no signing key.
+        let accept = |ground: &store::Peer| store::check_not_removed(&dir, &ground.public);
+        match pair_as_drone_checked(
             &mut stream,
             &me,
             &name,
             &code,
             current_key.as_ref(),
+            accept,
             install,
         ) {
             Ok(r) => break r,
@@ -305,9 +449,10 @@ fn drone(o: &Opts) -> R {
         "shared the existing signing key"
     };
     println!(
-        "Paired with ground station {} ({}); {how}.",
+        "Paired with ground station {} ({}) as {}; {how}.",
         result.ground.name,
-        result.ground.fingerprint()
+        result.ground.fingerprint(),
+        result.ground.role
     );
     Ok(())
 }
@@ -365,6 +510,12 @@ fn ground(o: &Opts) -> R {
             format!("code is for drone {drone_fp}, not {expected}; refusing to pair").into(),
         );
     }
+    if store::check_not_removed(&dir, &code.responder_public).is_err() {
+        return Err(format!(
+            "drone {drone_fp} was removed on this device; a removed device must make a new identity and pair again (or undo it with `oasa-pair restore {drone_fp}`)"
+        )
+        .into());
+    }
     let (me, _) = Identity::load_or_create(&dir)?;
     remember_name(&dir, &name);
 
@@ -383,9 +534,10 @@ fn ground(o: &Opts) -> R {
         "received the drone's signing key"
     };
     println!(
-        "Paired with drone {} ({}); {how}.",
+        "Paired with drone {} ({}) as {}; {how}.",
         r.drone.name,
-        r.drone.fingerprint()
+        r.drone.fingerprint(),
+        r.drone.role
     );
     Ok(())
 }
@@ -419,23 +571,189 @@ fn peers(o: &Opts) -> R {
         println!("No paired devices yet.");
     }
     for p in list {
-        println!("{}  {}", p.fingerprint(), p.name);
+        println!("{}  {:<8}  {}", p.fingerprint(), p.role, p.name);
     }
     Ok(())
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The key a person means: a trusted peer's fingerprint or name, a device
+/// already removed (by fingerprint), or 64 hex characters.
+fn resolve_target(dir: &Path, text: &str) -> R<[u8; 32]> {
+    if let Some(p) = store::find(dir, text)? {
+        return Ok(p.public);
+    }
+    if let Some(k) = parse_hex_key(&text.to_ascii_lowercase()) {
+        return Ok(k);
+    }
+    let removed = removal::load_removed(dir)?;
+    if let Some(k) = removed
+        .removed_keys()
+        .into_iter()
+        .find(|k| fingerprint(k) == text)
+    {
+        return Ok(k);
+    }
+    Err(format!("no device {text} (use its fingerprint, its name, or its 64-hex key)").into())
+}
+
+fn own_key(dir: &Path) -> R<[u8; 32]> {
+    let me = Identity::load(dir)
+        .map_err(|e| format!("{e} (run `oasa-pair init --dir {}` first)", dir.display()))?;
+    Ok(*me.public_key())
+}
+
+fn describe_removal(dir: &Path, key: &[u8; 32], out: &removal::RemoveOutcome) {
+    let fp = fingerprint(key);
+    match &out.peer {
+        Some(p) => println!("Removed {} {fp} ({}).", p.name, p.role),
+        None if out.already_removed => println!("{fp} was already removed; noted again."),
+        None => println!("Removed {fp} (it was not in the list; it can never be trusted here)."),
+    }
+    if dir.join(removal::ROTATION_PENDING_FILE).exists()
+        && out.peer.as_ref().is_some_and(|p| p.role == Role::Operator)
+    {
+        println!(
+            "The drone's MAVLink signing key is still the old one until `oasa-pair signer` changes it (it waits until the autopilot is disarmed)."
+        );
+    }
+    println!("A running oasa-link notices within a second (or at once on SIGHUP).");
+}
+
 fn remove(o: &Opts) -> R {
-    let fp = o
+    let dir = o.dir()?;
+    let who = o
         .positional
         .first()
-        .ok_or("give the fingerprint to remove")?;
-    if store::remove(&o.dir()?, fp)? {
+        .ok_or("give the fingerprint, name or key to remove")?;
+    let key = resolve_target(&dir, who)?;
+    let out = removal::remove_local(&dir, &own_key(&dir)?, &key, now_unix())?;
+    describe_removal(&dir, &key, &out);
+    Ok(())
+}
+
+fn revoke(o: &Opts) -> R {
+    let dir = o.dir()?;
+    let who = o
+        .positional
+        .first()
+        .ok_or("give the fingerprint, name or key to revoke")?;
+    let key = resolve_target(&dir, who)?;
+    let r = removal::revoke(&dir, &own_key(&dir)?, &key, now_unix())?;
+    describe_removal(&dir, &key, &r.outcome);
+    println!(
+        "Added to this device's removal log as entry {} of log {}{}. Devices that list this one as admin get it when their link is up.",
+        r.seq,
+        removal::log_id_text(&r.log_id),
+        if r.was_in_log {
+            " (it was already there)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+fn restore(o: &Opts) -> R {
+    let dir = o.dir()?;
+    let who = o
+        .positional
+        .first()
+        .ok_or("give the fingerprint (or 64-hex key) of the removed device")?;
+    let key = resolve_target(&dir, who)?;
+    if removal::restore(&dir, &key, now_unix())? {
         println!(
-            "Removed {fp} from the list. It is not locked out until keys are rotated (R-SEC2)."
+            "Restored {}. It is not trusted yet: pair it or `oasa-pair trust` it again. Entries already received for it are not applied again; a new one removes it again.",
+            fingerprint(&key)
         );
         Ok(())
     } else {
-        Err(format!("no paired device {fp}").into())
+        Err(format!("{} is not removed here", fingerprint(&key)).into())
+    }
+}
+
+fn removed(o: &Opts) -> R {
+    let r = removal::load_removed(&o.dir()?)?;
+    let keys = r.removed_keys();
+    if keys.is_empty() {
+        println!("Nothing removed.");
+    }
+    for k in keys {
+        let by = r
+            .records()
+            .iter()
+            .rev()
+            .find_map(|rec| match (rec.key == k, &rec.kind) {
+                (true, removal::RecordKind::Removed(removal::Source::Local)) => {
+                    Some("by hand".to_string())
+                }
+                (
+                    true,
+                    removal::RecordKind::Removed(removal::Source::Admin { fingerprint, .. }),
+                ) => Some(format!("by admin {fingerprint}")),
+                _ => None,
+            })
+            .unwrap_or_default();
+        println!("{}  {by}", fingerprint(&k));
+    }
+    Ok(())
+}
+
+fn rotate_signing(o: &Opts) -> R {
+    let dir = o.dir()?;
+    if !dir.join(AUTOPILOT_KEY_FILE).exists() {
+        return Err("this device holds no autopilot signing key (rotation is for a drone)".into());
+    }
+    rotation::request(&dir, "requested", "-", now_unix())?;
+    println!(
+        "A signing-key rotation is requested. `oasa-pair signer` does it once the autopilot is disarmed."
+    );
+    Ok(())
+}
+
+fn json_event(e: &signer::Event) -> String {
+    let mut s = format!("{{\"ts\":{},\"event\":\"{}\"", now_unix(), e.name());
+    if let Some(g) = e.generation() {
+        s.push_str(&format!(",\"generation\":{g}"));
+    }
+    s.push('}');
+    s
+}
+
+/// Run rotations for a drone, until killed.
+fn signer(o: &Opts) -> R {
+    let dir = o.dir()?;
+    let (sys, comp) = o.target()?;
+    let link_id: u8 = o
+        .get("link-id")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(COMPANION_LINK_ID);
+    if !dir.join(AUTOPILOT_KEY_FILE).exists() {
+        return Err("this device holds no autopilot signing key; pair first".into());
+    }
+    // One signer per folder: two could each run a rotation on one autopilot.
+    let _one = oasa_sec::rotation::lock_signer(&dir)?;
+    let port = UdpPort::connect(o.req("autopilot")?, sys, link_id)?;
+    let mut s = signer::Signer::new(&dir, port, signer::Config { sys, comp });
+    s.on_event(|e| println!("{}", json_event(e)));
+    println!("{{\"ts\":{},\"event\":\"signer_started\"}}", now_unix());
+    loop {
+        if let Err(e) = s.tick() {
+            // The error text never holds a key. The next round looks at which
+            // key the autopilot has before it does anything.
+            println!(
+                "{{\"ts\":{},\"event\":\"signer_error\",\"error\":{:?}}}",
+                now_unix(),
+                e.to_string()
+            );
+            std::thread::sleep(Duration::from_secs(5));
+        }
     }
 }
 

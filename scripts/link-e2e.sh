@@ -33,6 +33,7 @@ wait_for() { # secs pattern file
 }
 pubkey() { $B/oasa-pair show --dir "$1" | sed -E 's/.*"public_key":"([0-9a-f]{64})".*/\1/'; }
 n() { $CHECK count "$@"; }
+fp_of() { $B/oasa-pair show --dir "$T/$1" | sed -E 's/.*"fingerprint":"([^"]+)".*/\1/'; }
 jstat() { $CHECK stat "$@"; }
 
 # --- identities and trust (oasa-pair init + show + trust) ----------------
@@ -205,5 +206,191 @@ pass "--mavlink-guard together with --no-mavlink-guard is refused"
 cargo build --release --example mavguard_check >/dev/null 2>&1 || fail "could not build examples/mavguard_check"
 $PYTHON -I tests/interop/mavguard_diff.py --n 3000 || fail "the guard and pymavlink disagree"
 pass "guard and pymavlink agree on frame boundaries, ids and CRCs for everything the guard passes"
+
+# --- 7. Removal (R-SEC2) -------------------------------------------------
+wait_exit() { # pid secs: set EXIT_RC to the exit code, or "running" if it did not exit in time.
+  # Not for use in $(...): wait only works in the shell that started the process.
+  local i
+  EXIT_RC=running
+  for i in $(seq $(($2 * 10))); do
+    if ! kill -0 "$1" 2>/dev/null; then EXIT_RC=0; wait "$1" || EXIT_RC=$?; return 0; fi
+    sleep 0.1
+  done
+}
+link() { # logname dir peer encport [flags...]: plain ports are enc+100 (in) and enc+200 (out)
+  local name=$1 dir=$2 peer=$3 p=$4; shift 4
+  $B/oasa-link --dir "$T/$dir" --peer "$peer" --bind 127.0.0.1:$p \
+    --plain-listen 127.0.0.1:$((p+100)) --plain-send 127.0.0.1:$((p+200)) --duration 90 "$@" > "$T/$name.log" 2>&1 &
+  LAST=$!; PIDS+=($LAST)
+}
+trust_as() { # dir name peerdir role
+  $B/oasa-pair trust --dir "$T/$1" --name "$2" --key "$(pubkey "$T/$3")" --role "$4" >/dev/null
+}
+for d in rg rd rg2 rd2; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+
+# 7a. A removal mid-run: the link to the removed device ends with exit code 3.
+trust_as rd rg rg operator; trust_as rg rd rd peer
+link rd rd rg 7810; RD=$LAST
+link rg rg rd 7811 --remote 127.0.0.1:7810 --initiate; RG=$LAST
+wait_for 15 session_established "$T/rd.log" || fail "removal test: no session"
+wait_for 15 session_established "$T/rg.log" || fail "removal test: ground station has no session"
+$B/oasa-pair remove --dir "$T/rd" rg > "$T/remove.out" 2>&1 || { cat "$T/remove.out"; fail "oasa-pair remove failed"; }
+wait_exit "$RD" 5; [ "$EXIT_RC" = 3 ] || fail "the drone's link did not exit with code 3 after its peer was removed"
+grep -q '"event":"peer_removed".*"why":"removed"' "$T/rd.log" || fail "no peer_removed line"
+$CHECK check "$T/rd.log" || fail "removal log lines are not the agreed JSON"
+[ "$(jstat "$T/rd.log" delivered)" = 0 ] || fail "stats after peer_removed"
+pass "oasa-pair remove: the running oasa-link logs peer_removed and exits with code 3 within seconds (file watch, no restart)"
+if $B/oasa-link --dir "$T/rd" --peer rg --bind 127.0.0.1:7812 --plain-listen 127.0.0.1:7912 \
+  --plain-send 127.0.0.1:8012 --duration 1 >"$T/again.log" 2>&1; then fail "a removed peer was accepted again"; fi
+if $B/oasa-pair trust --dir "$T/rd" --name rg --key "$(pubkey "$T/rg")" >"$T/retrust.out" 2>&1; then fail "trust accepted a removed key"; fi
+grep -q "removed" "$T/retrust.out" || fail "no explanation when trusting a removed key"
+$B/oasa-pair removed --dir "$T/rd" | grep -q "by hand" || fail "removed does not list the tombstone"
+[ "$(stat -c %a "$T/rd/removed")" = 600 ] && [ "$(stat -c %a "$T/rd/trusted-peers.v1")" = 600 ] || fail "removal files are not owner-only"
+kill -TERM "$RG" 2>/dev/null || true
+pass "a removed key cannot be started with, trusted or paired again; tombstone file is 600"
+
+# 7b. SIGHUP reloads at once (even with nothing changed), and a removal by SIGHUP exits 3.
+trust_as rd2 rg2 rg2 operator; trust_as rg2 rd2 rd2 peer
+link rd2 rd2 rg2 7813; RD2=$LAST
+link rg2 rg2 rd2 7814 --remote 127.0.0.1:7813 --initiate; RG2=$LAST
+wait_for 15 session_established "$T/rd2.log" || fail "SIGHUP test: no session"
+kill -HUP "$RD2"
+wait_for 2 trust_reloaded "$T/rd2.log" || fail "SIGHUP did not reload the trust files"
+$B/oasa-pair remove --dir "$T/rd2" rg2 >/dev/null
+kill -HUP "$RD2"
+wait_exit "$RD2" 3; [ "$EXIT_RC" = 3 ] || fail "SIGHUP after a removal did not end the link with code 3"
+kill -TERM "$RG2" 2>/dev/null || true
+pass "SIGHUP reloads at once; after a removal it ends the link with code 3"
+
+# 7b2. A trust file that becomes unreadable while the link runs: it says so and keeps the
+# last good state (it does not exit and take the link down); when the file is fixed it recovers.
+for d in rg3 rd3; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+trust_as rd3 rg3 rg3 operator; trust_as rg3 rd3 rd3 peer
+link rd3 rd3 rg3 7815; RD3=$LAST
+link rg3 rg3 rd3 7816 --remote 127.0.0.1:7815 --initiate; RG3=$LAST
+wait_for 15 session_established "$T/rd3.log" || fail "unreadable-file test: no session"
+printf 'this is not a record\n' > "$T/rd3/removed"; chmod 600 "$T/rd3/removed"
+kill -HUP "$RD3"
+wait_for 3 trust_unreadable "$T/rd3.log" || fail "an unreadable removed file was not reported"
+sleep 1
+kill -0 "$RD3" 2>/dev/null || fail "the link exited when a trust file became unreadable"
+rm -f "$T/rd3/removed"
+kill -HUP "$RD3"
+sleep 1
+$B/oasa-pair remove --dir "$T/rd3" rg3 >/dev/null
+kill -HUP "$RD3"
+wait_exit "$RD3" 5; [ "$EXIT_RC" = 3 ] || fail "after the file was fixed, a removal did not end the link with code 3"
+kill -TERM "$RG3" 2>/dev/null || true
+pass "an unreadable trust file while running: trust_unreadable is logged, the link keeps running on the last good state, and it works again once the file is fixed"
+
+# 7c. A revoke travels from an admin to a device, and on to the device's other link.
+for d in adm dev dev3 vic vic2; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+trust_as dev adm adm admin; trust_as dev vic vic peer; trust_as dev vic2 vic2 peer
+trust_as adm dev dev peer; trust_as adm vic vic peer; trust_as adm vic2 vic2 peer
+trust_as vic dev dev peer
+trust_as dev3 adm adm peer; trust_as adm dev3 dev3 peer   # dev3 does not list adm as admin
+link devA dev adm 7820; DEVA=$LAST          # dev, talking to the admin
+link devV dev vic 7821; DEVV=$LAST          # dev, talking to the device that will be revoked
+link vic vic dev 7822 --remote 127.0.0.1:7821 --initiate; VIC=$LAST
+link adm adm dev 7823 --remote 127.0.0.1:7820 --initiate; ADM=$LAST
+link dev3 dev3 adm 7824; DEV3=$LAST
+link adm3 adm dev3 7825 --remote 127.0.0.1:7824 --initiate; ADM3=$LAST
+for f in devA devV vic adm dev3 adm3; do wait_for 15 session_established "$T/$f.log" || fail "revoke test: $f has no session"; done
+$B/oasa-pair revoke --dir "$T/adm" vic > "$T/revoke.out" 2>&1 || { cat "$T/revoke.out"; fail "oasa-pair revoke failed"; }
+wait_exit "$DEVV" 8; [ "$EXIT_RC" = 3 ] || fail "the revoke did not reach the device (its link to the revoked peer is still running)"
+grep -q '"event":"removal_entry".*"detail":"removed"' "$T/devA.log" || fail "the device logged no removal_entry"
+$B/oasa-pair removed --dir "$T/dev" | grep -q "by admin" || fail "the device has no tombstone naming the admin"
+! $B/oasa-pair peers --dir "$T/dev" | grep -q " vic$" || fail "the revoked device is still in the device's list"
+pass "revoke: an admin's entry reaches the device over the link, tombstones the key there, and the device's other oasa-link (to the revoked peer) exits with code 3"
+# A device that does not list the sender as admin applies nothing and says so.
+sleep 1
+[ ! -e "$T/dev3/removed" ] || fail "a device applied a removal from a sender that is not its admin"
+grep -q '"event":"not_admin_here"' "$T/adm3.log" || fail "the sender was not told NOT_ADMIN"
+pass "a device that does not list the sender as admin answers NOT_ADMIN and changes nothing"
+
+# The admin is offline when it revokes the next device, and catches up when it reconnects.
+kill -TERM "$ADM"; wait "$ADM" || fail "admin link did not exit 0"
+$B/oasa-pair revoke --dir "$T/adm" vic2 >/dev/null
+VIC2FP=$(fp_of vic2)
+! $B/oasa-pair removed --dir "$T/dev" | grep -q "$VIC2FP" || fail "vic2 was removed on the device before the admin reconnected"
+link adm_b adm dev 7826 --remote 127.0.0.1:7820 --initiate
+wait_for 15 session_established "$T/adm_b.log" || fail "the admin could not reconnect"
+for i in $(seq 100); do $B/oasa-pair removed --dir "$T/dev" | grep -q "$VIC2FP" && break; sleep 0.1; done
+$B/oasa-pair removed --dir "$T/dev" | grep -q "$VIC2FP" || fail "the admin came back online but the device never got the entry"
+[ "$(grep -c '"event":"removal_entry"' "$T/devA.log")" -ge 2 ] || fail "the device logged too few removal entries"
+pass "an admin that was offline when it revoked catches the device up as soon as the link is back"
+
+# Every log line is the agreed JSON, nothing secret is printed, control is counted apart.
+kill -TERM "$DEVA" "$VIC" "$ADM3" "$DEV3" 2>/dev/null || true
+wait "$DEVA" || fail "device link did not exit 0 on SIGTERM"
+$CHECK check "$T/devA.log" && $CHECK check "$T/adm_b.log" || fail "removal log lines are not the agreed JSON"
+[ "$(jstat "$T/devA.log" control_received)" -ge 4 ] || fail "control messages not counted"
+[ "$(jstat "$T/devA.log" delivered)" = 0 ] || fail "a control message reached the application side"
+KEY=$(od -An -tx1 -v "$T/adm/identity.key" | tr -d ' \n')
+grep -q "$KEY" "$T"/*.log && fail "a private key is in a log"
+for f in "$T"/dev/removed "$T"/adm/removal-log "$T"/dev/removal-sync/*; do
+  [ "$(stat -c %a "$f")" = 600 ] || fail "$f is not owner-only"
+done
+pass "control messages are counted apart and never reach the application side; removal files are 600"
+
+# --- 8. Signing-key rotation (R-SEC2 phase B) ----------------------------
+# A drone with two operators and a stand-in autopilot. The drone removes operator o1; the
+# signer rotates the key; the drone's link to o2 hands o2 the new key; o1's old key stops working.
+key32() { head -c 32 "$1" | od -An -tx1; }
+for d in sd o1 o2; do $B/oasa-pair init --dir "$T/$d" --name "$d" >/dev/null; done
+head -c 40 /dev/urandom > "$T/sd/mavlink-signing-key.bin"; chmod 600 "$T/sd/mavlink-signing-key.bin"
+SDFP=$(fp_of sd)
+for o in o1 o2; do
+  mkdir -p "$T/$o/signing-keys"; chmod 700 "$T/$o/signing-keys"
+  cp "$T/sd/mavlink-signing-key.bin" "$T/$o/signing-keys/$SDFP.bin"; chmod 600 "$T/$o/signing-keys/$SDFP.bin"
+  trust_as sd $o $o operator; trust_as $o sd sd peer
+done
+# The stand-in starts with the drone's key, as after pairing.
+head -c 32 "$T/sd/mavlink-signing-key.bin" > "$T/ap8.key"
+$B/examples/fake_autopilot udpin:127.0.0.1:14640 --armed-file "$T/sw-armed" --state-file "$T/ap8.key" > "$T/ap8.log" 2>&1 & PIDS+=($!)
+wait_for 10 "has a signing key" "$T/ap8.log" || fail "stand-in autopilot did not start with the key"
+link sdA sd o1 7820; SDA=$LAST
+link o1l o1 sd 7821 --remote 127.0.0.1:7820 --initiate; O1L=$LAST
+link sdB sd o2 7822; SDB=$LAST
+link o2l o2 sd 7823 --remote 127.0.0.1:7822 --initiate; O2L=$LAST
+wait_for 15 session_established "$T/sdA.log" && wait_for 15 session_established "$T/sdB.log" || fail "rotation test: no sessions"
+$B/oasa-pair command --dir "$T/o2" --to udpout:127.0.0.1:14640 --wait 10 >/dev/null || fail "the starting key does not work"
+OLD8=$(key32 "$T/sd/mavlink-signing-key.bin")
+cp "$T/o1/signing-keys/$SDFP.bin" "$T/o1-old.bin"
+$B/oasa-pair signer --dir "$T/sd" --autopilot udpout:127.0.0.1:14640 > "$T/signer8.log" 2>&1 & SIGNER8=$!; PIDS+=($SIGNER8)
+wait_for 10 signer_started "$T/signer8.log" || fail "signer did not start"
+$B/oasa-pair remove --dir "$T/sd" o1 >/dev/null || fail "could not remove o1"
+wait_exit "$SDA" 5; [ "$EXIT_RC" = 3 ] || fail "the drone's link to the removed operator did not exit 3"
+wait_for 60 rotation_done "$T/signer8.log" || fail "the signer did not rotate the key"
+NEW8=$(key32 "$T/sd/mavlink-signing-key.bin")
+[ "$NEW8" != "$OLD8" ] || fail "the drone's key did not change"
+for i in $(seq 100); do [ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW8" ] && break; sleep 0.1; done
+[ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW8" ] || fail "operator o2 never got the new key"
+[ "$(cat "$T/o2/signing-keys/$SDFP.gen")" = 1 ] || fail "operator o2 has no generation 1"
+[ ! -e "$T/o2/signing-keys/$SDFP.next" ] && [ ! -e "$T/o2/signing-keys/$SDFP.next.gen" ] || fail "operator o2 kept pending files"
+[ "$(key32 "$T/o1/signing-keys/$SDFP.bin")" = "$OLD8" ] && [ ! -e "$T/o1/signing-keys/$SDFP.next" ] \
+  || fail "the removed operator was given the new key"
+grep -q '"event":"signing_key_next"' "$T/o2l.log" && grep -q '"event":"signing_key_commit"' "$T/o2l.log" || fail "o2 logged no key messages"
+grep -q "$(od -An -tx1 -v -N32 "$T/sd/mavlink-signing-key.bin" | tr -d ' \n')" "$T"/*.log && fail "a signing key is in a log"
+$B/oasa-pair command --dir "$T/o2" --to udpout:127.0.0.1:14640 --wait 10 >/dev/null || fail "o2's new key does not work"
+if $B/oasa-pair command --dir "$T/o1" --to udpout:127.0.0.1:14640 --wait 4 >/dev/null 2>&1; then fail "the removed operator's old key still works"; fi
+pass "after removing o1: the signer rotates, o2 gets the new key from the drone's link, o1's old key stops working"
+
+# An operator that is offline during a rotation catches up when it reconnects.
+kill -TERM "$O2L" 2>/dev/null || true; wait "$O2L" 2>/dev/null || true
+$B/oasa-pair rotate-signing --dir "$T/sd" >/dev/null
+wait_count_e() { local i; for i in $(seq $(($1 * 10))); do [ "$(grep -c "$2" "$3")" -ge "$4" ] && return 0; sleep 0.1; done; return 1; }
+wait_count_e 60 rotation_done "$T/signer8.log" 2 || fail "second rotation did not finish"
+NEW9=$(key32 "$T/sd/mavlink-signing-key.bin")
+[ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW8" ] || fail "o2 changed while it was offline"
+link o2l2 o2 sd 7824 --remote 127.0.0.1:7822 --initiate; O2L=$LAST
+for i in $(seq 150); do [ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW9" ] && break; sleep 0.1; done
+[ "$(key32 "$T/o2/signing-keys/$SDFP.bin")" = "$NEW9" ] || fail "o2 did not catch up after reconnecting"
+[ "$(cat "$T/o2/signing-keys/$SDFP.gen")" = 2 ] || fail "o2 has the wrong generation after catching up"
+$B/oasa-pair command --dir "$T/o2" --to udpout:127.0.0.1:14640 --wait 10 >/dev/null || fail "o2's caught-up key does not work"
+$CHECK check "$T/sdB.log" && $CHECK check "$T/o2l.log" && $CHECK check "$T/o2l2.log" || fail "rotation log lines are not the agreed JSON"
+[ "$(stat -c %a "$T/o2/signing-keys/$SDFP.bin")" = 600 ] && [ "$(stat -c %a "$T/sd/mavlink-signing-ts" 2>/dev/null || echo 600)" = 600 ] || fail "key files are not owner-only"
+kill -TERM "$SDB" "$O2L" "$O1L" "$SIGNER8" 2>/dev/null || true
+pass "a reconnecting operator catches up to the current key and generation"
 
 echo "All link end-to-end checks passed."

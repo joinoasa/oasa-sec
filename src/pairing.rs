@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 use crate::code::PairingCode;
 use crate::identity::Identity;
 use crate::signing::SigningKey;
-use crate::store::Peer;
+use crate::store::{Peer, Role};
 use crate::{Error, PAIRING_NOISE, PAIRING_PROLOGUE, Result};
 
 /// Longest device name we accept.
@@ -125,9 +125,11 @@ pub fn pair_as_ground<S: Read + Write>(
     };
 
     Ok(GroundResult {
+        // A ground station lists a drone as a plain peer (R-SEC2 section 1).
         drone: Peer {
             public: code.responder_public,
             name: drone_name,
+            role: Role::Peer,
         },
         signing_key,
         new_key,
@@ -147,6 +149,22 @@ pub fn pair_as_drone<S: Read + Write>(
     my_name: &str,
     code: &PairingCode,
     current_key: Option<&SigningKey>,
+    install: impl FnOnce(&SigningKey) -> Result<()>,
+) -> Result<DroneResult> {
+    pair_as_drone_checked(stream, me, my_name, code, current_key, |_| Ok(()), install)
+}
+
+/// Like [`pair_as_drone`], with a check on the ground station that runs as
+/// soon as its key is known, before the drone answers or shares anything. If
+/// `accept` fails, pairing stops there (for example a key this device has
+/// removed). The ground station is saved as an `operator`.
+pub fn pair_as_drone_checked<S: Read + Write>(
+    stream: &mut S,
+    me: &Identity,
+    my_name: &str,
+    code: &PairingCode,
+    current_key: Option<&SigningKey>,
+    accept: impl FnOnce(&Peer) -> Result<()>,
     install: impl FnOnce(&SigningKey) -> Result<()>,
 ) -> Result<DroneResult> {
     check_name(my_name)?;
@@ -175,13 +193,17 @@ pub fn pair_as_drone<S: Read + Write>(
         .map_err(|_| Error::Protocol("bad ground station key"))?;
     crate::identity::check_peer_public(&ground_public)?;
 
-    let n = hs.write_message(&hello(my_name), &mut buf)?;
-    write_frame(stream, &buf[..n])?;
-    let mut t = hs.into_transport_mode()?;
+    // The ground station is saved as an operator: the drone's owner paired it.
     let ground = Peer {
         public: ground_public,
         name: ground_name,
+        role: Role::Operator,
     };
+    accept(&ground)?;
+
+    let n = hs.write_message(&hello(my_name), &mut buf)?;
+    write_frame(stream, &buf[..n])?;
+    let mut t = hs.into_transport_mode()?;
 
     if let Some(k) = current_key {
         let mut m = Zeroizing::new([0u8; 33]);
@@ -311,7 +333,7 @@ pub fn check_name(name: &str) -> Result<()> {
 }
 
 /// Four groups of four base32 characters, joined by `-`.
-fn looks_like_fingerprint(name: &str) -> bool {
+pub(crate) fn looks_like_fingerprint(name: &str) -> bool {
     let groups: Vec<&str> = name.split('-').collect();
     groups.len() == 4
         && groups.iter().all(|g| {
@@ -423,9 +445,49 @@ mod tests {
         assert_eq!(g.drone.name, "drone-1");
         assert_eq!(d.ground.public, r.ground_pub);
         assert_eq!(d.ground.name, "gcs-1");
+        // The drone saves the ground station as an operator; the ground
+        // station saves the drone as a plain peer (R-SEC2 section 1).
+        assert_eq!(d.ground.role, Role::Operator);
+        assert_eq!(g.drone.role, Role::Peer);
         assert!(g.new_key && d.new_key);
         assert_eq!(g.signing_key, fresh);
         assert_eq!(d.signing_key, fresh);
+    }
+
+    #[test]
+    fn a_ground_station_the_drone_refuses_gets_nothing_not_even_a_reply() {
+        let drone_id = Identity::generate().unwrap();
+        let ground_id = Identity::generate().unwrap();
+        let removed = *ground_id.public_key();
+        let code = PairingCode::new(*drone_id.public_key()).unwrap();
+        let ground_code = code.clone();
+        let existing = SigningKey::generate().unwrap();
+        let (mut g, mut d) = connected_pair();
+        let drone = thread::spawn(move || {
+            let r = pair_as_drone_checked(
+                &mut d,
+                &drone_id,
+                "drone-1",
+                &code,
+                Some(&existing),
+                |ground| {
+                    if ground.public == removed {
+                        Err(Error::Removed)
+                    } else {
+                        Ok(())
+                    }
+                },
+                ok_install,
+            );
+            drop(d);
+            r
+        });
+        let ground = pair_as_ground(&mut g, &ground_id, "gcs-1", &ground_code, || {
+            SigningKey::generate()
+        });
+        assert!(matches!(drone.join().unwrap(), Err(Error::Removed)));
+        // The ground station got no hello and no key: its read just ended.
+        assert!(ground.is_err());
     }
 
     #[test]

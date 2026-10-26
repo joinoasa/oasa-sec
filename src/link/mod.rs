@@ -1,4 +1,4 @@
-//! The OASA-SEC v0 encrypted link (tech tree node R-COM2). Spec:
+//! The OASA-SEC encrypted link, wire version 1 (tech tree node R-COM2). Spec:
 //! `docs/oasa-sec-v0-link.md`.
 //!
 //! This module is **sans-IO**: it never opens a socket, starts a thread or
@@ -40,7 +40,8 @@ use crate::{Error, Result};
 pub use counter::{ReplayWindow, WINDOW_SIZE, rebuild_counter};
 pub use endpoint::{Endpoint, PeerId};
 pub use packet::{
-    CounterLen, HANDSHAKE1_LEN, HANDSHAKE2_LEN, Packet, TAG_LEN, VERSION, data_overhead, parse,
+    CounterLen, HANDSHAKE1_LEN, HANDSHAKE2_LEN, Packet, TAG_LEN, VERSION, data_overhead,
+    keepalive_len, parse,
 };
 pub use source::{SourceLimiter, looks_like_handshake1};
 pub use stamp::{
@@ -51,7 +52,13 @@ pub use stamp::{
 pub const LINK_NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 /// Prologue mixed into every link handshake.
-pub const LINK_PROLOGUE: &[u8] = b"OASA-SEC v0 link";
+pub const LINK_PROLOGUE: &[u8] = b"OASA-SEC v1 link";
+
+/// Content type byte at the start of every non-empty data plaintext: an
+/// application packet (spec section 3).
+pub const CONTENT_APP: u8 = 0x00;
+/// Content type byte: a control message (see [`crate::control`]).
+pub const CONTENT_CONTROL: u8 = 0x01;
 
 /// Smallest packet size (MTU) the link supports, in bytes.
 pub const MIN_MTU: usize = 128;
@@ -212,10 +219,13 @@ pub enum DropReason {
     UntrustedPeer,
     StaleHandshake,
     RateLimited,
+    /// Authenticated, but the content type byte is unknown (or there is
+    /// nothing after it).
+    BadContent,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 8] = [
+    pub const ALL: [DropReason; 9] = [
         DropReason::BadHeader,
         DropReason::UnknownIndex,
         DropReason::TooOld,
@@ -224,6 +234,7 @@ impl DropReason {
         DropReason::UntrustedPeer,
         DropReason::StaleHandshake,
         DropReason::RateLimited,
+        DropReason::BadContent,
     ];
 
     /// The name used in logs and stats.
@@ -237,6 +248,7 @@ impl DropReason {
             DropReason::UntrustedPeer => "untrusted_peer",
             DropReason::StaleHandshake => "stale_handshake",
             DropReason::RateLimited => "rate_limited",
+            DropReason::BadContent => "bad_content",
         }
     }
 
@@ -297,6 +309,10 @@ pub struct Stats {
     pub received: u64,
     /// Plaintexts handed to the caller. Equals `received`.
     pub delivered: u64,
+    /// Control messages sent (they are not counted in `sent`).
+    pub control_sent: u64,
+    /// Control messages that passed every check (not counted in `received`).
+    pub control_received: u64,
     pub keepalives_sent: u64,
     pub keepalives_received: u64,
     pub handshakes_sent: u64,
@@ -304,7 +320,7 @@ pub struct Stats {
     pub handshakes_accepted: u64,
     /// Handshake 2 packets accepted (we were the initiator).
     pub handshakes_completed: u64,
-    drops: [u64; 8],
+    drops: [u64; 9],
 }
 
 impl Stats {
@@ -343,8 +359,13 @@ pub enum Dest {
 pub enum Event {
     /// Transmit this packet.
     Send { packet: Vec<u8>, to: Dest },
-    /// A plaintext packet arrived, authenticated and not replayed.
+    /// An application packet arrived, authenticated and not replayed. The
+    /// content type byte is already removed.
     Deliver(Vec<u8>),
+    /// A control message arrived, authenticated and not replayed: its bytes
+    /// (type, request id, body) without the content type byte. Never goes to
+    /// the application side; hand it to [`crate::control::Control`].
+    Control(Zeroizing<Vec<u8>>),
     /// A data packet (or keepalive) passed every check. The caller may
     /// update the peer's address to where it came from. Always comes before
     /// the `Send` and `Deliver` it causes.
@@ -367,6 +388,7 @@ impl fmt::Debug for Event {
         match self {
             Event::Send { packet, to } => write!(f, "Send({} bytes, {to:?})", packet.len()),
             Event::Deliver(p) => write!(f, "Deliver({} bytes)", p.len()),
+            Event::Control(p) => write!(f, "Control({} bytes)", p.len()),
             Event::Authenticated => f.write_str("Authenticated"),
             Event::HandshakeSent { retry, rekey } => {
                 write!(f, "HandshakeSent(retry={retry}, rekey={rekey})")
@@ -436,13 +458,24 @@ impl Link {
             .collect()
     }
 
-    /// Encrypt `plaintext` on the current session. Returns the packet.
+    /// Encrypt an application packet on the current session (the link adds
+    /// the content type byte). Returns the packet.
     pub fn send(
         &mut self,
         now: Duration,
         plaintext: &[u8],
     ) -> std::result::Result<Vec<u8>, SendError> {
         self.ep.send(self.id, now, plaintext)
+    }
+
+    /// Encrypt a control message (`[type][request id][body]`) on the current
+    /// session. Returns the packet.
+    pub fn send_control(
+        &mut self,
+        now: Duration,
+        message: &[u8],
+    ) -> std::result::Result<Vec<u8>, SendError> {
+        self.ep.send_control(self.id, now, message)
     }
 
     /// Run timers: expiry, rekey, handshake retries, keepalives. Call at

@@ -222,9 +222,14 @@ mod tests {
             let peer = crate::store::Peer {
                 public: k,
                 name: "evil".into(),
+                role: crate::store::Role::Peer,
             };
             assert!(crate::store::add(&dir, &peer).is_err());
-            let line = format!("{} evil\n", data_encoding::BASE32_NOPAD.encode(&k));
+            let line = format!(
+                "{}\n{} peer evil\n",
+                crate::store::FORMAT_LINE,
+                data_encoding::BASE32_NOPAD.encode(&k)
+            );
             crate::files::write_private_file(&dir.join(crate::store::TRUST_FILE), line.as_bytes())
                 .unwrap();
             assert!(crate::store::load(&dir).is_err());

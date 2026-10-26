@@ -16,17 +16,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use oasa_sec::identity::Identity;
+use oasa_sec::control::{Action, Control, Note};
+use oasa_sec::identity::{Identity, fingerprint};
 use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
     SendError, SourceLimiter, looks_like_handshake1,
 };
-use oasa_sec::mavguard::{Block, Guard};
-use oasa_sec::signing::AUTOPILOT_KEY_FILE;
-use oasa_sec::store;
+use oasa_sec::mavguard::{Block, Guard, max_verified_timestamp};
+use oasa_sec::removal::{LOG_FILE, REMOVED_FILE};
+use oasa_sec::rotation::{CURRENT_GEN_FILE, NEXT_KEY_FILE, write_seen_ts};
+use oasa_sec::signer::TS_AHEAD;
+use oasa_sec::signing::{AUTOPILOT_KEY_FILE, SigningKey, mavlink_timestamp_now};
+use oasa_sec::store::{self, TRUST_FILE};
 
 const USAGE: &str = "\
-oasa-link: OASA-SEC v0 encrypted link over UDP (R-COM2). Do not fly with it.
+oasa-link: OASA-SEC encrypted link (wire version 1) over UDP (R-COM2). Do not fly with it.
 
 USAGE:
   oasa-link --dir DIR --peer PEERNAME --bind HOST:PORT
@@ -61,7 +65,7 @@ USAGE:
   --rekey-secs     New handshake after this many seconds (default 600).
   --keepalive-secs Send an empty packet after this many idle seconds (default 25, 0 = off).
   --mtu            Largest encrypted packet in bytes (default 128, the smallest radio the
-                   link supports). Plaintext must fit in MTU minus 21 bytes (23 with 4).
+                   link supports). Plaintext must fit in MTU minus 22 bytes (24 with 4).
   --mavlink-guard  Check every packet from the link before it goes to --plain-send. Only
                    whole, CRC-valid frames of allowed messages and commands pass; the rest
                    of the datagram is dropped. Parameter writes, FTP and SETUP_SIGNING are
@@ -88,39 +92,63 @@ Prints one JSON line per event: handshake_sent, session_established, rekey, drop
 mavlink_guard (at start), warning. A datagram stopped by the guard is a drop with reason
 mavlink_blocked, a why word, the message id and (for commands) the command id
 (never contents). The widening flags each print a warning at start.
-At most 10 drop lines a second are printed; a drops_suppressed line counts the rest. The
-trusted peers are read once at startup: restart oasa-link after `oasa-pair trust` or
-`remove`. On exit prints {\"event\":\"stats\",...} and exits 0. Packet contents and keys are never printed.
+At most 10 drop lines a second are printed; a drops_suppressed line counts the rest.
+
+Removal (R-SEC2): oasa-link watches trusted-peers.v1, removed and removal-log and reloads
+within a second (at once on SIGHUP). If its own --peer has been removed it prints
+{\"event\":\"peer_removed\",...}, then the stats, and exits with code 3. If those files
+cannot be read at startup it exits with code 1; if they become unreadable while it runs it prints
+{\"event\":\"trust_unreadable\"} and keeps the last good state. Control messages (removal sync
+between admins and devices) are handled here and never reach --plain-send; their drops
+count as bad_role, bad_control and peer_removed. Lines: removal_entry, not_admin_here,
+trust_reloaded, trust_migrated.
+Signing-key rotation (R-SEC2): on a drone, oasa-link sends its operator SIGNING_KEY_NEXT and
+_COMMIT from the key files (the signer, `oasa-pair signer`, makes the rotation); on a ground
+station it keeps the pending key and switches on the commit. Lines: signing_key_next,
+signing_key_commit, signing_key_commit_unknown, signing_key_acked. A drone also saves the
+highest signature time it forwards to mavlink-signing-ts.
+
+On exit prints {\"event\":\"stats\",...} and exits 0 (3 after peer_removed). Packet contents
+and keys are never printed.
 ";
 
 /// Handshake 1 packets let through per second from one source address.
 const SOURCE_HANDSHAKES_PER_SECOND: u32 = 3;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Set by SIGHUP: reload the trust files now.
+static RELOAD: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 mod signals {
-    use super::STOP;
+    use super::{RELOAD, STOP};
     use std::sync::atomic::Ordering;
 
     extern "C" fn on_signal(_: i32) {
         STOP.store(true, Ordering::SeqCst);
     }
 
+    extern "C" fn on_hup(_: i32) {
+        RELOAD.store(true, Ordering::SeqCst);
+    }
+
     unsafe extern "C" {
         fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
     }
 
-    /// Ask for SIGINT and SIGTERM to set the stop flag. The handler only
-    /// touches an atomic, which is safe in a signal handler.
+    /// Ask for SIGINT and SIGTERM to set the stop flag, and SIGHUP the
+    /// reload flag. The handlers only touch an atomic, which is safe in a
+    /// signal handler.
     pub fn install() {
+        const SIGHUP: i32 = 1;
         const SIGINT: i32 = 2;
         const SIGTERM: i32 = 15;
-        // SAFETY: `signal` is the C library function; the handler is
+        // SAFETY: `signal` is the C library function; the handlers are
         // async-signal-safe (one atomic store).
         unsafe {
             signal(SIGINT, on_signal);
             signal(SIGTERM, on_signal);
+            signal(SIGHUP, on_hup);
         }
     }
 }
@@ -133,7 +161,8 @@ mod signals {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -486,8 +515,94 @@ fn spawn_reader(sock: UdpSocket, tx: mpsc::SyncSender<Msg>, encrypted: bool) {
     });
 }
 
+/// How the program sees a file change: modified time, size and inode
+/// (an atomic replace gives a new inode even within one clock tick).
+type FileSig = Option<(SystemTime, u64, u64)>;
+
+fn file_sig(path: &std::path::Path) -> FileSig {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        m.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((m.modified().ok()?, m.len(), ino))
+}
+
+/// Watches the files that decide who is trusted. Checked every 250 ms, so a
+/// change is seen well inside a second.
+struct Watch {
+    dir: PathBuf,
+    trust: [FileSig; 2],
+    log: FileSig,
+    /// A drone's signing-key files: a rotation began, finished or was dropped.
+    signing: [FileSig; 3],
+    next_check: Instant,
+}
+
+/// What changed since the last look.
+#[derive(Clone, Copy, Default)]
+struct Changed {
+    trust: bool,
+    log: bool,
+    signing: bool,
+}
+
+const WATCH_EVERY: Duration = Duration::from_millis(250);
+
+impl Watch {
+    fn new(dir: &std::path::Path, now: Instant) -> Self {
+        let mut w = Self {
+            dir: dir.to_path_buf(),
+            trust: [None, None],
+            log: None,
+            signing: [None, None, None],
+            next_check: now + WATCH_EVERY,
+        };
+        w.read();
+        w
+    }
+
+    fn read(&mut self) -> Changed {
+        let trust = [
+            file_sig(&self.dir.join(TRUST_FILE)),
+            file_sig(&self.dir.join(REMOVED_FILE)),
+        ];
+        let log = file_sig(&self.dir.join(LOG_FILE));
+        let signing = [
+            file_sig(&self.dir.join(AUTOPILOT_KEY_FILE)),
+            file_sig(&self.dir.join(NEXT_KEY_FILE)),
+            file_sig(&self.dir.join(CURRENT_GEN_FILE)),
+        ];
+        let changed = Changed {
+            trust: trust != self.trust,
+            log: log != self.log,
+            signing: signing != self.signing,
+        };
+        self.trust = trust;
+        self.log = log;
+        self.signing = signing;
+        changed
+    }
+
+    /// What changed, or `None` if it is not time to look yet. `force`
+    /// (SIGHUP) looks now and reports a trust reload.
+    fn check(&mut self, now: Instant, force: bool) -> Option<Changed> {
+        if !force && now < self.next_check {
+            return None;
+        }
+        self.next_check = now + WATCH_EVERY;
+        let mut c = self.read();
+        c.trust |= force;
+        Some(c)
+    }
+}
+
 struct Tunnel {
     link: Link,
+    control: Control,
     enc: UdpSocket,
     plain_out: UdpSocket,
     plain_send: SocketAddr,
@@ -500,6 +615,51 @@ struct Tunnel {
     /// Handshakes in a row refused as old or too far ahead.
     stale_run: u32,
     hinted: bool,
+    /// A drone saves the highest MAVLink signature time it forwards, as a
+    /// floor for the next signing-key change (at most every 10 s).
+    seen: SeenTs,
+}
+
+struct SeenTs {
+    dir: PathBuf,
+    drone: bool,
+    best: u64,
+    saved: u64,
+    last_save: Instant,
+    /// The drone's current autopilot key, read again every 10 s (a rotation
+    /// changes it). Only frames signed with it count.
+    key: Option<SigningKey>,
+    key_read: Option<Instant>,
+}
+
+impl SeenTs {
+    fn note(&mut self, datagram: &[u8]) {
+        if !self.drone {
+            return;
+        }
+        if self
+            .key_read
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+        {
+            self.key = SigningKey::load(&self.dir.join(AUTOPILOT_KEY_FILE)).ok();
+            self.key_read = Some(Instant::now());
+        }
+        if let Some(k) = &self.key {
+            self.best = self.best.max(max_verified_timestamp(
+                datagram,
+                k.as_bytes(),
+                mavlink_timestamp_now(),
+                TS_AHEAD,
+            ));
+        }
+        if self.best > self.saved && self.last_save.elapsed() >= Duration::from_secs(10) {
+            // A failed save only means a lower floor; the signer has its own clock.
+            if write_seen_ts(&self.dir, self.best).is_ok() {
+                self.saved = self.best;
+            }
+            self.last_save = Instant::now();
+        }
+    }
 }
 
 impl Tunnel {
@@ -550,7 +710,7 @@ impl Tunnel {
 
     /// Act on what the link asked for. `source` is where the packet being
     /// handled came from (None for timers and local packets).
-    fn apply(&mut self, events: Vec<Event>, source: Option<SocketAddr>) {
+    fn apply(&mut self, events: Vec<Event>, source: Option<SocketAddr>, now: Duration) {
         let ts = rfc3339(SystemTime::now());
         for e in events {
             match e {
@@ -571,7 +731,12 @@ impl Tunnel {
                         self.guard_drop(b);
                         continue;
                     }
+                    self.seen.note(&p);
                     let _ = self.plain_out.send_to(&p, self.plain_send);
+                }
+                Event::Control(bytes) => {
+                    let actions = self.control.handle(now, unix_now(), &bytes);
+                    self.run_actions(actions, now);
                 }
                 Event::Authenticated => {
                     // Follow the peer if it moved, but only because a packet
@@ -584,6 +749,9 @@ impl Tunnel {
                     "{{\"ts\":\"{ts}\",\"event\":\"handshake_sent\",\"retry\":{retry},\"rekey\":{rekey}}}"
                 ),
                 Event::SessionEstablished { initiator, rekey } => {
+                    // A new session: unfinished removal sync starts over.
+                    let actions = self.control.session_started(now);
+                    self.run_actions(actions, now);
                     self.stale_run = 0;
                     self.hinted = false;
                     let role = if initiator { "initiator" } else { "responder" };
@@ -624,6 +792,28 @@ impl Tunnel {
         }
     }
 
+    /// Do what the control layer asked: send its messages on the link, count
+    /// its drops, log its notes. A message that cannot go now (no session
+    /// yet) is not lost: the control layer resends on its own timers.
+    fn run_actions(&mut self, actions: Vec<Action>, now: Duration) {
+        for a in actions {
+            match a {
+                Action::Send(bytes) => {
+                    if let Ok(packet) = self.link.send_control(now, &bytes) {
+                        match self.remote {
+                            Some(r) => {
+                                let _ = self.enc.send_to(&packet, r);
+                            }
+                            None => self.local_drop("no_remote"),
+                        }
+                    }
+                }
+                Action::Drop(reason) => self.local_drop(reason),
+                Action::Note(n) => print_note(&n),
+            }
+        }
+    }
+
     fn print_stats(&self) {
         let st = self.link.stats();
         let mut drops: Vec<(String, u64)> = st
@@ -639,19 +829,24 @@ impl Tunnel {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{{\"ts\":\"{}\",\"event\":\"stats\",\"sent\":{},\"received\":{},\"delivered\":{},\"drops\":{{{drops}}}}}",
+            "{{\"ts\":\"{}\",\"event\":\"stats\",\"sent\":{},\"received\":{},\"delivered\":{},\"control_sent\":{},\"control_received\":{},\"drops\":{{{drops}}}}}",
             rfc3339(SystemTime::now()),
             st.sent,
             st.received,
-            st.delivered
+            st.delivered,
+            st.control_sent,
+            st.control_received
         );
     }
 }
 
-fn run(args: &[String]) -> R {
+/// Exit code when this process's own `--peer` was removed (R-SEC2).
+const EXIT_PEER_REMOVED: u8 = 3;
+
+fn run(args: &[String]) -> R<u8> {
     let Some(a) = parse_args(args)? else {
         print!("{USAGE}");
-        return Ok(());
+        return Ok(0);
     };
     let me = Identity::load(&a.dir).map_err(|e| {
         format!(
@@ -659,10 +854,24 @@ fn run(args: &[String]) -> R {
             a.dir.display()
         )
     })?;
+    // An old trusted-peers file is converted once; say what came out.
+    if let Some(peers) = store::migrate_if_needed(&a.dir)? {
+        let ts = rfc3339(SystemTime::now());
+        for p in &peers {
+            println!(
+                "{{\"ts\":\"{ts}\",\"event\":\"trust_migrated\",\"key\":\"{}\",\"role\":\"{}\"}}",
+                p.fingerprint(),
+                p.role
+            );
+        }
+    }
+    // Look at the files before reading them, so a change in between is seen.
+    let mut watch = Watch::new(&a.dir, Instant::now());
     let peer = store::find(&a.dir, &a.peer)?.ok_or(format!(
         "no trusted peer named {}; pair first, or `oasa-pair trust`",
         a.peer
     ))?;
+    let own_public = *me.public_key();
     let start = Instant::now();
     let wall_base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -735,6 +944,7 @@ fn run(args: &[String]) -> R {
 
     let mut t = Tunnel {
         link,
+        control: Control::new(&a.dir, own_public, peer.public, Box::new(OsEntropy)),
         enc,
         plain_out,
         plain_send: a.plain_send,
@@ -744,12 +954,23 @@ fn run(args: &[String]) -> R {
         drop_log: DropLog::new(Instant::now()),
         stale_run: 0,
         hinted: false,
+        seen: SeenTs {
+            dir: a.dir.clone(),
+            drone: a.dir.join(AUTOPILOT_KEY_FILE).exists(),
+            best: 0,
+            saved: 0,
+            last_save: Instant::now(),
+            key: None,
+            key_read: None,
+        },
     };
 
     if a.initiate {
-        let ev = t.link.start_handshake(start.elapsed())?;
-        t.apply(ev, None);
+        let now = start.elapsed();
+        let ev = t.link.start_handshake(now)?;
+        t.apply(ev, None, now);
     }
+    let mut exit_code = 0u8;
     let deadline = match a.duration {
         Some(d) => Some(start.checked_add(d).ok_or("--duration is too large")?),
         None => None,
@@ -779,7 +1000,7 @@ fn run(args: &[String]) -> R {
                         continue;
                     }
                     let ev = t.link.handle_packet(now, &bytes);
-                    t.apply(ev, Some(from));
+                    t.apply(ev, Some(from), now);
                 }
                 Msg::Plain(bytes, from) => {
                     if !a.allow_remote_plain && from.ip() != a.plain_send.ip() {
@@ -802,13 +1023,101 @@ fn run(args: &[String]) -> R {
                 }
             }
         }
-        let ev = t.link.poll_timers(start.elapsed());
-        t.apply(ev, None);
+        let now = start.elapsed();
+        let ev = t.link.poll_timers(now);
+        t.apply(ev, None, now);
+        let actions = t.control.poll(now);
+        t.run_actions(actions, now);
+        // The trust files: looked at four times a second, and at once on SIGHUP.
+        let hup = RELOAD.swap(false, Ordering::SeqCst);
+        if let Some(changed) = watch.check(Instant::now(), hup) {
+            if changed.trust {
+                match reload(&a.dir, &peer, &mut t) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        exit_code = EXIT_PEER_REMOVED;
+                        break;
+                    }
+                    Err(e) => {
+                        // Fail safe: keep what was last read and checked (the
+                        // link is already limited to that peer), say so, and
+                        // look again when the files change. Stopping here
+                        // would let one bad file take every link down.
+                        println!(
+                            "{{\"ts\":\"{}\",\"event\":\"trust_unreadable\",\"why\":{:?}}}",
+                            rfc3339(SystemTime::now()),
+                            e.to_string()
+                        );
+                    }
+                }
+            }
+            if changed.log {
+                let actions = t.control.log_changed(now);
+                t.run_actions(actions, now);
+            }
+            if changed.signing {
+                let actions = t.control.signing_changed(now);
+                t.run_actions(actions, now);
+            }
+        }
         t.flush_drop_summary(false);
     }
     t.flush_drop_summary(true);
     t.print_stats();
-    Ok(())
+    Ok(exit_code)
+}
+
+/// Read the trust files again. `Ok(true)`: carry on. `Ok(false)`: our own
+/// peer is gone (removed, or no longer listed); the link to it is over, which
+/// the caller does by exiting. Unsent control messages for it are dropped.
+fn reload(dir: &std::path::Path, peer: &store::Peer, t: &mut Tunnel) -> oasa_sec::Result<bool> {
+    let snap = store::snapshot(dir)?;
+    let ts = rfc3339(SystemTime::now());
+    if snap.get(&peer.public).is_none() {
+        t.control.peer_removed();
+        let why = if snap.removed.is_removed(&peer.public) {
+            "removed"
+        } else {
+            "not_listed"
+        };
+        println!(
+            "{{\"ts\":\"{ts}\",\"event\":\"peer_removed\",\"peer\":\"{}\",\"why\":\"{why}\"}}",
+            fingerprint(&peer.public)
+        );
+        return Ok(false);
+    }
+    println!(
+        "{{\"ts\":\"{ts}\",\"event\":\"trust_reloaded\",\"peers\":{},\"removed\":{}}}",
+        snap.peers.len(),
+        snap.removed.removed_keys().len()
+    );
+    Ok(true)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// One log line for a control-layer note. Fingerprints and numbers only.
+fn print_note(n: &Note) {
+    let mut line = format!(
+        "{{\"ts\":\"{}\",\"event\":\"{}\"",
+        rfc3339(SystemTime::now()),
+        n.what
+    );
+    if let Some(k) = &n.key {
+        line.push_str(&format!(",\"key\":\"{k}\""));
+    }
+    if let Some(s) = n.seq {
+        line.push_str(&format!(",\"seq\":{s}"));
+    }
+    if let Some(d) = n.detail {
+        line.push_str(&format!(",\"detail\":\"{d}\""));
+    }
+    line.push('}');
+    println!("{line}");
 }
 
 /// `2026-10-23T12:34:56.789Z`
