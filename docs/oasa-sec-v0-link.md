@@ -78,14 +78,35 @@ Sending can fail locally (`empty`, `too_large`, `no_session`, `unknown_peer`); n
 
 ## 5. Session life
 
-| Rule | Default |
-|---|---|
-| Initiator starts a new handshake after | 10 minutes or 2³² packets sent |
-| Nobody sends or accepts on a session after | 15 minutes or 2⁶⁰ packets |
-| Handshake retry if no answer | 5 s, then backing off to 60 s |
-| Keepalive if nothing sent for | 25 s (off by default on slow radios) |
-| Stale: sent payload, heard nothing for | 30 s, then a new handshake |
-| Stale: only keepalives sent, heard nothing for | 60 s (2 × stale), then a new handshake |
+| Rule | Default (fast link) | Slow radio (handshake round trip *R* on the air) |
+|---|---|---|
+| Initiator starts a new handshake after | 10 minutes or 2³² packets sent | same; set per radio |
+| Nobody sends or accepts on a session after | 15 minutes or 2⁶⁰ packets | same; at least the first retry time above the rekey time |
+| Handshake retry if no answer | 5 s, then backing off to 60 s, each wait varied by up to ±20% | first retry max(5 s, 1.5 × *R* + 2 s), backing off to max(60 s, 4 × first retry), also ±20% |
+| Keepalive if nothing sent for | 25 s | off when *R* is over 2 s |
+| Stale: sent payload, heard nothing for | 30 s, then a new handshake | max(30 s, 4 × first retry) |
+| Stale: only keepalives sent, heard nothing for | 60 s (2 × stale), then a new handshake | 2 × stale |
+| Previous session stays readable after its last packet | 10 s | max(10 s, 2 × *R*) |
+| Shortest gap between accepted handshakes from one peer | 1 s | max(1 s, *R* / 2), never over 5 s |
+| Control message resend (section 6) | 2 s, doubling to 60 s, ±20% | the handshake retry and cap above |
+
+*R* is the airtime of handshake 1 (119 bytes) plus handshake 2 (55 bytes): about 7.1 s on LoRa SF12 BW125 (4.6 s out, 2.5 s back), 1.0 s on SF9, 0.3 s on SF7, under 0.1 s on SiK, mLRS and Wi-Fi (numbers from the OASA lab airtime model, `oasa_lab/airtime.py`). A fixed 5 s retry is shorter than the SF12 round trip, so the retry would go out before the answer could arrive and the handshake would take about twice as long. The retry must be longer than *R*; the other timers follow from it. Nothing here changes the packets or the crypto: it is local timing only, and the two sides need not agree on it (but should be given the same radio). A fast link (*R* under about 2 s) keeps the defaults exactly. In the Rust crate: `Config::for_airtime(R)`, `RadioProfile`, and `oasa-link --radio-profile NAME` or `--handshake-rtt-ms N` (and `--retry-secs N`).
+
+Why each timer moves, or does not:
+
+- **Retry:** must exceed *R* plus queueing, or a duplicate handshake goes out for every attempt. The 2 s margin and the factor 1.5 cover turnaround and a queued packet; if the radio is also busy with telemetry, give a larger `--retry-secs`.
+- **Stale:** a side that received payload answers with a keepalive after half of the stale time. That answer, and the payload it answers, each cross the air, so half the stale time must be well over *R*; 4 × the retry does it. The cap on the retry backs off further.
+- **Previous grace:** packets of the old session can still be in the air or queued when a rekey completes.
+- **Per-peer handshake gap:** every accepted handshake costs the responder a reply on the air; the gap bounds that. It limits the *peer's* retries, which this side cannot know, so it never goes over 4 s (the shortest jittered default retry, 5 s less 20%): a peer on default or slower timers is never rate limited by it. A configuration whose own gap is above its own retry is refused.
+- **Late answers:** the initiator keeps its two newest handshake attempts open, so a handshake 2 that answers the previous attempt still completes when it arrives after the retry went out (a peer on the default 5 s retry, or a queued radio). The first answer wins and wipes the other attempt; a third attempt wipes the oldest. One exception: the responder keeps only its newest accepted handshake, so if the answer to the *older* attempt arrives first, its session may already be unknown at the responder. The initiator then keeps the newer attempt open until the session it made is confirmed by a valid packet, and moves to the newer session if that answer arrives first (it sends on exactly one session, and the other is wiped). Both attempts have their own random index and Noise state, a forged answer fails its tag and changes nothing, and `snow` does not zeroize a dropped handshake state (see the last bullet). This changes no packet.
+- **Jitter:** every handshake and control retry wait is the nominal one times a random factor from 0.8 to 1.2, so retries do not line up with periodic telemetry on a half-duplex radio. The randomness is passed in like the session indexes. The derived retry has 1.5 × *R* + 2 s, so even the shortest jittered wait is over *R*.
+- **Control messages:** `oasa-link` gives the control layer the link's retry when a radio profile, `--handshake-rtt-ms` or `--retry-secs` is set. The resend timer starts when the message is handed to the radio, not when it goes on the air, so a long transmit queue ahead of it can still cause an early resend; give a larger `--retry-secs` on a busy radio. Otherwise a 128 byte SF12 control message (4.9 s) and its ack (about 1.5 s) cross the air after the 2 s resend and every message would be sent several times.
+- **Global handshake rate (20 a second):** unchanged. A slow radio cannot deliver anywhere near that many packets, so it never fires and costs nothing; it exists to bound work on a fast link or a UDP socket.
+- **Rekey and reject times:** unchanged by the rule, because airtime is a small share of 10 minutes (one handshake is about 1% of a SF12 channel). They are the operator's choice per radio (see the rekey bullet below). A configuration is refused if reject minus rekey is shorter than the first retry, because no retry would fit before the session dies, and a configuration with a retry over 5 s is refused if the rekey time is under 4 retries, because it would be shaking hands all the time (fast timers accept any rekey time: tests use a few seconds). `oasa-link` raises the reject time to the rekey time plus 4 retries for you.
+- **Duty cycle:** these timers do not enforce a legal duty cycle. In the EU868 bands with a 1% limit, one SF12 handshake 1 (4.6 s on the air) needs about 7.7 minutes of quiet afterwards, so retries every 12 s break the limit: the radio layer must hold packets back, and then the retry should be raised to match with `--retry-secs`.
+- **Frames smaller than the handshake:** `sik-64k-ecc` has a 118 byte MTU, one byte under handshake 1 (119), so a handshake spans two radio frames and its stored round trip (50 ms) is an underestimate; it is fast, so the default timers cover it.
+- **Keepalive:** off on slow radios. A 22 byte keepalive is 1.5 s of SF12 airtime every 25 s, and the stale rule heals a dead session without it. The cost is that a session with no traffic is not noticed as dead until there is something to send.
+- **Settings that contradict each other are refused:** a retry above its cap, a stale time under twice the first retry, a per-peer gap above the first retry, a rekey margin under the first retry, and (with a retry over 5 s) a rekey time under 4 retries.
 
 - The **initiator** may send data as soon as it gets message 2. It sends a keepalive at once so the responder learns the session works.
 - The **responder** sends on a new session only after a valid data packet arrives on it. Until then it keeps using the previous session. This stops a stale or replayed handshake from breaking a working link. When it switches, it sends one keepalive so the initiator knows the session is confirmed.
