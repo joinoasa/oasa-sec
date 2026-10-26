@@ -112,4 +112,10 @@ Generations (`mavlink-signing-gen`) are never reused. Details and what was check
 - R-SEC2: a serial autopilot link for the signer (UDP and TCP now), and rekeying other MAVLink signers on the drone (a gimbal, a second computer).
 - Independent review.
 
+## Docs
+
+- [Pairing guide](docs/guide-pairing.md): set up, pair, remove, rotate (R-SEC1)
+- [Training](docs/training-r-sec1.md): a 1 to 2 hour course on a laptop
+- [Release record](docs/release-r-sec1.md): test results and security review status
+
 Licensed under [Apache-2.0](LICENSE).
