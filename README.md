@@ -55,7 +55,7 @@ pip install pymavlink
 scripts/e2e.sh
 ```
 
-That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 14 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved (with a message naming the likely causes), and `command` keeps trying when the autopilot answers late.
+That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 19 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved (with a message naming the likely causes), and `command` keeps trying when the autopilot answers late.
 
 By hand:
 
@@ -111,5 +111,11 @@ Generations (`mavlink-signing-gen`) are never reused. Details and what was check
 - R-COM2: radio adapters in [oasa-radio](https://github.com/joinoasa/oasa-radio) plug in where `oasa-link` uses UDP; handshakes for radios under 128 bytes; DoS cookies; group keys.
 - R-SEC2: a serial autopilot link for the signer (UDP and TCP now), and rekeying other MAVLink signers on the drone (a gimbal, a second computer).
 - Independent review.
+
+## Docs
+
+- [Pairing guide](docs/guide-pairing.md): set up, pair, remove, rotate (R-SEC1)
+- [Training](docs/training-r-sec1.md): a 1 to 2 hour course on a laptop
+- [Release record](docs/release-r-sec1.md): test results and security review status
 
 Licensed under [Apache-2.0](LICENSE).
