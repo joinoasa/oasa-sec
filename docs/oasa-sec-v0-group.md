@@ -1,6 +1,6 @@
 # OASA-SEC v0: group keys for one-to-many traffic (draft)
 
-**Stage:** Idea → Draft · **Node:** R-COM2 (phase 2) · **Last reviewed:** 2026-10-26 (design review 1 applied; not yet reviewed by a person)
+**Stage:** Idea → Draft · **Node:** R-COM2 (phase 2) · **Last reviewed:** 2026-10-26 (design reviews 1 and 2 applied; not yet reviewed by a person)
 
 One encrypted packet that every member of a group can read: a ground station's position updates to its fleet, nodes sharing position and velocity for smart beams (T-RF4), discovery beacons. On a radio that is broadcast by nature (LoRa, a shared Wi-Fi channel), one group packet replaces one copy per device.
 
@@ -14,7 +14,8 @@ Builds on the [link](oasa-sec-v0-link.md) and on [roles and removal](oasa-sec-v0
   - **No control messages over group keys.** Removal logs, signing keys and group keys stay on link sessions, which prove the sender.
   - Commands that one packet must carry to many devices need **signatures**. That needs a new algorithm (for example Ed25519), so it waits for an OASA Proposal and owner approval (§10).
 - **Removal:** a removed device can read **and forge** group traffic until the owner has applied the removal and each member has switched to the new epoch (§5, §8).
-- **Delay:** a packet recorded in an epoch can be delivered late (to a member that didn't hear it first) while that epoch lives. Group data must carry its own time if age matters (positions should).
+- **Delay:** a packet recorded in an epoch can be delivered late (to a member that didn't hear it first) while that epoch lives. Group data that a device acts on **must** carry its own time (positions do), so a late copy is recognised as old.
+- **Owner out of range:** members drop an epoch when its life runs out (§5). Drones within range of each other but not of the owner then stop sharing positions until the owner is heard again. Safety over availability.
 
 ## 2. Prior art and why this design
 
@@ -30,8 +31,8 @@ The main risk in any group design is a **repeated nonce**: two packets under one
 
 - A group is identified by **(owner fingerprint, group id)** everywhere: in files, on the command line and in pins. The 2-byte **group id** is what goes on the air; the owner picks it at random.
 - The **owner** is one device, usually a ground station. It makes every key, decides who is in, and is also a sender with its own sender id.
-- **Who may own a group on this device** is a separate local permission, `group-owner`, set only by `oasa-pair` (`oasa-pair trust … --group-owner`, or at pairing). Roles (`admin`, `operator`) give no group rights, and a group owner gets no command or removal rights. A device accepts group control messages only from a peer it lists with `group-owner`; anything else is dropped (`bad_role`).
-- **Id clash:** if a device already holds a group with the same wire id from another owner, it answers `GROUP_ID_TAKEN` and the new owner picks another id. Two owners can never share a wire id on one device.
+- **Who may own a group on this device** is a separate local permission, set only by `oasa-pair group allow-owner PEER` and kept in its own file, `group-owners` (so `trusted-peers.v1` and older programs that read it don't change). Pairing does **not** grant it. Roles (`admin`, `operator`) give no group rights, and a group owner gets no command or removal rights. A device accepts group control messages only from a peer it lists with `group-owner`; anything else is dropped (`bad_role`).
+- **Id clash:** if a device already holds a group with the same wire id from another owner, it answers `GROUP_ID_TAKEN` and the new owner picks another id, and logs which member refused it (a device that lets two owners in could use this to make one re-pick). Two owners can never share a wire id on one device.
 - **Losing the owner:** when a device removes the owner, or takes away its `group-owner` permission, it deletes every group from that owner. `oasa-pair group forget OWNER` does the same by hand (for an owner that was re-paired).
 - **Membership is not trust.** A drone in a group reads packets from other members but does not add them to `trusted-peers`; it can't start a link with them, and they can't command it.
 
@@ -41,9 +42,9 @@ The main risk in any group design is a **repeated nonce**: two packets under one
 
 **Sender ids.** The owner gives each member a 2-byte sender id in each `GROUP_KEY` (§5). Rules:
 
-- **A sender id is issued at most once per epoch, to anyone, the same device included.** Ids are dense (0 to the highest issued) and in a random order each epoch, so a device can't be followed across epochs by its id.
-- **The owner issues a fresh sender id in every link session** with the member (in the `GROUP_KEY` it sends at session start, §5). Every restart of `oasa-link` is a new link session, so a restarted, restored or copied device always gets a new id.
-- **Keys and ids loaded from disk are receive-only.** A device sends only under a sender id issued to this process. A device that has no fresh id waits for its next link session with the owner, and meanwhile only receives.
+- **A sender id is issued at most once per epoch, to anyone, the same device included.**
+- Each epoch has an **id ceiling** set by the owner and sent in `GROUP_KEY` (default 8 × members + 16). Every id in that epoch, including ids issued later, is below it, handed out in a random order, so a device can't be followed across epochs by its id. One member gets at most 8 ids per epoch (more are refused and logged). When the owner runs out of ids it starts a new epoch.
+- **Keys and ids loaded from disk are receive-only.** A device sends only under a sender id issued to this process. At the start of every link session with the owner, a device that has no id issued to this process sends `GROUP_ID_REQUEST`, and the owner answers at once with a `GROUP_KEY` for the current epoch carrying a fresh id. A restarted, restored or copied device therefore always sends under a new id.
 - **One sender per group per folder:** a sending process holds `.group-<owner>-<id>.lock`. A second process on the same folder only receives.
 
 **Sender keys.** Every sender encrypts with its own key:
@@ -66,13 +67,13 @@ plaintext: [content type: 1][body]
 - **Counter:** the whole 32-bit counter per (sender, epoch), starting at 0. A sender stops at 2³² − 1 and waits for the next epoch. A receiver drops nothing for being "far ahead"; the replay window decides.
 - **Nonce:** `snow`'s ChaChaPoly takes a 64-bit nonce and lays it out as 4 zero bytes followed by the 64-bit value little-endian. We pass the counter. Known-answer tests state this layout.
 - **Associated data:** the whole 10-byte header. Changing any header byte fails the tag.
-- **Content type:** only `0x00` (application) is accepted; anything else is dropped after authentication (`bad_content`).
+- **Content type:** `0x00` (application, with a body) or `0x02` (**activation**, empty body, never delivered; §5). Anything else is dropped after authentication (`bad_content`).
 - **Size:** at least **27 bytes** (10 header + 1 content type + 16 tag), checked before any crypto (`snow` does not check, and a short packet would crash it). Overhead 27 bytes: a 128-byte radio packet carries 101 bytes of group data.
 
 **Receiving**, in order, dropping silently on failure:
 1. Length at least 27 and within the MTU; header byte valid.
 2. Group id known; epoch byte matches a held epoch.
-3. Sender id not above the highest issued for that epoch (from `GROUP_KEY`); not this device's own id (that is logged as `sender_clash`, the sign of a clone or a jam, and reported to the owner, §5).
+3. Sender id below the epoch's id ceiling. If it is this device's own id: a counter this device sent recently (kept in a small ring) is an **echo** (a multicast loopback or a repeater) and is dropped quietly; any other counter is logged as `sender_clash`, the sign of a clone or a jam, and reported to the owner (§5). Group sockets turn multicast loopback off.
 4. Counter inside or ahead of the replay window, if the sender has one.
 5. Tag verified.
 6. **Replay window** (RFC 6479, 1024 packets) per (sender, epoch), **created only after a valid tag**, updated only after the tag.
@@ -82,7 +83,7 @@ Drops are counted (`unknown_group`, `too_old`, `bad_tag`, `replay`, `bad_content
 
 **Counters on disk (second layer).** Before a sender uses counter value `c`, it has saved a reservation above `c`, in blocks of 65,536: write a temp file, `fsync` it, rename it, `fsync` the folder; start at `R`, save `R + 65,536`, then send `R`. A missing or unreadable reservation means **never send in that epoch**.
 
-**Replay across restarts.** Replay windows live in memory. After a restart a member **does not accept group packets in any epoch it held before the restart**; it asks the owner for a new epoch (`GROUP_REKEY`, §5) and receives again once that epoch arrives. This stops an outsider from replaying a recorded epoch to a member that just rebooted. The owner may hold such requests until its minimum rotation interval (§5) passes, so a rebooted member may be deaf to the group for that long.
+**Replay across restarts.** As Bluetooth Mesh keeps its replay list, each member saves the highest counter it has accepted per (sender, epoch) at least every 10 s and when it stops. After a restart, anything at or below the saved value is `too_old`. A crash can let packets from at most the last 10 s before it be replayed once; a clean stop leaves no gap. No rotation is needed when a member reboots.
 
 **Wiping keys.** Epoch keys, sender keys and carried keys are `Zeroizing`. `snow`'s cipher keeps its own key copy and doesn't wipe it, so each cipher object is reset with an all-zero key before it is dropped. There is one cipher object per (sender, epoch).
 
@@ -92,25 +93,26 @@ New control messages (link spec §3, content type `0x01`), over each member's ow
 
 | Type | Name | From → to | Body | Bytes |
 |---|---|---|---|---|
-| `0x30` | `GROUP_KEY` | owner → member | group id (2), epoch (4), flags (1), your sender id (2), highest sender id (2), key (32) | 48 |
+| `0x30` | `GROUP_KEY` | owner → member | group id (2), epoch (4), flags (1), your sender id (2), id ceiling (2), epoch life in minutes (2), key (32) | 50 |
 | `0x31` | `GROUP_ACTIVATE` | owner → member | group id (2), epoch (4) | 11 |
 | `0x32` | `GROUP_LEAVE` | owner → member | group id (2) | 7 |
-| `0x33` | `GROUP_HAVE` | member → owner | group id (2), newest epoch held (4) | 11 |
+| `0x33` | `GROUP_HAVE` | member → owner, answering a `GROUP_KEY` (same request id) | group id (2), newest epoch held (4) | 11 |
 | `0x34` | `GROUP_ID_TAKEN` | member → owner | group id (2) | 7 |
-| `0x35` | `GROUP_REKEY` | member → owner | group id (2), reason (1): restart, sender clash | 8 |
+| `0x35` | `GROUP_REKEY` | member → owner | group id (2), reason (1): sender clash, counter near its limit | 8 |
+| `0x36` | `GROUP_ID_REQUEST` | member → owner | group id (2) | 7 |
 
-Flags in `GROUP_KEY`: bit 0 **no grace** (set when the new epoch is caused by a removal). With the link's overhead, the largest is 70 bytes (72 with the long counter): it fits the 128-byte MTU. `GROUP_KEY` is carried in `Zeroizing` buffers. The usual rules hold: `ACK` for each, retries from 2 s doubling to 60 s.
+Flags in `GROUP_KEY`: bit 0 **no grace** (set when the new epoch is caused by a removal). With the link's overhead, the largest is 72 bytes (74 with the long counter): it fits the 128-byte MTU. `GROUP_KEY` is carried in `Zeroizing` buffers. The usual rules hold: `ACK` for each, retries from 2 s doubling to 60 s.
 
 **What a member does with a `GROUP_KEY`:**
 - **A newer epoch** (and its low byte differs from the epoch still held, else the older one is dropped at once): save it (file `0600`), receive on it, keep sending on the current epoch. If a newer epoch was already pending (not active), the new one **replaces** it.
 - **The epoch it already holds**, same key: take the new sender id (a fresh id for this session, §4). Same epoch with a **different key** is refused and logged (`group_conflict`), never silently ignored.
-- **An older epoch:** answer `GROUP_HAVE` with the newest epoch it holds. The owner jumps above that number (this repairs an owner restored from an old backup).
+- **An older epoch:** answer `GROUP_HAVE` with the newest epoch it holds. The owner accepts `GROUP_HAVE` only as the answer to a `GROUP_KEY` it sent, and jumps above the number only if it is less than its own epoch + 2²⁰; otherwise it logs `group_have_refused` (a bad member can't push the epoch to its end). This repairs an owner restored from an old backup. An owner whose epoch numbers run out starts a new group id.
 
 **Rotation:**
 1. The owner makes `G[e+1]` and **saves it with the full sender-id table (`fsync`) before any `GROUP_KEY` leaves**. It sends `GROUP_KEY` to every member it keeps.
-2. When every member has acked, or after the **activation timeout**, the owner **activates by sending its first group packet in `e+1`**: a member switches on the first valid packet it receives in `e+1`. `GROUP_ACTIVATE` goes by link only to members that didn't switch (they keep sending on `e`, which the owner sees). An `ACTIVATE` for an epoch not held is ignored and not acked. The timeout is 30 s by default and scales with the radio's airtime like the link's retry timer.
+2. When every member has acked, or after the **activation timeout**, the owner **activates by sending an activation packet** (content type `0x02`) in `e+1`: a member switches on the first packet in `e+1` whose tag verifies, whatever its content type. After another activation timeout, the owner sends `GROUP_ACTIVATE` by link to every member it has not heard on `e+1` (silent members and those out of its radio range included). An `ACTIVATE` for an epoch not held is ignored and not acked. The timeout is 30 s by default and scales with the radio's airtime like the link's retry timer.
 3. After switching, a member keeps receiving on `e` for a **grace time** of 60 s, then wipes `G[e]`, its sender keys and windows. With **no grace**, it wipes `e` at once.
-4. **Maximum epoch life:** a member drops an epoch held longer than twice the rotation time since it received the key (monotonic clock), even if no new one came. Group traffic then stops until the owner is heard from; it never silently continues on an old key.
+4. **Maximum epoch life:** a member drops an epoch once the epoch life given in its `GROUP_KEY` has passed since it received the key (monotonic clock; the owner sets twice its rotation time), even if no new one came. Group traffic then stops until the owner is heard from; it never silently continues on an old key.
 
 **When the owner rotates:**
 
@@ -120,10 +122,10 @@ Flags in `GROUP_KEY`: bit 0 **no grace** (set when the new epoch is caused by a 
 | A member leaves (`oasa-pair group remove`) | Same, plus `GROUP_LEAVE` to that member (a courtesy: safety never depends on it) |
 | The owner starts | New epoch. The owner never issues ids in an epoch loaded from disk |
 | Time | Every 60 minutes by default (set per radio) |
-| The owner's own counter passes 2³¹, or a member's authenticated `GROUP_REKEY` | New epoch, but no sooner than the **minimum rotation interval** after the last one (5 minutes by default; removals ignore it). A member can't force rotations by forging high counters: only the owner's own counter and link messages count |
+| The owner's own counter passes 2³¹, or a member's authenticated `GROUP_REKEY` | New epoch, but no sooner than the **minimum rotation interval** after the last one (5 minutes by default; removals ignore it). Requests inside one interval make one rotation, and each member's requests count toward at most one rotation an hour (more are logged, not acted on). A member can't force rotations by forging high counters: only the owner's own counter and link messages count |
 | A device joins | New epoch, so a new member can't read what was sent before it joined. Can be turned off per group for busy groups |
 
-**Session start:** the owner sends a `GROUP_KEY` with a fresh sender id at the start of each link session with a member. On a rekey of an existing session nothing is resent unless the member hasn't acked the current epoch.
+**Session start:** the owner can't tell a member's restart from a rekey, so the member asks: it sends `GROUP_ID_REQUEST` when it has no id issued to its process (§4). Otherwise the owner resends a `GROUP_KEY` only if the member hasn't acked the current epoch.
 
 **Airtime on slow radios.** On LoRa SF12 (about 290 bit/s), one `GROUP_KEY` and its `ACK` take about 5 s, so a rotation over 20 members takes over a minute, and an hourly rotation doesn't fit a 1% duty cycle (36 s an hour in the EU868 band). Set long rotation times on such radios, keep groups small, and expect removal to take minutes there, not seconds. Measure in the lab before choosing defaults (§10).
 
@@ -131,7 +133,9 @@ Flags in `GROUP_KEY`: bit 0 **no grace** (set when the new epoch is caused by a 
 
 | File | Content |
 |---|---|
-| `groups/<owner fingerprint>-<group id>.v1` | Owner, newest epoch, up to two epoch keys, highest sender id per epoch (`0600`). Ids and keys loaded from here are receive-only (§4) |
+| `groups/<owner fingerprint>-<group id>.v1` | Owner, newest epoch, up to two epoch keys, id ceiling and epoch life per epoch (`0600`). Ids and keys loaded from here are receive-only (§4) |
+| `groups/<owner fingerprint>-<group id>.seen` | Highest counter accepted per (sender, epoch), saved every 10 s and at stop |
+| `group-owners` | Peers allowed to own groups on this device |
 | `groups/<owner fingerprint>-<group id>.counter` | The sender's reservation per epoch, with the sender id it belongs to |
 | `groups-owned/<group id>.v1` (owner only) | Members with their public key, the sender ids issued per epoch, ack state. Saved with `fsync` before a `GROUP_KEY` leaves |
 
@@ -147,7 +151,7 @@ Files are changed under the same `.lock` and swapped in atomically, as `trusted-
   - `GLOBAL_POSITION_INT` steers ArduPilot's follow mode.
 
   PX4 accepts `HEARTBEAT` and `ADSB_VEHICLE` unsigned even with signing on, so signing gives no protection here.
-- So the **group MAVLink guard starts empty** (a separate guard from the link's, which it never inherits) and drops everything. If a drone's companion must pass some MAVLink, `--group-allow-msg ID` adds one, with a warning. `HEARTBEAT` with type ground station or with the drone's own system id, `TIMESYNC`, and everything the link guard blocks can never be allowed. `ADSB_VEHICLE` needs `--group-allow-adsb`, which warns that any member can trigger avoidance, and the docs require warn-only avoidance settings.
+- So the **group MAVLink guard starts empty** (a separate guard from the link's, which it never inherits). On a drone it scans every byte offset of every group datagram for a whole, CRC-valid MAVLink 1 or 2 frame, as a router does, and drops the datagram if it finds any frame not allowed. Companion data that holds no MAVLink frame passes. If a drone's companion must pass some MAVLink, `--group-allow-msg ID` adds one, with a warning. `HEARTBEAT` with type ground station or with the drone's own system id, `TIMESYNC`, and everything the link guard blocks can never be allowed. `ADSB_VEHICLE` needs `--group-allow-adsb`, which warns that any member can trigger avoidance, and the docs require warn-only avoidance settings.
 - **Send side:** a drone sends to the group only what its companion software writes to the group port, never its autopilot stream: status text, parameters and missions don't go to members it doesn't trust.
 - Library: `oasa_sec::group`, sans-IO like the link: keys, counters and time come in as arguments.
 
@@ -155,9 +159,9 @@ Files are changed under the same `.lock` and swapped in atomically, as `trusted-
 
 | Who | Can | Can't |
 |---|---|---|
-| Outsider on the air | See sizes, timing, group id, epoch byte, sender id and counter (so traffic volume, and that one fleet is the same across days) | Read or forge packets. Replays are dropped by the replay window, and after a member restarts by the restart rule (§4). Can deliver a recorded packet late, within its epoch, to a member that didn't hear it |
+| Outsider on the air | See sizes, timing, group id, epoch byte, sender id and counter (so traffic volume, and that one fleet is the same across days) | Read or forge packets. Replays are dropped by the replay window, also after a restart (saved counters, §4), except up to 10 s of packets after a member crashes. Can deliver a recorded packet late, within its epoch, to a member that didn't hear it |
 | A removed device | Read and forge in the current epoch until the owner applies the removal and each member switches (no grace). Toward a member the owner can't reach, until that member's maximum epoch life runs out | Read or forge after that, or get a new key |
-| A member that turns bad | Forge packets as any member. Jam a sender, the owner included, by sending its sender id with high counters, which pushes that sender's real packets out of everyone's replay window | Reach an autopilot (§7), force rotations faster than the minimum interval, change membership, or touch link sessions |
+| A member that turns bad | Forge packets as any member. Jam a sender, the owner included, by sending its sender id with high counters, which pushes that sender's real packets out of everyone's replay window | Reach an autopilot (§7), force more than one rotation an hour or use up the epoch numbers, change membership, or touch link sessions |
 | The owner, if stolen | Everything in its groups | Anything a link session protects, or anything it has no `group-owner` permission for |
 
 A jam has no fix with a shared key. It shows up as one sender's packets suddenly dropping as `too_old`, or as `sender_clash` at the jammed sender. The fix is to remove the member (a new epoch at once).
@@ -166,7 +170,7 @@ A jam has no fix with a shared key. It shows up as one sender's packets suddenly
 
 - Known-answer vectors for `K[e, s]` and for one packet (with the stated nonce layout), checked by an independent implementation (Python, as for pairing).
 - **No repeated nonce, ever.** Kill and restart a sender mid-epoch; restore its folder from an older copy; copy a folder to a second device; run two processes on one folder; remove and re-add a member in one epoch; crash the owner mid-rotation and restore it from an older copy. Every capture is checked for a repeated (key, nonce) pair.
-- L1: three or more members through the lossy simulated channel: rotation with a member offline, removal with no grace, a removal in the middle of a rotation, a forged header byte, an old epoch replayed, a replay to a restarted member, a member sending with another's sender id, a member forging high counters (no rotation storm), the 256-epoch low-byte wrap, a packet shorter than 27 bytes.
+- L1: three or more members through the lossy simulated channel: rotation with a member offline, removal with no grace, a removal in the middle of a rotation, a forged header byte, an old epoch replayed, a replay to a member after a clean stop and after a crash, a multicast echo (no `sender_clash`), ids issued mid-epoch (accepted by every member), a member asking for ids in a loop (capped), a forged `GROUP_HAVE` near 2³², a member sending with another's sender id, a member forging high counters (no rotation storm), the 256-epoch low-byte wrap, a packet shorter than 27 bytes.
 - The guard: with the defaults, nothing from a group reaches the plaintext port as MAVLink; the never-allowed messages stay blocked under every flag.
 - Airtime: a rotation over the LoRa profiles, measured.
 - Captures checked by the lab's checker for plaintext.
