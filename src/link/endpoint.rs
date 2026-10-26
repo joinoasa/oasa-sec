@@ -133,6 +133,13 @@ struct PeerLink {
     /// attempt supersedes it and when any session is established. (`snow`
     /// does not zeroize its handshake state when dropped; see the spec.)
     hs_old: Option<InFlight>,
+    /// We finished on `hs_old` while a newer attempt (`hs`) is still open.
+    /// The responder may already have replaced the older attempt's session
+    /// with the newer one (it keeps only the latest), so the session we just
+    /// made may be dead at its end. `hs` stays open until the session we made
+    /// is confirmed by a valid packet; if the newer answer arrives first we
+    /// move to that session instead.
+    hs_follows: bool,
     current: Option<Session>,
     /// A replaced session and when it last carried a valid packet.
     previous: Option<(Session, Duration)>,
@@ -210,6 +217,7 @@ impl Endpoint {
             wants_session: None,
             hs: None,
             hs_old: None,
+            hs_follows: false,
             current: None,
             previous: None,
             pending: None,
@@ -560,6 +568,7 @@ impl PeerLink {
         self.store.save(&next)?;
         self.stamps = next;
         let packet = packet::encode_handshake1(&self.public, &buf[..n]);
+        self.hs_follows = false;
         // The newest attempt moves to the spare slot; the one that was
         // there before it is dropped (wiped as far as `snow` allows).
         self.hs_old = self.hs.replace(InFlight {
@@ -730,8 +739,14 @@ impl PeerLink {
             }
         };
         sh.stats.handshakes_completed += 1;
-        // The first answer wins: the other attempt is dropped.
-        self.hs = None;
+        // The first answer wins and the other attempt is dropped, with one
+        // exception: if the answer was for the older attempt, the newer one
+        // stays open until this session is confirmed (see `hs_follows`).
+        let keep_newer = in_old && self.hs.is_some();
+        if !keep_newer {
+            self.hs = None;
+        }
+        self.hs_follows = keep_newer;
         self.hs_old = None;
         let remote_index = u16::from_be_bytes([payload[0], payload[1]]);
         let session = Session::new(transport, f.local_index, remote_index, true, now);
@@ -844,6 +859,11 @@ impl PeerLink {
                 if session_is_initiator {
                     self.previous = None;
                     self.unconfirmed_rounds = 0;
+                    // Confirmed: the newer attempt kept open for it is not needed.
+                    if self.hs_follows {
+                        self.hs = None;
+                        self.hs_follows = false;
+                    }
                 }
             }
             Slot::Previous => {

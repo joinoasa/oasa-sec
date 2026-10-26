@@ -12,8 +12,7 @@ use std::time::Duration;
 
 use super::{Config, Entropy};
 
-/// Keepalives are off when the handshake round trip is longer than this: a
-/// keepalive costs airtime on a slow radio and the stale rule needs none.
+/// Far above any radio; only stops overflow.
 const MAX_ROUND_TRIP: Duration = Duration::from_secs(86_400);
 
 /// `d` plus or minus up to 20%, from `rng`. Spreads handshake and control
@@ -46,6 +45,8 @@ pub(crate) fn lora_airtime(nbytes: usize, sf: u32) -> Duration {
     Duration::from_nanos((4 * symbols + 1) * (1u64 << (sf - 2)) * 1_000_000_000 / bw)
 }
 
+/// Keepalives are off when the handshake round trip is longer than this: a
+/// keepalive costs airtime on a slow radio and the stale rule needs none.
 const KEEPALIVE_OFF_ABOVE: Duration = Duration::from_secs(2);
 
 /// A radio the OASA test lab can simulate. The names are the lab's profile
@@ -152,10 +153,10 @@ impl Config {
     /// - `previous_grace` = at least 2 x round trip, at least 10 s: packets
     ///   of the old session may still be in the air or queued.
     /// - `peer_handshake_gap` = at least half the round trip, at least 1 s,
-    ///   never above 5 s: each accepted handshake costs a reply on the air.
+    ///   never above 4 s: each accepted handshake costs a reply on the air.
     ///   The gap limits the *peer's* retries, which we cannot know, so it is
-    ///   capped at the default 5 s retry: a peer on default timers or slower
-    ///   is never rate limited by it.
+    ///   capped at 4 s, the shortest jittered default retry (5 s less 20%): a
+    ///   peer on default timers or slower is never rate limited by it.
     /// - `keepalive` is off when the round trip is over 2 s (the spec's "off
     ///   by default on slow radios"); the stale rule still heals a dead session.
     /// - Left alone: `handshakes_per_second` (a slow radio never reaches it),
@@ -172,7 +173,10 @@ impl Config {
         let base_retry = base.retry_initial;
         let c = Self {
             previous_grace: base.previous_grace.max(rtt * 2),
-            peer_handshake_gap: base.peer_handshake_gap.max(rtt / 2).min(base.retry_initial),
+            peer_handshake_gap: base
+                .peer_handshake_gap
+                .max(rtt / 2)
+                .min(Duration::from_secs(4)),
             keepalive: if rtt > KEEPALIVE_OFF_ABOVE {
                 None
             } else {
@@ -232,7 +236,7 @@ mod tests {
         assert!(c.stale_after / 2 > rtt, "the ack at half of stale must fit");
         assert!(c.previous_grace >= rtt * 2);
         assert!(c.peer_handshake_gap >= rtt / 2);
-        assert!(c.peer_handshake_gap <= Duration::from_secs(5));
+        assert!(c.peer_handshake_gap <= Duration::from_secs(4));
         assert_eq!(c.keepalive, None);
         c.validate().unwrap();
     }

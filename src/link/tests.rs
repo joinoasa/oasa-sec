@@ -1706,6 +1706,9 @@ struct SlowLink {
     lose: Vec<(bool, usize)>,
     sent_a: usize,
     sent_b: usize,
+    /// One radio per side: it sends one packet at a time, the rest wait.
+    tx_queue: bool,
+    busy: [Duration; 2],
     a_events: Vec<(Duration, Event)>,
     b_events: Vec<(Duration, Event)>,
 }
@@ -1724,6 +1727,8 @@ impl SlowLink {
             lose: Vec::new(),
             sent_a: 0,
             sent_b: 0,
+            tx_queue: false,
+            busy: [Duration::ZERO; 2],
             a_events: Vec::new(),
             b_events: Vec::new(),
         }
@@ -1741,9 +1746,20 @@ impl SlowLink {
             if self.lose.contains(&(from_a, n)) {
                 continue;
             }
-            self.air
-                .push((self.now + sf12_air(pkt.len()), !from_a, pkt));
+            self.put_on_air(from_a, pkt);
         }
+    }
+
+    fn put_on_air(&mut self, from_a: bool, pkt: Vec<u8>) {
+        let side = usize::from(!from_a);
+        let begin = if self.tx_queue {
+            self.now.max(self.busy[side])
+        } else {
+            self.now
+        };
+        let arrives = begin + sf12_air(pkt.len());
+        self.busy[side] = arrives;
+        self.air.push((arrives, !from_a, pkt));
     }
 
     fn start(&mut self) {
@@ -1759,8 +1775,8 @@ impl SlowLink {
             self.now += ms(50);
             let now = self.now;
             if let Some(pkt) = app(now, &mut self.p.a) {
-                self.air.push((now + sf12_air(pkt.len()), false, pkt));
                 self.sent_a += 1;
+                self.put_on_air(true, pkt);
             }
             let ev = self.p.a.poll_timers(now);
             self.transmit(true, &ev);
@@ -2006,6 +2022,12 @@ fn a_late_handshake_2_for_the_previous_attempt_still_completes() {
         "{ev:?}"
     );
     assert!(l.p.a.can_send());
+    // The responder gets our keepalive on that session and confirms it; the
+    // confirmation closes the newer attempt that was kept open.
+    let ka = sends(&ev).remove(0);
+    let ev = l.p.b.handle_packet(l.t_retry + ms(1_000), &ka);
+    let confirm = sends(&ev).remove(0);
+    l.p.a.handle_packet(l.t_retry + ms(2_000), &confirm);
     // The answer to the retry arrives later still: nothing waits for it any
     // more, it is dropped, and the session is unchanged.
     let hs2_retry = sends(&l.p.b.handle_packet(l.t_retry + ms(4_600), &l.hs1_retry));
@@ -2014,6 +2036,99 @@ fn a_late_handshake_2_for_the_previous_attempt_still_completes() {
     assert_eq!(drops(&ev), vec![DropReason::UnknownIndex]);
     assert_eq!(l.p.a.stats().handshakes_completed, 1);
     assert!(l.p.a.can_send());
+}
+
+/// The responder accepted attempt A, then the retry B (B replaced A as its
+/// pending session). A's answer reaches the initiator first. Then: the
+/// initiator's packet on A is unknown to the responder, B's answer arrives,
+/// and the initiator moves to B without another handshake. With `rekey`, a
+/// working session exists first.
+fn crossed_answers(rekey: bool) {
+    let mut p = pair(Config::default());
+    let mut t = ms(10);
+    if rekey {
+        let (q, now) = established(Config::default());
+        p = q;
+        t = now + Duration::from_secs(700);
+    }
+    let ev = p.a.poll_timers(t);
+    let ev = if rekey {
+        ev
+    } else {
+        p.a.start_handshake(t).unwrap()
+    };
+    let hs1_a = sends(&ev).remove(0);
+    let hs2_a = sends(&p.b.handle_packet(t + ms(4_600), &hs1_a)).remove(0);
+    // The retry B goes out before A's answer arrives; the responder takes it
+    // too (its gap has passed) and drops A's session.
+    let tb = t + Duration::from_secs(6);
+    let ev = p.a.poll_timers(tb);
+    assert!(ev.contains(&Event::HandshakeSent { retry: true, rekey }));
+    let hs1_b = sends(&ev).remove(0);
+    let hs2_b = sends(&p.b.handle_packet(tb + ms(4_600), &hs1_b)).remove(0);
+    // A's answer reaches the initiator first (it was queued ahead of B's).
+    let ta = tb + ms(5_000);
+    let ev = p.a.handle_packet(ta, &hs2_a);
+    assert!(ev.iter().any(|e| matches!(
+        e,
+        Event::SessionEstablished {
+            initiator: true,
+            ..
+        }
+    )));
+    // Its keepalive on A reaches a responder that no longer knows A.
+    let ka = sends(&ev).remove(0);
+    let ev = p.b.handle_packet(ta + ms(1_000), &ka);
+    assert_eq!(drops(&ev), vec![DropReason::UnknownIndex]);
+    // B's answer: the initiator moves to B instead of timing out and shaking
+    // hands again.
+    let ev = p.a.handle_packet(ta + ms(2_000), &hs2_b);
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            Event::SessionEstablished {
+                initiator: true,
+                ..
+            }
+        )),
+        "{ev:?}"
+    );
+    assert!(drops(&ev).is_empty());
+    let ka = sends(&ev).remove(0);
+    let ev = p.b.handle_packet(ta + ms(3_000), &ka);
+    assert!(ev.iter().any(|e| matches!(
+        e,
+        Event::SessionEstablished {
+            initiator: false,
+            ..
+        }
+    )));
+    // Data both ways on the one session, and no third handshake.
+    let pkt = p.a.send(ta + ms(4_000), b"up").unwrap();
+    assert_eq!(
+        delivered(&p.b.handle_packet(ta + ms(5_000), &pkt)),
+        vec![b"up".to_vec()]
+    );
+    let pkt = p.b.send(ta + ms(6_000), b"down").unwrap();
+    assert_eq!(
+        delivered(&p.a.handle_packet(ta + ms(7_000), &pkt)),
+        vec![b"down".to_vec()]
+    );
+    assert_eq!(p.a.stats().handshakes_sent, if rekey { 3 } else { 2 });
+    assert_eq!(p.a.stats().dropped(DropReason::UnknownIndex), 0);
+    // And it stays up: nothing starts a new handshake soon after.
+    let ev = p.a.poll_timers(ta + Duration::from_secs(20));
+    assert!(!handshake_sent(&ev), "{ev:?}");
+}
+
+#[test]
+fn crossed_answers_move_to_the_newer_session_on_the_first_handshake() {
+    crossed_answers(false);
+}
+
+#[test]
+fn crossed_answers_move_to_the_newer_session_on_a_rekey() {
+    crossed_answers(true);
 }
 
 #[test]
@@ -2165,4 +2280,41 @@ fn jitter_stays_within_20_percent_and_uses_the_given_randomness() {
     // The retry from the airtime rule, jittered down, still exceeds R.
     let cfg = sf12_config();
     assert!(cfg.retry_initial.mul_f64(0.8) > round_trip());
+}
+
+#[test]
+fn a_queued_radio_with_default_timers_wastes_no_handshakes_or_sessions() {
+    // Default timers (5 s retry, shorter than the 7.1 s handshake) on a radio
+    // that sends one packet at a time: the common ordering is that the
+    // responder gets the retry before the initiator's first packet on the
+    // session made from the first answer. One hour with a rekey every
+    // 100 s and telemetry every 20 s.
+    let cfg = Config {
+        rekey_after: Duration::from_secs(100),
+        reject_after: Duration::from_secs(150),
+        ..Config::default()
+    };
+    let mut s = SlowLink::new(cfg);
+    s.tx_queue = true;
+    s.start();
+    let mut next = Duration::from_secs(20);
+    s.run(3600, |now, a| {
+        if now >= next && a.can_send() {
+            next = now + Duration::from_secs(20);
+            return a.send(now, b"telemetry").ok();
+        }
+        None
+    });
+    let (a, b) = (s.p.a.stats(), s.p.b.stats());
+    let unknown = a.dropped(DropReason::UnknownIndex) + b.dropped(DropReason::UnknownIndex);
+    eprintln!(
+        "handshakes sent {} unknown_index {unknown} delivered {}",
+        a.handshakes_sent, b.delivered
+    );
+    assert!(s.p.a.can_send());
+    // 3600 s / 100 s = 36 rekeys; each costs at most a retry or two, and no
+    // session is abandoned and rebuilt.
+    assert!(a.handshakes_sent <= 36 * 2 + 2, "{}", a.handshakes_sent);
+    assert!(unknown <= 50, "{unknown}");
+    assert!(b.delivered >= 150, "{}", b.delivered);
 }

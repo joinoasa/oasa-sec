@@ -589,7 +589,7 @@ impl Control {
             if now < o.next_try {
                 return None;
             }
-            o.backoff = (o.backoff * 2).min(retry_max);
+            o.backoff = o.backoff.saturating_mul(2).min(retry_max);
             o.next_try = now + jittered(o.backoff, rng);
             Some(Action::Send(o.bytes.clone()))
         }
