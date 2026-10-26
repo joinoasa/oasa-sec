@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Post an idea
+    url: https://github.com/joinoasa/ideas/issues/new?template=idea.yml
+    about: New ideas for the tech tree go to the ideas inbox.
+  - name: Building with AI agents
+    url: https://joinoasa.org/docs/agents/
+    about: How task cards, labels and checks work.
