@@ -1,0 +1,82 @@
+oasa = "files/0"
+
+[project]
+name = "oasa-sec"
+summary = "Device identity, encrypted pairing and the encrypted link"
+repo = "https://github.com/joinoasa/oasa-sec"
+license = "Apache-2.0"
+nodes = ["R-SEC1", "R-SEC2", "R-COM2"]
+standards = ["OASA-SEC"]
+docs = [
+  "README.md",
+  "AGENTS.md",
+  "SECURITY.md",
+  "docs/oasa-sec-v0-pairing.md",
+  "docs/oasa-sec-v0-link.md",
+  "docs/oasa-sec-v0-rotation.md",
+]
+
+[review]
+# Keys, pairing and the link: an independent reviewer plus a person.
+security = "critical"
+
+[setup]
+container = ".devcontainer/devcontainer.json"
+tools = ["rust >= 1.89", "python >= 3.11", "cargo-deny", "cargo-audit"]
+steps = [
+  "cargo build --locked --bins --examples",
+  "python3 -m venv .venv",
+  ".venv/bin/pip install pymavlink",
+]
+
+[[check]]
+name = "fmt"
+run = "cargo fmt --check"
+
+[[check]]
+name = "clippy"
+run = "cargo clippy --locked --all-targets -- -D warnings"
+
+[[check]]
+name = "test"
+run = "cargo test --locked"
+
+[[check]]
+name = "deny"
+run = "cargo deny --locked check"
+needs = ["cargo-deny"]
+
+[[check]]
+name = "audit"
+run = "cargo audit"
+needs = ["cargo-audit", "network access to the advisory database"]
+
+[[check]]
+name = "build"
+run = "cargo build --locked --bins --examples"
+
+[[check]]
+name = "e2e"
+run = 'PYTHON="$PWD/.venv/bin/python" scripts/e2e.sh'
+needs = ["pymavlink in .venv (the setup steps install it)"]
+
+[[check]]
+name = "link-e2e"
+run = 'PYTHON="$PWD/.venv/bin/python" scripts/link-e2e.sh'
+needs = ["pymavlink in .venv (the setup steps install it)"]
+
+# oasa-lab suites that use these binaries. Run them from the oasa-lab repo with
+# OASA_SEC_BIN_DIR=<this repo>/target/debug (CI runs l1-oasa-link on every pull request).
+[[lab]]
+suite = "l1-oasa-link"
+
+[[lab]]
+suite = "l2-lora-link"
+hardware = true   # real run needs 2 LoRa modems and an RTL-SDR; OASA_LAB_SIM=1 runs it on the simulated bench
+
+[[lab]]
+suite = "l1-mavlink-sitl"   # needs PX4 and ArduPilot simulators; slow, not in CI (docs/sitl.md)
+
+[hardware]
+needed = false
+optional = ["2x Heltec LoRa V3", "RTL-SDR V4L"]

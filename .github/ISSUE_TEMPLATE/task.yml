@@ -1,0 +1,66 @@
+name: Task
+description: A piece of work small enough for one pull request. Agent-ready tasks are scoped so an AI agent can finish them from this card alone.
+title: "[NODE-ID] "
+labels: ["task"]
+body:
+  - type: markdown
+    attributes:
+      value: "How task cards work: https://joinoasa.org/docs/agents/#task-cards. Keep it short, clear, not wordy."
+  - type: input
+    id: node
+    attributes:
+      label: Node
+      description: The tech tree node this serves, e.g. R-COM2
+      placeholder: R-COM2
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: One or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: Checks that prove it's finished. Runnable where possible.
+      placeholder: "- `cargo test` passes, including a new test for ...\n- `oasa-lab run l1-...` passes the checker"
+    validations:
+      required: true
+  - type: textarea
+    id: start
+    attributes:
+      label: Start here
+      description: Files, docs and commands to read first.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: What the pull request must show.
+      value: "- The checks table from `python3 oasa_toml.py run --markdown`\n"
+    validations:
+      required: true
+  - type: textarea
+    id: out
+    attributes:
+      label: Out of scope
+      description: What not to touch.
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      options:
+        - Small (hours)
+        - Medium (a day or two)
+        - Large (split it first)
+    validations:
+      required: true
+  - type: textarea
+    id: needs
+    attributes:
+      label: Needs
+      description: Hardware, access or decisions it waits on. Leave empty if none.

@@ -3,3 +3,6 @@
 mavlink-signing-key.bin
 trusted-peers
 __pycache__/
+.oasa/
+.venv/
+oasa-checks.json
