@@ -25,7 +25,7 @@ body:
     id: done
     attributes:
       label: Done when
-      description: Checks that prove it's finished. Runnable where possible.
+      description: Checks that prove it's finished. Runnable where possible. Name exact fields, files and formats where a choice matters, and say whether old data must still work.
       placeholder: "- `cargo test` passes, including a new test for ...\n- `oasa-lab run l1-...` passes the checker"
     validations:
       required: true
@@ -41,7 +41,7 @@ body:
     attributes:
       label: Evidence
       description: What the pull request must show.
-      value: "- The checks table from `python3 oasa_toml.py run --markdown`\n"
+      value: "- The checks table from `python3 .oasa/oasa_toml.py run --markdown`\n"
     validations:
       required: true
   - type: textarea
@@ -63,4 +63,4 @@ body:
     id: needs
     attributes:
       label: Needs
-      description: Hardware, access or decisions it waits on. Leave empty if none.
+      description: Hardware, access, decisions, or other OASA repos it needs built next to this one (e.g. ../oasa-radio for a suite that runs its binary). Leave empty if none.
