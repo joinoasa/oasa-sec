@@ -48,7 +48,9 @@ pub use source::{SourceLimiter, looks_like_handshake1};
 pub use stamp::{
     FileTimestampStore, MemoryTimestampStore, StoredStamps, Timestamp, TimestampStore,
 };
-pub use timing::RadioProfile;
+#[cfg(test)]
+pub(crate) use timing::lora_airtime;
+pub use timing::{RadioProfile, jittered};
 
 /// The Noise protocol used for the link.
 pub const LINK_NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -162,6 +164,13 @@ impl Config {
         }
         if self.peer_handshake_gap > self.retry_initial {
             return bad("peer_handshake_gap must not be above retry_initial");
+        }
+        // A slow retry with a short rekey time would be rekeying all the time.
+        // (Fast timers keep any rekey time: short ones are used in tests.)
+        if self.retry_initial > Config::default().retry_initial
+            && self.rekey_after < self.retry_initial.saturating_mul(4)
+        {
+            return bad("rekey_after must be at least 4 times retry_initial");
         }
         if self.reject_after.saturating_sub(self.rekey_after) < self.retry_initial {
             return bad("reject_after must be at least retry_initial above rekey_after");
