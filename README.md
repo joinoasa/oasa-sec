@@ -55,7 +55,7 @@ pip install pymavlink
 scripts/e2e.sh
 ```
 
-That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 14 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved (with a message naming the likely causes), and `command` keeps trying when the autopilot answers late.
+That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 19 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved (with a message naming the likely causes), and `command` keeps trying when the autopilot answers late.
 
 By hand:
 
