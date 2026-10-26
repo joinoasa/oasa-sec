@@ -251,4 +251,4 @@ Two ways in:
 1. Handshakes on radios with an MTU under 128 bytes: split into pieces, or a smaller pattern?
 2. DoS cookies (WireGuard's) for radios where someone could flood handshakes. `mac1` uses a public key as its secret, so someone who recorded one real message 1 can replay it (the responder drops it as `stale_handshake` but has spent an X25519 on it) and can use up the 20 a second budget. The per-source limit helps against one address only. Cookies tied to the sender's address would fix it, and need a reply to an unproven sender.
 3. Default rekey limits per radio, once we measure airtime.
-4. Group keys for broadcast (R-COM2 phase 2).
+4. Group keys for broadcast (R-COM2 phase 2): draft in [oasa-sec-v0-group.md](oasa-sec-v0-group.md).
