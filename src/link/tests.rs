@@ -1660,3 +1660,271 @@ fn keepalives_stay_empty_and_sizes_are_22_and_24() {
         );
     }
 }
+
+// ---- A slow half-duplex radio (LoRa SF12 BW125 in the lab) -----------------
+//
+// Handshake 1 (119 bytes) takes 4.6 s on the air and handshake 2 (55 bytes)
+// 2.5 s, so a handshake needs about 7.1 s. The simulated channel below delivers
+// each packet after its airtime and loses nothing unless a test says so.
+
+const HS1_AIR: Duration = Duration::from_millis(4_596);
+const HS2_AIR: Duration = Duration::from_millis(2_466);
+
+/// Airtime of a packet by its length: the SF12 numbers for the two handshake
+/// packets, about 1 s for a keepalive and 5 s for a full 128 byte packet.
+fn sf12_air(len: usize) -> Duration {
+    match len {
+        119 => HS1_AIR,
+        55 => HS2_AIR,
+        l => Duration::from_millis(900 + 35 * l as u64),
+    }
+}
+
+struct SlowLink {
+    p: Pair,
+    now: Duration,
+    /// (arrives at, to a?, packet)
+    air: Vec<(Duration, bool, Vec<u8>)>,
+    /// Packets to lose: the nth packet sent by a (true) or b (false).
+    lose: Vec<(bool, usize)>,
+    sent_a: usize,
+    sent_b: usize,
+    a_events: Vec<(Duration, Event)>,
+    b_events: Vec<(Duration, Event)>,
+}
+
+impl SlowLink {
+    fn new(cfg: Config) -> Self {
+        Self {
+            p: pair(cfg),
+            now: ms(10),
+            air: Vec::new(),
+            lose: Vec::new(),
+            sent_a: 0,
+            sent_b: 0,
+            a_events: Vec::new(),
+            b_events: Vec::new(),
+        }
+    }
+
+    fn transmit(&mut self, from_a: bool, events: &[Event]) {
+        for pkt in sends(events) {
+            let n = if from_a {
+                self.sent_a += 1;
+                self.sent_a
+            } else {
+                self.sent_b += 1;
+                self.sent_b
+            };
+            if self.lose.contains(&(from_a, n)) {
+                continue;
+            }
+            self.air
+                .push((self.now + sf12_air(pkt.len()), !from_a, pkt));
+        }
+    }
+
+    fn start(&mut self) {
+        let ev = self.p.a.start_handshake(self.now).unwrap();
+        self.transmit(true, &ev);
+        self.a_events.extend(ev.into_iter().map(|e| (self.now, e)));
+    }
+
+    /// Advance in 50 ms steps for `secs` seconds. `app` may send payload from a.
+    fn run(&mut self, secs: u64, mut app: impl FnMut(Duration, &mut Link) -> Option<Vec<u8>>) {
+        let end = self.now + Duration::from_secs(secs);
+        while self.now < end {
+            self.now += ms(50);
+            let now = self.now;
+            if let Some(pkt) = app(now, &mut self.p.a) {
+                self.air.push((now + sf12_air(pkt.len()), false, pkt));
+                self.sent_a += 1;
+            }
+            let ev = self.p.a.poll_timers(now);
+            self.transmit(true, &ev);
+            self.a_events.extend(ev.into_iter().map(|e| (now, e)));
+            let ev = self.p.b.poll_timers(now);
+            self.transmit(false, &ev);
+            self.b_events.extend(ev.into_iter().map(|e| (now, e)));
+            let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.air)
+                .into_iter()
+                .partition(|(t, _, _)| *t <= now);
+            self.air = rest;
+            for (_, to_a, pkt) in due {
+                if to_a {
+                    let ev = self.p.a.handle_packet(now, &pkt);
+                    self.transmit(true, &ev);
+                    self.a_events.extend(ev.into_iter().map(|e| (now, e)));
+                } else {
+                    let ev = self.p.b.handle_packet(now, &pkt);
+                    self.transmit(false, &ev);
+                    self.b_events.extend(ev.into_iter().map(|e| (now, e)));
+                }
+            }
+        }
+    }
+
+    fn established_at(&self, events: &[(Duration, Event)]) -> Option<Duration> {
+        events
+            .iter()
+            .find(|(_, e)| matches!(e, Event::SessionEstablished { .. }))
+            .map(|(t, _)| *t)
+    }
+
+    fn handshakes_sent(&self) -> usize {
+        self.a_events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::HandshakeSent { .. }))
+            .count()
+    }
+
+    fn retries(&self) -> Vec<Duration> {
+        self.a_events
+            .iter()
+            .filter_map(|(t, e)| match e {
+                Event::HandshakeSent { retry: true, .. } => Some(*t),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn no_app(_: Duration, _: &mut Link) -> Option<Vec<u8>> {
+    None
+}
+
+fn sf12_config() -> Config {
+    Config::for_airtime(HS1_AIR + HS2_AIR)
+}
+
+#[test]
+fn old_defaults_retry_before_the_answer_can_arrive_on_a_slow_link() {
+    let mut s = SlowLink::new(Config::default());
+    s.start();
+    s.run(30, no_app);
+    // The answer needs 7.1 s; the default retry goes out at 5 s.
+    let first_retry = s.retries()[0];
+    assert!(first_retry < ms(10) + HS1_AIR + HS2_AIR, "{first_retry:?}");
+    assert!(s.handshakes_sent() >= 2);
+    // And the session is only up after the duplicate round, not after ~7 s.
+    assert!(s.p.a.can_send());
+}
+
+#[test]
+fn airtime_scaled_config_completes_with_one_handshake_and_no_retry() {
+    let cfg = sf12_config();
+    assert!(cfg.retry_initial > HS1_AIR + HS2_AIR);
+    let mut s = SlowLink::new(cfg);
+    s.start();
+    s.run(300, no_app);
+    let up = s.established_at(&s.a_events).expect("a never established");
+    let took = up - ms(10);
+    // One round trip, not two: the answer was not preceded by a retry.
+    assert!(took >= HS1_AIR + HS2_AIR && took < HS1_AIR + HS2_AIR + ms(200));
+    assert_eq!(s.handshakes_sent(), 1);
+    assert!(s.retries().is_empty());
+    assert_eq!(s.p.a.stats().handshakes_completed, 1);
+    assert_eq!(s.p.b.stats().handshakes_accepted, 1);
+    // The responder switched after the initiator's confirming keepalive, and
+    // nothing was dropped on either side while idle (keepalives are off).
+    assert!(s.established_at(&s.b_events).is_some());
+    assert_eq!(s.p.a.stats().total_dropped(), 0);
+    assert_eq!(s.p.b.stats().total_dropped(), 0);
+    assert_eq!(s.p.a.stats().keepalives_sent, 1);
+}
+
+#[test]
+fn a_healthy_slow_link_with_traffic_never_looks_stale() {
+    let mut s = SlowLink::new(sf12_config());
+    s.start();
+    let mut next_send = Duration::from_secs(15);
+    s.run(400, |now, a| {
+        if now >= next_send && a.can_send() {
+            next_send = now + Duration::from_secs(20);
+            return a.send(now, b"hello over lora").ok();
+        }
+        None
+    });
+    // One-way traffic for 400 s: no second handshake from a stale rule.
+    assert_eq!(s.handshakes_sent(), 1);
+    assert!(s.p.b.stats().delivered >= 15);
+    assert_eq!(s.p.b.stats().handshakes_accepted, 1);
+    assert_eq!(s.p.a.stats().handshakes_sent, 1);
+}
+
+#[test]
+fn a_lost_handshake_1_is_retried_once_and_the_link_recovers_on_a_slow_link() {
+    let cfg = sf12_config();
+    let retry = cfg.retry_initial;
+    let mut s = SlowLink::new(cfg);
+    s.lose.push((true, 1));
+    s.start();
+    s.run(120, no_app);
+    assert_eq!(s.retries().len(), 1);
+    assert_eq!(s.handshakes_sent(), 2);
+    let r = s.retries()[0] - ms(10);
+    assert!(r >= retry && r < retry + ms(200), "{r:?}");
+    let up = s.established_at(&s.a_events).unwrap();
+    assert!(up >= ms(10) + retry + HS1_AIR + HS2_AIR);
+    assert!(s.p.a.can_send() && s.established_at(&s.b_events).is_some());
+}
+
+#[test]
+fn a_lost_handshake_2_is_retried_and_the_link_recovers_on_a_slow_link() {
+    let cfg = sf12_config();
+    let mut s = SlowLink::new(cfg);
+    s.lose.push((false, 1));
+    s.start();
+    s.run(120, no_app);
+    assert_eq!(s.retries().len(), 1);
+    assert_eq!(s.handshakes_sent(), 2);
+    assert!(s.p.a.can_send() && s.established_at(&s.b_events).is_some());
+    // The responder accepted the retry (its rate gap is far below the retry).
+    assert_eq!(s.p.b.stats().handshakes_accepted, 2);
+    assert_eq!(s.p.b.stats().dropped(DropReason::RateLimited), 0);
+}
+
+#[test]
+fn config_for_airtime_is_validated_and_contradictions_are_refused() {
+    sf12_config().validate().unwrap();
+    let ok = sf12_config();
+    let bad = [
+        // retry above its cap
+        Config {
+            retry_max: ok.retry_initial - ms(1),
+            ..ok.clone()
+        },
+        // stale rule shorter than the retry
+        Config {
+            stale_after: ok.retry_initial,
+            ..ok.clone()
+        },
+        Config {
+            stale_after: ms(1_500),
+            retry_initial: Duration::from_secs(5),
+            ..ok.clone()
+        },
+        // a per-peer gap longer than the retry would drop every retry
+        Config {
+            peer_handshake_gap: ok.retry_initial + ms(1),
+            ..ok.clone()
+        },
+        // no room to retry a rekey before the session dies
+        Config {
+            rekey_after: Duration::from_secs(900) - ok.retry_initial + ms(1),
+            reject_after: Duration::from_secs(900),
+            ..ok.clone()
+        },
+    ];
+    for (i, c) in bad.iter().enumerate() {
+        assert!(c.validate().is_err(), "case {i} should be refused");
+    }
+    // The defaults stay valid, and so does an exactly-fitting margin.
+    Config::default().validate().unwrap();
+    Config {
+        stale_after: ok.retry_initial * 2,
+        ..ok.clone()
+    }
+    .validate()
+    .unwrap();
+}
