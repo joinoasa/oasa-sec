@@ -45,6 +45,8 @@ struct Frame {
     comp: u8,
     /// Who a `COMMAND_ACK` answers.
     ack_to: (u8, u8),
+    /// The system id on this frame, if not the fake's own.
+    sys: Option<u32>,
 }
 
 /// The autopilot. Signing rules as PX4 and ArduPilot have them: keyless, it
@@ -79,6 +81,10 @@ struct Ap {
     on_setup: Option<Box<dyn FnMut()>>,
     /// Answer requests to somebody else instead of to the signer.
     ack_to: Option<(u8, u8)>,
+    /// The system id on every frame it sends, if not `SYS`.
+    sys: Option<u32>,
+    /// The system id on its `COMMAND_ACK`s only, if not its own.
+    ack_sys: Option<u32>,
 }
 
 impl Ap {
@@ -154,6 +160,7 @@ impl Port for FakePort {
                         let at = ap.t + Duration::from_millis(50);
                         let signed = ap.key.map(|k| (k, 5_000));
                         let ack_to = ap.ack_to.unwrap_or((SYS, SIGNER_COMP));
+                        let sys = ap.ack_sys;
                         ap.push(Frame {
                             at,
                             msg: MavMessage::COMMAND_ACK(COMMAND_ACK_DATA {
@@ -163,6 +170,7 @@ impl Port for FakePort {
                             signed,
                             comp: COMP,
                             ack_to,
+                            sys,
                         });
                     }
                 }
@@ -198,6 +206,7 @@ impl Port for FakePort {
                 signed: ap.sign_own.then_some(()).and(ap.key).map(|k| (k, ts)),
                 comp: COMP,
                 ack_to: (0, 0),
+                sys: None,
             }
         };
         let sig = frame.signed.map(|(k, ts)| Sig {
@@ -206,7 +215,7 @@ impl Port for FakePort {
         });
         Ok(Some(Inbound {
             header: MavHeader {
-                system_id: SYS,
+                system_id: frame.sys.or(ap.sys).unwrap_or(SYS.into()),
                 component_id: frame.comp,
                 sequence: 0,
             },
@@ -619,6 +628,7 @@ fn frame(r: &Rig, comp: u8, msg: MavMessage, key: Option<[u8; 32]>) -> Frame {
         signed: key.map(|k| (k, 5_000)),
         comp,
         ack_to: (SYS, SIGNER_COMP),
+        sys: None,
     }
 }
 
@@ -663,6 +673,59 @@ fn an_old_key_ack_meant_for_somebody_else_does_not_roll_back() {
     // The same autopilot answering us is believed.
     let mut r = crashed_rig("sg-ourdest", false);
     assert_eq!(r.run(1), vec![Event::RolledBack(1)]);
+}
+
+#[test]
+fn a_32_bit_system_id_is_not_the_autopilot() {
+    // mavlink 0.21 reads IFLAG_SYSID32 frames. An id above 255 whose low byte
+    // is the autopilot's must not pass for the autopilot.
+    let mut r = crashed_rig("sg-sysid32", false);
+    r.ap.borrow_mut().sys = Some(0x100 | u32::from(SYS));
+    assert_eq!(
+        r.run(1),
+        vec![Event::Stuck],
+        "it must not roll the key back"
+    );
+    assert!(r.keys().next.is_some(), "both keys are kept");
+    // The same frames with the autopilot's own id are believed.
+    let mut r = crashed_rig("sg-sysid8", false);
+    assert_eq!(r.run(1), vec![Event::RolledBack(1)]);
+}
+
+#[test]
+fn a_32_bit_system_id_does_not_raise_the_timestamp_floor() {
+    // Signed under the key we hold and within the cap, but from 0x101.
+    let mut r = rig("sg-ts-sysid32");
+    r.want();
+    {
+        let mut a = r.ap.borrow_mut();
+        a.sign_own = true;
+        a.hb_ts = crate::signing::mavlink_timestamp_now() + 5_000_000;
+        a.sys = Some(0x100 | u32::from(SYS));
+    }
+    r.run(3);
+    assert_eq!(r.signer.max_ts, 0);
+}
+
+#[test]
+fn an_ack_from_a_32_bit_system_id_proves_nothing() {
+    // Heartbeats come from the autopilot, unsigned, so only an answer can
+    // prove the new key; every answer comes from 0x101.
+    let mut r = rig("sg-ack-sysid32");
+    r.want();
+    {
+        let mut a = r.ap.borrow_mut();
+        a.sign_own = false;
+        a.ack_sys = Some(0x100 | u32::from(SYS));
+    }
+    let ev = r.run(15);
+    assert!(!ev.contains(&Event::Rotated(1)), "{ev:?}");
+    // The same answers from the autopilot itself complete the rotation.
+    let mut r = rig("sg-ack-sysid8");
+    r.want();
+    r.ap.borrow_mut().sign_own = false;
+    let ev = r.run(15);
+    assert!(ev.contains(&Event::Rotated(1)), "{ev:?}");
 }
 
 #[test]

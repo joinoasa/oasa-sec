@@ -637,6 +637,12 @@ pub fn max_verified_timestamp(datagram: &[u8], key: &[u8; 32], clock: u64, ahead
         if datagram[pos] != V2_START {
             break;
         }
+        // Like the guard: a flag we don't know (IFLAG_SYSID32 changes the
+        // header length) means we can't read the rest. Defence in depth: such
+        // a frame read as 10 bytes of header would not verify anyway.
+        if datagram[pos + 2] & !INCOMPAT_SIGNED != 0 {
+            break;
+        }
         let len = datagram[pos + 1] as usize;
         let signed = datagram[pos + 2] & INCOMPAT_SIGNED != 0;
         let end = pos + 10 + len + 2 + if signed { SIGNATURE_LEN } else { 0 };
@@ -1638,5 +1644,32 @@ mod tests {
         assert_eq!(max(&[0xFD; 3]), 0);
         assert_eq!(max(&[]), 0);
         assert_eq!(max(&[0x55; 40]), 0);
+        // An IFLAG_SYSID32 frame (13-byte header), even one signed under our
+        // key, is not read: the scan stops there.
+        let mut wide = sysid32_frame(&K, 1234);
+        assert_eq!(max(&wide), 0);
+        wide.extend(signed_frame(&K, 99));
+        assert_eq!(max(&wide), 0);
+    }
+
+    /// A signed HEARTBEAT from system 0x101, as mavlink 0.21 writes it.
+    fn sysid32_frame(key: &[u8; 32], ts: u64) -> Vec<u8> {
+        use mavlink::dialects::common::MavMessage;
+        use mavlink::{MAVLinkV2MessageRaw, MavHeader, consts};
+        let header = MavHeader {
+            system_id: 0x101,
+            component_id: 1,
+            sequence: 0,
+        };
+        let msg = MavMessage::HEARTBEAT(Default::default());
+        let mut raw = MAVLinkV2MessageRaw::new();
+        raw.serialize_message_for_signing(header, &msg);
+        raw.signature_timestamp_bytes_mut()
+            .copy_from_slice(&ts.to_le_bytes()[..consts::v2::SIGNATURE_TIMESTAMP_SIZE]);
+        let mut sig = [0u8; consts::v2::SIGNATURE_VALUE_SIZE];
+        raw.calculate_signature(key, &mut sig);
+        raw.signature_value_mut().copy_from_slice(&sig);
+        assert_ne!(raw.incompatibility_flags() & consts::v2::IFLAG_SYSID32, 0);
+        raw.raw_bytes().to_vec()
     }
 }

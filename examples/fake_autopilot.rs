@@ -31,6 +31,11 @@ use mavlink::{
 /// A signed (or, with no key, unsigned) `COMMAND_ACK` that names who it
 /// answers, as real autopilots do. The library's message type has no
 /// extension fields, so the frame is built by hand.
+/// The fake's own system id, which it sets itself: always 1 byte.
+fn sys8(id: u32) -> u8 {
+    u8::try_from(id).expect("fake autopilot: system id above 255")
+}
+
 fn ack_frame(
     me: MavHeader,
     command: u16,
@@ -50,7 +55,7 @@ fn ack_frame(
     buf[1] = 10;
     buf[2] = if key.is_some() { 1 } else { 0 }; // IFLAG_SIGNED
     buf[4] = me.sequence;
-    buf[5] = me.system_id;
+    buf[5] = sys8(me.system_id);
     buf[6] = me.component_id;
     buf[7..10].copy_from_slice(&77u32.to_le_bytes()[..3]);
     buf[10..20].copy_from_slice(&payload);
@@ -162,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         match msg {
-            MavMessage::SETUP_SIGNING(s) if s.target_system == me.system_id => {
+            MavMessage::SETUP_SIGNING(s) if u32::from(s.target_system) == me.system_id => {
                 if on(&armed_file) {
                     println!("refused SETUP_SIGNING: armed");
                 } else if on(&ignore_setup_file) {
@@ -190,7 +195,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     key_bytes = Some(s.secret_key);
                 }
             }
-            MavMessage::COMMAND_LONG(c) if c.target_system == me.system_id => {
+            MavMessage::COMMAND_LONG(c) if u32::from(c.target_system) == me.system_id => {
+                // Any sender can put a 32-bit id here; this fake answers 1-byte ids only.
+                let Ok(from_sys) = u8::try_from(hdr.system_id) else {
+                    println!(
+                        "ignored {:?} from 32-bit system id {}",
+                        c.command, hdr.system_id
+                    );
+                    continue;
+                };
                 println!(
                     "accepted {:?} from {}:{} (signed: {has_key})",
                     c.command, hdr.system_id, hdr.component_id
@@ -207,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ..me
                     },
                     c.command as u16,
-                    (hdr.system_id, hdr.component_id),
+                    (from_sys, hdr.component_id),
                     key_bytes,
                     last_ts,
                 );
