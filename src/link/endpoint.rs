@@ -771,7 +771,7 @@ impl PeerLink {
         self.hs_old = None;
         let remote_index = u16::from_be_bytes([payload[0], payload[1]]);
         let session = Session::new(transport, f.local_index, remote_index, true, now);
-        let rekey = self.install_current(session, now, true);
+        let rekey = self.install_current(&sh.cfg, session, now, true);
         out.push(Event::SessionEstablished {
             initiator: true,
             rekey,
@@ -787,7 +787,13 @@ impl PeerLink {
     /// earlier that the peer never confirmed does not push out the older,
     /// working one that is still readable. (When the peer has just proved
     /// itself with a valid packet, the old session always stays readable.)
-    fn install_current(&mut self, session: Session, now: Duration, from_handshake_2: bool) -> bool {
+    fn install_current(
+        &mut self,
+        cfg: &Config,
+        session: Session,
+        now: Duration,
+        from_handshake_2: bool,
+    ) -> bool {
         let rekey = self.current.is_some();
         self.awaiting_since = None;
         self.silent_since = None;
@@ -796,7 +802,7 @@ impl PeerLink {
         // After crossed handshakes the peer sends on the session we made,
         // kept in `previous`; it stays readable rather than our current one,
         // which the peer has stopped using.
-        let peer_uses_previous = self.peer_uses_previous();
+        let peer_uses_previous = self.peer_uses_previous(cfg);
         if let Some(old) = self.current.take()
             && (old.confirmed || self.previous.is_none() || !from_handshake_2)
             && !peer_uses_previous
@@ -809,12 +815,17 @@ impl PeerLink {
 
     /// Crossed handshakes (both sides started one at once): we send on the
     /// session the peer made, and the peer sends on the one we made, which
-    /// is in `previous`. True while the peer's latest packet came on
-    /// `previous`.
-    fn peer_uses_previous(&self) -> bool {
+    /// is in `previous`. True only if the two sessions were made within one
+    /// handshake window (`retry_max`) of each other, and while the peer's
+    /// latest packet came on `previous`. A session we made long before is
+    /// not crossed: a delayed old packet on it must not keep it readable.
+    fn peer_uses_previous(&self, cfg: &Config) -> bool {
         match (&self.current, &self.previous) {
             (Some(c), Some((p, _))) => {
-                !c.initiator && p.initiator && p.last_received > c.last_received
+                !c.initiator
+                    && p.initiator
+                    && c.created.abs_diff(p.created) < cfg.retry_max
+                    && p.last_received > c.last_received
             }
             _ => false,
         }
@@ -913,7 +924,7 @@ impl PeerLink {
             Slot::Pending => {
                 // First valid data on the new session: switch to it.
                 let new = self.pending.take().expect("matched above");
-                let rekey = self.install_current(new, now, false);
+                let rekey = self.install_current(&sh.cfg, new, now, false);
                 out.push(Event::SessionEstablished {
                     initiator: false,
                     rekey,
@@ -953,7 +964,7 @@ impl PeerLink {
         }
         // The grace does not apply while the peer still sends on `previous`
         // after crossed handshakes: it is then the session we receive on.
-        let crossed = self.peer_uses_previous();
+        let crossed = self.peer_uses_previous(&sh.cfg);
         if self.previous.as_ref().is_some_and(|(s, used)| {
             s.expired(now, &sh.cfg)
                 || (!crossed && now.saturating_sub(*used) >= sh.cfg.previous_grace)

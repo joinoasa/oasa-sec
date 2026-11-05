@@ -2247,10 +2247,15 @@ fn config_for_airtime_is_validated_and_contradictions_are_refused() {
             peer_handshake_gap: ok.retry_initial + ms(1),
             ..ok.clone()
         },
-        // no room to retry a rekey before the session dies
+        // no room to retry a rekey, and for the responder's late rekey,
+        // before the session dies
         Config {
             rekey_after: Duration::from_secs(900) - ok.retry_initial + ms(1),
             reject_after: Duration::from_secs(900),
+            ..ok.clone()
+        },
+        Config {
+            rekey_after: ok.reject_after - ok.retry_initial * 4 + ms(1),
             ..ok.clone()
         },
         // a rekey time shorter than a few retries: handshakes all the time
@@ -2546,4 +2551,52 @@ fn a_rekey_from_crossed_sessions_keeps_reading_what_the_peer_sends() {
         delivered(&p.a.handle_packet(t2, &fresh)),
         vec![b"new".to_vec()]
     );
+}
+
+#[test]
+fn the_rekey_margin_must_hold_four_retries_and_with_retry_makes_room() {
+    let c = Config::for_airtime(round_trip());
+    let edge = Config {
+        rekey_after: c.reject_after - c.retry_initial * 4,
+        ..c.clone()
+    };
+    edge.validate().unwrap();
+    // A long round trip raises the reject time instead of being refused.
+    let relay = Config::for_airtime(Duration::from_secs(70));
+    relay.validate().unwrap();
+    assert!(relay.reject_after >= relay.rekey_after + relay.retry_initial * 4);
+}
+
+#[test]
+fn a_delayed_old_packet_does_not_keep_an_old_session_readable() {
+    // Not crossed: a made the session long ago, then b starts a new one (its
+    // late rekey or the stale rule). Someone on the path holds back two of
+    // b's packets on the old session and delivers one after b's first
+    // packet on the new session. The old session must still go after the
+    // normal grace.
+    let cfg = Config {
+        previous_grace: Duration::from_secs(10),
+        keepalive: None,
+        ..Config::default()
+    };
+    let (mut p, t0) = established(cfg);
+    let t1 = t0 + Duration::from_secs(120);
+    let held_1 = p.b.send(t1, b"old 1").unwrap();
+    let held_2 = p.b.send(t1, b"old 2").unwrap();
+    let hs1 = sends(&p.b.start_handshake(t1).unwrap()).remove(0);
+    let hs2 = sends(&p.a.handle_packet(t1, &hs1)).remove(0);
+    let ka = sends(&p.b.handle_packet(t1, &hs2)).remove(0);
+    let ev = p.a.handle_packet(t1, &ka);
+    assert!(ev.contains(&Event::SessionEstablished {
+        initiator: false,
+        rekey: true
+    }));
+    // The held packet arrives late: still inside the grace, so it is read.
+    let t2 = t1 + Duration::from_secs(1);
+    assert_eq!(delivered(&p.a.handle_packet(t2, &held_1)).len(), 1);
+    // After the grace the old session is gone.
+    let t3 = t2 + Duration::from_secs(11);
+    p.a.poll_timers(t3);
+    let ev = p.a.handle_packet(t3, &held_2);
+    assert_eq!(drops(&ev), vec![DropReason::UnknownIndex]);
 }

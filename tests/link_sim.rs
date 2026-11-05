@@ -1208,7 +1208,7 @@ fn a_rebooted_peer_is_noticed_and_the_link_heals() {
 
 #[test]
 fn mismatched_expiry_settings_cost_seconds_and_recover_by_themselves() {
-    // B rejects sessions after 60 s while A would use them for 150 s.
+    // B rejects sessions after 70 s while A would use them for 150 s.
     // Not a supported setup (the spec says to set the same limits on both
     // sides) but it must not wedge.
     let mut a = config(CounterLen::Short);
@@ -1216,7 +1216,7 @@ fn mismatched_expiry_settings_cost_seconds_and_recover_by_themselves() {
     a.reject_after = Duration::from_secs(150);
     let mut b = a.clone();
     b.rekey_after = Duration::from_secs(50);
-    b.reject_after = Duration::from_secs(60);
+    b.reject_after = Duration::from_secs(70);
     let mut sim = Sim::new_with(51, a, b, Channel::clean());
     sim.start();
     sim.run(Duration::from_secs(400), ms(10), ms(100), |_| {});
