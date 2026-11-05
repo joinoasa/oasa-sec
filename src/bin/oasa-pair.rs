@@ -404,8 +404,12 @@ fn drone(o: &Opts) -> R {
     println!("Anyone who sees this code can pair once. Close pairing mode when done.");
 
     let deadline = Instant::now() + window;
-    let attempts = Mutex::new(Attempts::default());
+    let attempts = Mutex::new(Attempts {
+        current: current_key,
+        ..Attempts::default()
+    });
     let mut next_id = 0u64;
+    let mut accept_errors = LogLimit::default();
     std::thread::scope(|scope| {
         while lock(&attempts).result.is_none() && Instant::now() < deadline {
             let (stream, addr) = match listener.accept() {
@@ -415,7 +419,7 @@ fn drone(o: &Opts) -> R {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("Accepting a connection failed: {e}");
+                    accept_errors.log(|n| eprintln!("Accepting a connection failed: {e}{n}"));
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -438,27 +442,33 @@ fn drone(o: &Opts) -> R {
                 cut: false,
             });
             let (attempts, me, name, code, dir) = (&attempts, &me, &name, &code, &dir);
-            let (current_key, key_path) = (current_key.as_ref(), &key_path);
+            let key_path = &key_path;
             scope.spawn(move || {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let r = DeadlineStream::new(stream, FIRST_MESSAGE.min(left))
-                    .map_err(oasa_sec::Error::from)
-                    .and_then(|mut s| {
-                        let budget = s.deadline();
+                // A panic is a failed attempt: it must not undo another's success.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drone_attempt(stream, id, deadline, attempts, |s, accept, budget| {
+                        let (current, generation) = {
+                            let a = lock(attempts);
+                            (a.current.clone(), a.key_generation)
+                        };
                         // Runs once the first message proved the code, before
                         // the drone answers or shares anything.
                         let accept = |ground: &store::Peer| {
                             // A removed key gets nothing: no reply, no signing key.
                             store::check_not_removed(dir, &ground.public)?;
-                            claim(attempts, id)?;
-                            budget.set(
-                                ATTEMPT.min(deadline.saturating_duration_since(Instant::now())),
-                            );
+                            accept(generation)
+                        };
+                        let install = |key: &SigningKey| {
+                            // The autopilot may take a while; the ground station waits.
+                            budget(ATTEMPT);
+                            install_key(o, key, key_path)?;
+                            installed(attempts, key);
                             Ok(())
                         };
-                        let install = |key: &SigningKey| install_key(o, key, key_path);
-                        pair_as_drone_checked(&mut s, me, name, code, current_key, accept, install)
-                    });
+                        pair_as_drone_checked(s, me, name, code, current.as_ref(), accept, install)
+                    })
+                }))
+                .unwrap_or(Err(oasa_sec::Error::Protocol("the attempt crashed")));
                 finish(attempts, id, addr, r);
             });
         }
@@ -495,9 +505,16 @@ fn drone(o: &Opts) -> R {
 
 /// At most this many pairing attempts run at once, each on its own thread.
 const MAX_ATTEMPTS: usize = 8;
-/// The first message (one frame of at most 162 bytes) must arrive within this.
+/// The ground station's first message (one frame of at most 162 bytes) must
+/// arrive within this of connecting.
 const FIRST_MESSAGE: Duration = Duration::from_secs(3);
-/// Once the first message proved the code, the rest of the attempt gets this.
+/// Its reply to the drone's hello must arrive within this. It is a round
+/// trip, so twice the first message's time: the same slow link passes both.
+/// No person or autopilot is waited on here, and a replayed first message
+/// can hold the code no longer than this, once.
+const HELLO_REPLY: Duration = Duration::from_secs(6);
+/// Once the drone starts loading a new key into the autopilot, the rest of
+/// the attempt gets this.
 const ATTEMPT: Duration = Duration::from_secs(15);
 
 /// The drone's pairing attempts in progress. At most one holds the claim (it
@@ -507,6 +524,13 @@ struct Attempts {
     live: Vec<Attempt>,
     claimed: Option<u64>,
     result: Option<oasa_sec::pairing::DroneResult>,
+    /// Ephemeral keys of first messages that proved the code in this window.
+    /// A recorded message 1 decrypts again without the drone's ephemeral, so
+    /// a repeat gets no reply.
+    seen: std::collections::HashSet<[u8; 32]>,
+    /// The autopilot's key as the drone knows it now, and a count of changes.
+    current: Option<SigningKey>,
+    key_generation: u64,
 }
 
 struct Attempt {
@@ -558,9 +582,26 @@ fn make_room(attempts: &Mutex<Attempts>) -> bool {
 }
 
 /// Called when an attempt's first message proved the code: only one attempt
-/// at a time may go on, so one code pairs one ground station.
-fn claim(attempts: &Mutex<Attempts>, id: u64) -> oasa_sec::Result<()> {
+/// at a time may go on, so one code pairs one ground station. `ephemeral`
+/// starts the first message; `generation` is the key count the attempt
+/// started with.
+fn claim(
+    attempts: &Mutex<Attempts>,
+    id: u64,
+    ephemeral: [u8; 32],
+    generation: u64,
+) -> oasa_sec::Result<()> {
     let mut a = lock(attempts);
+    if !a.seen.insert(ephemeral) {
+        return Err(oasa_sec::Error::Protocol(
+            "first message seen before (a replay)",
+        ));
+    }
+    if generation != a.key_generation {
+        // A ground station's attempt failed after the autopilot took a new
+        // key; this attempt still holds the old one. Its ground station retries.
+        return Err(oasa_sec::Error::Protocol("the signing key changed"));
+    }
     if a.claimed.is_some() || a.result.is_some() {
         return Err(oasa_sec::Error::Protocol(
             "another ground station with the code is pairing",
@@ -572,6 +613,102 @@ fn claim(attempts: &Mutex<Attempts>, id: u64) -> oasa_sec::Result<()> {
     }
     a.claimed = Some(id);
     Ok(())
+}
+
+/// The autopilot took `key` and it is saved: later attempts share it.
+fn installed(attempts: &Mutex<Attempts>, key: &SigningKey) {
+    let mut a = lock(attempts);
+    a.current = Some(key.clone());
+    a.key_generation += 1;
+}
+
+/// One attempt's connection: `run` gets the stream, a check to call once the
+/// first message proved the code (it takes the claim and moves the deadline
+/// to the next step), and a way to move the deadline.
+fn drone_attempt<T>(
+    stream: std::net::TcpStream,
+    id: u64,
+    window_end: Instant,
+    attempts: &Mutex<Attempts>,
+    run: impl FnOnce(
+        &mut FirstBytes,
+        &dyn Fn(u64) -> oasa_sec::Result<()>,
+        &dyn Fn(Duration),
+    ) -> oasa_sec::Result<T>,
+) -> oasa_sec::Result<T> {
+    let left = || window_end.saturating_duration_since(Instant::now());
+    let inner = DeadlineStream::new(stream, FIRST_MESSAGE.min(left()))?;
+    let deadline = inner.deadline();
+    let head = std::rc::Rc::new(std::cell::RefCell::new(Vec::with_capacity(34)));
+    let mut s = FirstBytes {
+        inner,
+        head: head.clone(),
+    };
+    let budget = |d: Duration| deadline.set(d.min(left()));
+    let accept = |generation: u64| {
+        // Message 1 starts with the ground station's ephemeral key, in clear.
+        let ephemeral: [u8; 32] = head
+            .borrow()
+            .get(2..34)
+            .and_then(|e| e.try_into().ok())
+            .ok_or(oasa_sec::Error::Protocol("short first message"))?;
+        claim(attempts, id, ephemeral, generation)?;
+        budget(HELLO_REPLY);
+        Ok(())
+    };
+    run(&mut s, &accept, &budget)
+}
+
+/// A stream that keeps the first 34 bytes it reads: the frame length and the
+/// ephemeral key that start message 1.
+struct FirstBytes {
+    inner: DeadlineStream,
+    head: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+}
+
+impl std::io::Read for FirstBytes {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let mut head = self.head.borrow_mut();
+        let room = 34usize.saturating_sub(head.len()).min(n);
+        head.extend_from_slice(&buf[..room]);
+        Ok(n)
+    }
+}
+
+impl std::io::Write for FirstBytes {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Logs at most once a second, and says how many were left out.
+#[derive(Default)]
+struct LogLimit {
+    last: Option<Instant>,
+    skipped: u64,
+}
+
+impl LogLimit {
+    fn log(&mut self, f: impl FnOnce(String)) {
+        if self
+            .last
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            self.skipped += 1;
+            return;
+        }
+        let more = match self.skipped {
+            0 => String::new(),
+            n => format!(" ({n} more not shown)"),
+        };
+        f(more);
+        self.last = Some(Instant::now());
+        self.skipped = 0;
+    }
 }
 
 fn finish(
@@ -687,10 +824,6 @@ fn ground(o: &Opts) -> R {
 /// How long the ground station waits for the drone's first reply before it
 /// tries again with a new connection.
 const REPLY_WAIT: Duration = Duration::from_secs(5);
-/// A drone that reads the first message and closes the connection without a
-/// word this many times is not going to answer: the code is wrong (an old
-/// one) or this device was removed.
-const MAX_SILENT_CLOSES: u32 = 3;
 
 /// Run `pair` over new connections to `addr` until it works, the drone
 /// answers and then fails (never retried), or `wait` runs out. A drone busy
@@ -704,23 +837,15 @@ fn ground_attempts<T>(
     use std::net::ToSocketAddrs;
     let deadline = Instant::now() + wait;
     let mut pause = Duration::from_millis(250);
-    let mut silent = 0;
+    let mut closes = 0;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(format!(
-                "pairing took too long: no answer from the drone in {}s (is it in pairing mode, and is the address right?)",
-                wait.as_secs()
-            )
-            .into());
+            return Err(no_answer(wait, closes).into());
         }
         let mut replied = false;
         let tried = (|| -> oasa_sec::Result<T> {
-            let to = addr
-                .to_socket_addrs()?
-                .next()
-                .ok_or(oasa_sec::Error::Protocol("the address has no IP"))?;
-            let stream = std::net::TcpStream::connect_timeout(&to, left.min(REPLY_WAIT))?;
+            let stream = connect_any(addr.to_socket_addrs()?, left.min(REPLY_WAIT))?;
             let left = deadline.saturating_duration_since(Instant::now());
             let inner = DeadlineStream::new(stream, left.min(REPLY_WAIT))?;
             let mut s = Replied {
@@ -740,25 +865,49 @@ fn ground_attempts<T>(
             Err(oasa_sec::Error::Io(e)) => e,
             Err(e) => return Err(e.into()),
         };
-        // A clean close: the drone read the first message and said nothing,
-        // so it did not accept the code. (A drone that closes a connection
-        // to make room has not read it, which shows as a reset: retried.)
+        // A clean close: a drone that won't answer (wrong code, a removed
+        // device), but also one that closed this attempt to make room or is
+        // busy with another ground station. Only the end can tell.
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            silent += 1;
-            if silent >= MAX_SILENT_CLOSES {
-                return Err(format!(
-                    "the drone closed the connection without answering, {silent} times. \
-                     The code is not this drone's current code (each code works once and \
-                     ends with its pairing window), or the drone removed this device"
-                )
-                .into());
-            }
+            closes += 1;
         }
         eprintln!("No answer from the drone yet ({e}); trying again.");
         std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
         pause = (pause * 2).min(Duration::from_secs(2));
     }
 }
+/// Connect to the first address that answers.
+fn connect_any(
+    addrs: impl Iterator<Item = std::net::SocketAddr>,
+    timeout: Duration,
+) -> std::io::Result<std::net::TcpStream> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "the address has no IP");
+    for to in addrs {
+        match std::net::TcpStream::connect_timeout(&to, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Why the ground station gave up, with the likely causes.
+fn no_answer(wait: Duration, closes: u32) -> String {
+    if closes == 0 {
+        return format!(
+            "pairing took too long: no answer from the drone in {}s (is it in pairing mode, and is the address right?)",
+            wait.as_secs()
+        );
+    }
+    format!(
+        "no answer from the drone in {}s: it closed the connection without answering \
+         ({closes} times). Likely causes: the code is not this drone's current code (each \
+         code works once and ends with its pairing window); the drone is busy with other \
+         connections; or the drone removed this device",
+        wait.as_secs()
+    )
+}
+
 /// The ground station's side of one connection. Until the drone's first
 /// byte arrives the deadline is short (`REPLY_WAIT`); after it, the deadline
 /// is the whole pairing's.
