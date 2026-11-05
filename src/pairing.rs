@@ -22,6 +22,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -254,7 +255,24 @@ pub fn pair_as_drone_checked<S: Read + Write>(
 /// can't hold pairing mode open by sending one byte at a time.
 pub struct DeadlineStream {
     inner: TcpStream,
-    deadline: Instant,
+    deadline: Deadline,
+}
+
+/// A handle on a [`DeadlineStream`]'s deadline. The drone starts an attempt
+/// with a short deadline for the first message and moves it with this once
+/// the message proves the sender holds the code.
+#[derive(Clone)]
+pub struct Deadline(Arc<Mutex<Instant>>);
+
+impl Deadline {
+    /// The deadline becomes `budget` from now (earlier or later than before).
+    pub fn set(&self, budget: Duration) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now() + budget;
+    }
+
+    fn get(&self) -> Instant {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl DeadlineStream {
@@ -263,12 +281,20 @@ impl DeadlineStream {
         inner.set_nodelay(true)?;
         Ok(Self {
             inner,
-            deadline: Instant::now() + budget,
+            deadline: Deadline(Arc::new(Mutex::new(Instant::now() + budget))),
         })
     }
 
+    /// A handle that moves this stream's deadline.
+    pub fn deadline(&self) -> Deadline {
+        self.deadline.clone()
+    }
+
     fn remaining(&self) -> io::Result<Duration> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
+        let left = self
+            .deadline
+            .get()
+            .saturating_duration_since(Instant::now());
         if left.is_zero() {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -601,6 +627,26 @@ mod tests {
         }
         assert!(t.join().unwrap().is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_moved_deadline_applies_to_the_next_read() {
+        let (mut g, d) = connected_pair();
+        let mut d = DeadlineStream::new(d, Duration::from_millis(100)).unwrap();
+        d.deadline().set(Duration::from_secs(5));
+        let t = thread::spawn(move || {
+            let mut b = [0u8; 1];
+            d.read_exact(&mut b).map(|_| b[0])
+        });
+        thread::sleep(Duration::from_millis(300)); // past the first deadline
+        g.write_all(&[7]).unwrap();
+        assert_eq!(t.join().unwrap().unwrap(), 7);
+
+        let (_g, d) = connected_pair();
+        let mut d = DeadlineStream::new(d, Duration::from_secs(5)).unwrap();
+        d.deadline().set(Duration::ZERO);
+        let e = d.read(&mut [0u8; 1]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

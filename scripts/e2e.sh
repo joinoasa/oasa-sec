@@ -92,7 +92,7 @@ body[65:] = hashlib.blake2s(b"OASA-SEC v0 code checksum" + bytes(body[:65])).dig
 print("OASA1-" + base64.b32encode(bytes(body)).decode().rstrip("="))
 PY
 )
-echo "$FAKE" | $B/oasa-pair ground --dir "$T/attacker" --name evil --connect 127.0.0.1:7400 --code - >/dev/null 2>&1 \
+echo "$FAKE" | $B/oasa-pair ground --dir "$T/attacker" --name evil --connect 127.0.0.1:7400 --code - --wait 3 >/dev/null 2>&1 \
   && fail "attacker without the secret was able to pair"
 wait_for 10 "Pairing attempt failed: encryption or authentication failed" "$T/drone.log" \
   || fail "drone did not reject the attacker for the right reason"

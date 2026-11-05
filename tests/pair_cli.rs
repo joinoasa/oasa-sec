@@ -514,3 +514,379 @@ fn a_second_signer_on_one_folder_is_refused() {
     again.kill().unwrap();
     again.wait().unwrap();
 }
+
+// --- Pairing under attack (review finding M1) -------------------------------
+
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Start `oasa-pair drone` on a free port; return it, its address and its code.
+fn start_drone(d: &Path) -> (std::process::Child, String, String) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let addr = format!("127.0.0.1:{}", free_port());
+    let mut c = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+        .args(["drone", "--dir", s(d), "--name", "drone-1"])
+        .args(["--listen", &addr, "--wait", "60"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    watchdog(c.id());
+    let mut out = BufReader::new(c.stdout.take().unwrap());
+    let code = loop {
+        let mut line = String::new();
+        assert!(
+            out.read_line(&mut line).unwrap() > 0,
+            "drone showed no code"
+        );
+        if line.starts_with("OASA1-") {
+            break line.trim().to_string();
+        }
+    };
+    // Keep reading so the drone never blocks on a full pipe.
+    std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
+    let mut err = c.stderr.take().unwrap();
+    std::thread::spawn(move || std::io::copy(&mut err, &mut std::io::sink()));
+    (c, addr, code)
+}
+
+fn run_ground(d: &Path, addr: &str, code: &str, extra: &[&str]) -> (Output, Duration) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let start = Instant::now();
+    let mut g = Command::new(env!("CARGO_BIN_EXE_oasa-pair"))
+        .args([
+            "ground",
+            "--dir",
+            s(d),
+            "--name",
+            "gcs-1",
+            "--connect",
+            addr,
+        ])
+        .args(["--code", "-"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    watchdog(g.id());
+    writeln!(g.stdin.take().unwrap(), "{code}").unwrap();
+    let o = g.wait_with_output().unwrap();
+    (o, start.elapsed())
+}
+
+/// An attacker with no code keeps `n` connections open to the pairing port and
+/// opens a new one shortly after the drone closes one. `trickle` sends a frame
+/// header and then one byte every 200 ms; otherwise the connection stays idle.
+fn jam(addr: &str, n: usize, trickle: bool) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    for _ in 0..n {
+        let (addr, stop) = (addr.to_string(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(mut c) = TcpStream::connect(&addr) {
+                    hold(&mut c, &stop, trickle);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
+    // Let the attacker's connections get there first.
+    std::thread::sleep(Duration::from_millis(500));
+    stop
+}
+
+fn hold(c: &mut TcpStream, stop: &AtomicBool, trickle: bool) {
+    use std::io::{Read, Write};
+    c.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    if trickle && c.write_all(&[0x00, 0x90]).is_err() {
+        return;
+    }
+    let mut b = [0u8; 64];
+    while !stop.load(Ordering::Relaxed) {
+        match c.read(&mut b) {
+            Ok(0) => return, // the drone closed it
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return,
+        }
+        if trickle && c.write_all(&[0x41]).is_err() {
+            return;
+        }
+    }
+}
+
+fn pairs_despite(tag: &str, n: usize, trickle: bool) {
+    let (dd, gd) = (tempdir(&format!("{tag}-d")), tempdir(&format!("{tag}-g")));
+    let (mut drone, addr, code) = start_drone(&dd);
+    let stop = jam(&addr, n, trickle);
+    let (o, took) = run_ground(&gd, &addr, &code, &[]);
+    stop.store(true, Ordering::Relaxed);
+    let (out, e) = (
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr),
+    );
+    assert!(o.status.success(), "ground failed after {took:?}: {e}");
+    assert!(out.contains("Paired with drone drone-1"), "{out}");
+    assert!(took < Duration::from_secs(10), "pairing took {took:?}");
+    assert!(drone.wait().unwrap().success(), "the drone did not finish");
+    let peers = ok(&["peers", "--dir", s(&dd)]);
+    assert_eq!(peers.lines().count(), 1, "{peers}");
+    assert!(
+        peers.contains("gcs-1") && peers.contains("operator"),
+        "{peers}"
+    );
+}
+
+#[test]
+fn idle_connections_cannot_jam_pairing() {
+    pairs_despite("jam-idle", 12, false);
+}
+
+#[test]
+fn slow_senders_cannot_jam_pairing() {
+    pairs_despite("jam-slow", 12, true);
+}
+
+/// Two ground stations with the right code at once: exactly one pairs, the
+/// code is used once, and the drone saves exactly one ground station.
+#[test]
+fn one_code_pairs_once_even_in_parallel() {
+    let dd = tempdir("par-d");
+    let (mut drone, addr, code) = start_drone(&dd);
+    let runs: Vec<_> = (0..3)
+        .map(|i| {
+            let (addr, code) = (addr.clone(), code.clone());
+            std::thread::spawn(move || {
+                let gd = tempdir(&format!("par-g{i}"));
+                let (o, _) = run_ground(&gd, &addr, &code, &["--wait", "5"]);
+                (o.status.success(), gd)
+            })
+        })
+        .collect();
+    let results: Vec<_> = runs.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|(won, _)| *won).count(), 1);
+    assert!(drone.wait().unwrap().success());
+    assert_eq!(ok(&["peers", "--dir", s(&dd)]).lines().count(), 1);
+    for (won, gd) in &results {
+        // Only the winner saved a key for the drone.
+        let keys = std::fs::read_dir(gd.join("signing-keys")).map_or(0, |r| r.count());
+        assert_eq!(keys, usize::from(*won));
+    }
+}
+
+/// A ground station with a code for this drone but the wrong secret gets no
+/// reply, gives up at its --wait with the likely causes, and doesn't end the
+/// drone's window.
+#[test]
+fn a_wrong_code_gets_no_reply_and_gives_up_quickly() {
+    let (dd, gd) = (tempdir("wrong-d"), tempdir("wrong-g"));
+    ok(&["init", "--dir", s(&dd), "--name", "drone-1"]);
+    let (mut drone, addr, code) = start_drone(&dd);
+    let drone_pub = oasa_sec::code::PairingCode::decode(&code)
+        .unwrap()
+        .responder_public;
+    let fake = oasa_sec::code::PairingCode::new(drone_pub)
+        .unwrap()
+        .encode();
+    let (o, took) = run_ground(&gd, &addr, &fake, &["--wait", "3"]);
+    assert!(!o.status.success());
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        e.contains("without answering") && e.contains("Likely causes"),
+        "{e}"
+    );
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    let (o, _) = run_ground(&gd, &addr, &code, &[]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(drone.wait().unwrap().success());
+}
+
+/// A man in the middle that forwards connections to the drone, each chunk
+/// arriving `delay` after it was sent (a slow link). With `capture`, it first takes the
+/// ground station's first message 1 and closes that connection (so the drone
+/// never sees it) and hands it out. Returns its address and the capture.
+fn mitm(
+    drone: &str,
+    delay: Duration,
+    capture: bool,
+) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let drone = drone.to_string();
+    std::thread::spawn(move || {
+        if capture {
+            let (mut first, _) = l.accept().unwrap();
+            let mut len = [0u8; 2];
+            first.read_exact(&mut len).unwrap();
+            let mut m = vec![0u8; u16::from_be_bytes(len) as usize];
+            first.read_exact(&mut m).unwrap();
+            drop(first);
+            tx.send([&len[..], &m].concat()).unwrap();
+        }
+        for c in l.incoming() {
+            let (Ok(a), Ok(b)) = (c, TcpStream::connect(&drone)) else {
+                continue;
+            };
+            for (mut from, mut to) in [(a.try_clone().unwrap(), b.try_clone().unwrap()), (b, a)] {
+                // Each chunk arrives `delay` after it was sent (latency).
+                let (tx, rx) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n @ 1..) = from.read(&mut buf) {
+                        tx.send((Instant::now() + delay, buf[..n].to_vec()))
+                            .unwrap();
+                    }
+                    tx.send((Instant::now() + delay, Vec::new())).unwrap();
+                });
+                std::thread::spawn(move || {
+                    for (at, data) in rx {
+                        std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                        if data.is_empty() || to.write_all(&data).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        }
+    });
+    (addr, rx)
+}
+
+/// Send a recorded message 1 to the drone. With `hold`, keep the connection
+/// until the drone closes it. Returns how many bytes the drone sent back.
+fn replay(drone: &str, msg1: &[u8], hold: bool) -> usize {
+    use std::io::{Read, Write};
+    let Ok(mut c) = TcpStream::connect(drone) else {
+        return 0;
+    };
+    c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    if c.write_all(msg1).is_err() {
+        return 0;
+    }
+    let mut got = 0;
+    let mut b = [0u8; 256];
+    while let Ok(n) = c.read(&mut b) {
+        if n == 0 {
+            break;
+        }
+        got += n;
+        if !hold {
+            break;
+        }
+    }
+    got
+}
+
+/// A recorded message 1 gets at most one reply in a pairing window: the
+/// drone remembers its ephemeral key. The real ground station still pairs.
+#[test]
+fn a_replayed_first_message_gets_one_reply_at_most() {
+    let (dd, gd) = (tempdir("rep1-d"), tempdir("rep1-g"));
+    let (mut drone, addr, code) = start_drone(&dd);
+    let (proxy, captured) = mitm(&addr, Duration::ZERO, true);
+    let ground = std::thread::spawn(move || run_ground(&gd, &proxy, &code, &[]));
+    let msg1 = captured.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(
+        replay(&addr, &msg1, false) > 0,
+        "the first copy proves the code"
+    );
+    assert_eq!(replay(&addr, &msg1, false), 0, "a repeat must get no reply");
+    let (o, took) = ground.join().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(took < Duration::from_secs(10), "pairing took {took:?}");
+    assert!(drone.wait().unwrap().success());
+    assert_eq!(ok(&["peers", "--dir", s(&dd)]).lines().count(), 1);
+}
+
+/// An attacker keeps replaying a recorded message 1 and holding the
+/// connection: it can't hold pairing, and the ground station still pairs.
+#[test]
+fn a_replayed_first_message_cannot_hold_pairing() {
+    let (dd, gd) = (tempdir("rep2-d"), tempdir("rep2-g"));
+    let (mut drone, addr, code) = start_drone(&dd);
+    let (proxy, captured) = mitm(&addr, Duration::ZERO, true);
+    let ground = std::thread::spawn(move || run_ground(&gd, &proxy, &code, &[]));
+    let msg1 = captured.recv_timeout(Duration::from_secs(10)).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let replayer = {
+        let (stop, addr) = (stop.clone(), addr.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                replay(&addr, &msg1, true);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    let (o, took) = ground.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(took < Duration::from_secs(12), "pairing took {took:?}");
+    assert!(drone.wait().unwrap().success());
+    replayer.join().unwrap();
+}
+
+/// A flood of new connections closes a slow ground station's attempts to make
+/// room. That looks like a drone that won't answer, so the ground station
+/// must keep trying until --wait, and pair once the flood stops.
+#[test]
+fn being_closed_to_make_room_does_not_make_the_ground_station_give_up() {
+    let (dd, gd) = (tempdir("flood-d"), tempdir("flood-g"));
+    let (mut drone, addr, code) = start_drone(&dd);
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood: Vec<_> = (0..8)
+        .map(|_| {
+            let (stop, addr) = (stop.clone(), addr.clone());
+            std::thread::spawn(move || {
+                // Open connections as fast as possible; keep each for 1 s.
+                let mut open = std::collections::VecDeque::new();
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(c) = TcpStream::connect(&addr) {
+                        open.push_back((Instant::now(), c));
+                    }
+                    while open
+                        .front()
+                        .is_some_and(|(t, _)| t.elapsed() > Duration::from_secs(1))
+                    {
+                        open.pop_front();
+                    }
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    // Over a slow link the drone closes an attempt before message 1 is
+    // there, so the ground station sees a clean close.
+    let (slow, _) = mitm(&addr, Duration::from_secs(1), false);
+    let ground = std::thread::spawn(move || run_ground(&gd, &slow, &code, &[]));
+    std::thread::sleep(Duration::from_secs(4));
+    stop.store(true, Ordering::Relaxed);
+    for t in flood {
+        t.join().unwrap();
+    }
+    let (o, took) = ground.join().unwrap();
+    assert!(
+        o.status.success(),
+        "after {took:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(drone.wait().unwrap().success());
+}
