@@ -23,7 +23,17 @@ When a drone enters pairing mode it makes a **new one-time code**:
 
 Text form: `OASA1-` + uppercase base32 without padding (117 characters). Every character is in the QR "alphanumeric" set, so the QR stays small. Readers accept lowercase, spaces and dashes so a person can type it in chunks.
 
-The code is shown as a QR code on the drone's screen or companion app, or passed over USB. **Anyone who sees it can pair once.** The code is thrown away after one successful pairing or when the pairing window closes (5 minutes by default). Failed attempts don't end the window: they can't guess a 256-bit secret, so a lockout would only let a stranger shut pairing down. Each attempt is limited to 15 seconds in total and each message to its real size, so a slow or oversized sender can't hold the drone.
+The code is shown as a QR code on the drone's screen or companion app, or passed over USB. **Anyone who sees it can pair once.** The code is thrown away after one successful pairing or when the pairing window closes (5 minutes by default). Failed attempts don't end the window: they can't guess a 256-bit secret, so a lockout or a pause between attempts would only let a stranger slow pairing down. So there is none.
+
+**Nobody can hold the port.** Anyone who can reach the drone's pairing port can connect, so the drone never waits on one connection:
+
+- It runs up to 8 attempts at once, each on its own thread. When all 8 are busy, a new connection closes the oldest one that hasn't proved the code yet. A ground station sends its first message as soon as it connects, so it is never the oldest for long.
+- The first message (one frame, at most 162 bytes) must arrive within 3 s of connecting. That is enough on any link pairing runs over today (Wi-Fi, Ethernet, USB networking); pairing over a slow radio would need a longer wait (section 8).
+- Each message is limited to its real size.
+- Once the first message proves the code, the attempt holds the code: it gets up to 15 s more to finish, and any other attempt that proves the code meanwhile is closed with no reply. If the holder fails, the code is free again. The first success ends every other attempt, and the code is then thrown away, so one code pairs one ground station. The trust file is written once, after that, under the folder's lock.
+- The ground station retries with a new connection (pauses from 0.25 s up to 2 s) until it pairs or 30 s pass (`--wait`). It waits 5 s for the drone's first reply. A drone that reads the first message and closes the connection without a word 3 times is taken to mean a wrong (old) code, or a removed device; a failure after the drone has answered is never retried.
+
+Idle or slow connections therefore can't block pairing. Opening many new connections a second, from many addresses, can still delay it, like jamming the radio itself.
 
 The ground station reads the code from a scan, a file or standard input, never from the command line, where other users could see it. People can pass the fingerprint printed on the drone with `--expect-drone` so a swapped QR code is caught.
 
