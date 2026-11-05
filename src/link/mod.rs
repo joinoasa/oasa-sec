@@ -172,8 +172,12 @@ impl Config {
         {
             return bad("rekey_after must be at least 4 times retry_initial");
         }
-        if self.reject_after.saturating_sub(self.rekey_after) < self.retry_initial {
-            return bad("reject_after must be at least retry_initial above rekey_after");
+        // Room for the initiator's rekey and its retries, then for the
+        // responder's late rekey (spec section 5): `oasa-link` raises the
+        // reject time to this for you.
+        if self.reject_after.saturating_sub(self.rekey_after) < self.retry_initial.saturating_mul(4)
+        {
+            return bad("reject_after must be at least 4 times retry_initial above rekey_after");
         }
         // Time arithmetic never overflows if every setting stays under ten years.
         let cap = Duration::from_secs(10 * 365 * 86_400);

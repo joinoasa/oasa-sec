@@ -23,6 +23,12 @@ pub(crate) struct Session {
     /// second line of defence.
     pub confirmed: bool,
     pub created: Duration,
+    /// A session the peer made (we answered its handshake): when we start a
+    /// handshake ourselves if the peer has not rekeyed it (spec section 5).
+    /// Never for a session we made.
+    pub late_rekey_at: Option<Duration>,
+    /// When the last valid packet arrived on it (zero: none yet).
+    pub last_received: Duration,
     transport: StatelessTransportState,
     send_counter: u64,
     recv: ReplayWindow,
@@ -45,6 +51,8 @@ impl Session {
             initiator,
             confirmed: false,
             created: now,
+            late_rekey_at: None,
+            last_received: Duration::ZERO,
             transport,
             send_counter: 0,
             recv: ReplayWindow::new(),
@@ -134,6 +142,7 @@ impl Session {
             return Err(DropReason::Replay);
         }
         self.packets_received += 1;
+        self.last_received = now;
         Ok(out)
     }
 }

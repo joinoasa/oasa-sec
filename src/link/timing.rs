@@ -159,9 +159,11 @@ impl Config {
     ///   peer on default timers or slower is never rate limited by it.
     /// - `keepalive` is off when the round trip is over 2 s (the spec's "off
     ///   by default on slow radios"); the stale rule still heals a dead session.
-    /// - Left alone: `handshakes_per_second` (a slow radio never reaches it),
-    ///   `rekey_after` and `reject_after` (set per radio by the operator; the
-    ///   margin between them is checked by [`Config::validate`]).
+    /// - `reject_after` = at least `rekey_after` + 4 x `retry_initial`: room
+    ///   for the rekey, its retries and the responder's late rekey.
+    /// - Left alone: `handshakes_per_second` (a slow radio never reaches it)
+    ///   and `rekey_after` (set per radio by the operator; a rekey time under
+    ///   4 retries is refused by [`Config::validate`]).
     ///
     /// The round trip is clamped to a day so the arithmetic cannot overflow;
     /// the retry is always longer than the round trip.
@@ -188,14 +190,16 @@ impl Config {
     }
 
     /// Set the first handshake retry delay and raise the timers that depend
-    /// on it: `retry_max` and `stale_after` to at least 4 x `retry`. Never
-    /// lowers `retry_max` or `stale_after`.
+    /// on it: `retry_max` and `stale_after` to at least 4 x `retry`, and
+    /// `reject_after` to at least `rekey_after` + 4 x `retry`. Never lowers
+    /// any of them. Set `rekey_after` first if you change it.
     pub fn with_retry(mut self, retry: Duration) -> Self {
         let retry = retry.min(MAX_ROUND_TRIP * 2);
         self.retry_initial = retry;
         let four = retry * 4;
         self.retry_max = self.retry_max.max(four);
         self.stale_after = self.stale_after.max(four);
+        self.reject_after = self.reject_after.max(self.rekey_after.saturating_add(four));
         self
     }
 }
