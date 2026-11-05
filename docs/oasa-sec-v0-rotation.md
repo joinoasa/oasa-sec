@@ -99,7 +99,7 @@ A drone's autopilot has one MAVLink signing key, shared with its operators. Each
 
 ### Who does what
 
-- `oasa-pair signer --autopilot …` runs on the drone and **owns a dedicated link to the autopilot** (its own serial port or UDP port, never a router endpoint, so `SETUP_SIGNING` never reaches routers or logs). It watches arming state, runs rotations, and probes. The port must be on the companion's link to the autopilot only: nothing else should be able to reach it.
+- `oasa-pair signer --autopilot …` runs on the drone and **owns a dedicated link to the autopilot** (its own `udpout:` or `tcpout:` link, never a router endpoint; serial is not supported yet and needs a serial-to-UDP bridge, so `SETUP_SIGNING` never reaches routers or logs). It watches arming state, runs rotations, and probes. The port must be on the companion's link to the autopilot only: nothing else should be able to reach it.
 - A rotation is requested by writing `rotation-pending` (under the lock): by `oasa-pair remove`/`rotate-signing`, by `oasa-pair trust` when it changes an operator's role to anything else, or by an `oasa-link` that applied an admin's removal of an operator.
 - Only one `oasa-pair signer` runs per folder (`.signer.lock`); a second one refuses to start.
 - Each drone-side `oasa-link` process sends `SIGNING_KEY_NEXT` and `SIGNING_KEY_COMMIT` to its own operator from the key files, remembering the generation each operator acked (`signing-acked/<fingerprint>`).
