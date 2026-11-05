@@ -41,7 +41,7 @@ $B/oasa-link --dir /tmp/gcs --peer drone --bind 127.0.0.1:7002 --remote 127.0.0.
 echo hello | nc -u -q1 127.0.0.1 7021
 ```
 
-Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line. It watches the trust files and reloads within a second (or at once on SIGHUP), so `oasa-pair trust`, `remove` and `revoke` need no restart; if its own peer is removed it exits with code 3. `--plain-listen` must be a loopback address unless you pass `--allow-remote-plain`. If a peer's clock was wrong and its handshakes are now refused as stale, fix the clock and run `oasa-pair reset-stamp --dir DIR --peer NAME`. Set the same rekey limits on both sides. Give `--remote` whenever you know the peer's address: a device without it cannot start a handshake itself. Use `--trusted-clock` only on a device whose clock is set before it starts.
+Over a pair (`oasa-pair drone` and `ground`) the peers trust each other already, so `trust` is only for devices with nothing to pair with, like relays and test nodes. `oasa-link --help` lists every option; on exit (Ctrl-C, SIGTERM or `--duration`) it prints a stats line. It watches the trust files and reloads within a second (or at once on SIGHUP), so `oasa-pair trust`, `remove` and `revoke` need no restart; if its own peer is removed it exits with code 3. `--plain-listen` must be a loopback address unless you pass `--allow-remote-plain`. If a peer's clock was wrong and its handshakes are now refused as stale, fix the clock and run `oasa-pair reset-stamp --dir DIR --peer NAME`. Set the same rekey limits on both sides. On a slow radio give both sides the same `--radio-profile` (`lora-sf12-bw125`, `lora-sf9-bw125`, `lora-sf7-bw125`, `sik-64k`, `sik-64k-ecc`, `mlrs-19hz`, `mlrs-31hz`, `mlrs-50hz`, `wifi-wfb`: the [oasa-lab](https://github.com/joinoasa/oasa-lab) names) or `--handshake-rtt-ms N`: the default 5 s handshake retry is shorter than the 7.1 s a handshake takes on LoRa SF12, so it would resend before the answer arrives. The profile scales the retry, stale, grace and handshake-gap timers and turns keepalives off on slow radios; `--retry-secs N` sets the retry by hand. See section 5 of the link doc. Give `--remote` whenever you know the peer's address: a device without it cannot start a handshake itself. Use `--trusted-clock` only on a device whose clock is set before it starts.
 
 On a drone (a device folder with `mavlink-signing-key.bin`) `oasa-link` also runs a **MAVLink guard** on what comes out of the link. It is an **allowlist**: only whole, CRC-valid frames of the right length, for the messages and commands a ground station needs to monitor and fly, get through (the tables are in section 7 of the link doc). Parameter writes, FTP, `SETUP_SIGNING`, geofence and rally changes, RTK data, reboot, calibration and storage commands and every other message are dropped. `--allow-param NAME`, `--allow-mavlink-ftp`, `--allow-fence-rally`, `--allow-rtk`, `--allow-msg ID` and `--allow-command ID` widen it and each logs a warning; `--no-mavlink-guard` turns it off.
 
@@ -55,7 +55,7 @@ pip install pymavlink
 scripts/e2e.sh
 ```
 
-That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 14 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved (with a message naming the likely causes), and `command` keeps trying when the autopilot answers late.
+That runs a stand-in autopilot, a drone, two ground stations, an attacker and pymavlink, and checks 19 things, including: the attacker is rejected by the handshake, the code is never taken on the command line, signed commands work, unsigned and wrong-key commands are ignored, our signatures interoperate with pymavlink both ways, a second ground station doesn't lock out the first, and a key the autopilot didn't take is never saved (with a message naming the likely causes), and `command` keeps trying when the autopilot answers late.
 
 By hand:
 
@@ -111,5 +111,11 @@ Generations (`mavlink-signing-gen`) are never reused. Details and what was check
 - R-COM2: radio adapters in [oasa-radio](https://github.com/joinoasa/oasa-radio) plug in where `oasa-link` uses UDP; handshakes for radios under 128 bytes; DoS cookies; group keys.
 - R-SEC2: a serial autopilot link for the signer (UDP and TCP now), and rekeying other MAVLink signers on the drone (a gimbal, a second computer).
 - Independent review.
+
+## Docs
+
+- [Pairing guide](docs/guide-pairing.md): set up, pair, remove, rotate (R-SEC1)
+- [Training](docs/training-r-sec1.md): a 1 to 2 hour course on a laptop
+- [Release record](docs/release-r-sec1.md): test results and security review status
 
 Licensed under [Apache-2.0](LICENSE).

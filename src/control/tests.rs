@@ -727,7 +727,14 @@ fn an_unacked_commit_starts_over_with_next_and_retries_back_off() {
             restarted |= matches!(parsed(&m), Message::SigningKeyNext { .. });
         }
     }
-    assert_eq!(&gaps[..3], &[2u64, 4, 8][..], "{gaps:?}");
+    // Each wait is the nominal one spread by up to 20% (whole seconds here).
+    for (g, nominal) in gaps.iter().zip([2.0f64, 4.0, 8.0]) {
+        let g = *g as f64;
+        assert!(
+            g >= nominal * 0.8 - 1.0 && g <= nominal * 1.2 + 1.0,
+            "{gaps:?}"
+        );
+    }
     assert!(
         restarted,
         "after four resends it sends NEXT again, then the commit follows its ack"
@@ -906,7 +913,16 @@ fn an_unanswered_message_is_resent_after_2_s_doubling_to_60_s_for_the_whole_sess
         gaps.push(next - t);
         t = next;
     }
-    assert_eq!(gaps, vec![2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60, 60]);
+    // Each wait is the nominal one spread by up to 20%.
+    let nominal = [
+        2.0f64, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0,
+    ];
+    for (g, n) in gaps.iter().zip(nominal) {
+        let g = *g as f64;
+        assert!(g >= n * 0.8 - 1.0 && g <= n * 1.2 + 1.0, "{gaps:?}");
+    }
+    assert_eq!(gaps.len(), 12);
+    assert!(gaps.iter().any(|g| *g != 2 && *g != 4), "{gaps:?}");
 }
 
 #[test]
@@ -1323,4 +1339,82 @@ fn a_session_may_add_only_so_many_new_removals_and_the_rest_are_refused_not_acke
     let out = c2.handle(secs(1), 10, &entry_bytes(4, over, key(over)));
     assert_eq!(sends(&out).len(), 1);
     assert!(is_removed(&dir, &key(over)));
+}
+
+// ---- a slow radio (LoRa SF12) -------------------------------------------------
+
+/// Run an admin and a device over a delayed channel: every message takes its
+/// SF12 airtime (the link adds 22 bytes and the content type byte). Returns
+/// how many times the admin and the device sent each message, and whether
+/// the device applied all the removals.
+fn slow_sync(admin_retry: Option<(Duration, Duration)>) -> (usize, usize, bool) {
+    use crate::link::lora_airtime;
+    let (admin, device) = fleet(3);
+    let mut a = control(&admin, ADMIN, DEVICE, 1);
+    let mut d = control(&device, DEVICE, ADMIN, 2);
+    if let Some((i, m)) = admin_retry {
+        a = a.with_retry(i, m);
+        d = d.with_retry(i, m);
+    }
+    // (arrives at, to the device?, bytes)
+    let mut air: Vec<(Duration, bool, Vec<u8>)> = Vec::new();
+    let mut sent: Vec<Vec<u8>> = Vec::new();
+    let mut now = Duration::ZERO;
+    let mut tx = |air: &mut Vec<_>, now: Duration, to_device: bool, acts: Vec<Action>| {
+        for m in sends(&acts) {
+            sent.push(m.clone());
+            air.push((now + lora_airtime(m.len() + 23, 12), to_device, m));
+        }
+    };
+    let first = a.session_started(now);
+    tx(&mut air, now, true, first);
+    while now < secs(120) {
+        now += Duration::from_millis(50);
+        let acts = a.poll(now);
+        tx(&mut air, now, true, acts);
+        let acts = d.poll(now);
+        tx(&mut air, now, false, acts);
+        let (due, rest): (Vec<_>, Vec<_>) = air.drain(..).partition(|(t, _, _)| *t <= now);
+        air = rest;
+        for (_, to_device, bytes) in due {
+            if to_device {
+                let acts = d.handle(now, 1000, &bytes);
+                tx(&mut air, now, false, acts);
+            } else {
+                let acts = a.handle(now, 1000, &bytes);
+                tx(&mut air, now, true, acts);
+            }
+        }
+    }
+    let distinct: BTreeSet<&Vec<u8>> = sent.iter().collect();
+    let all = (0..3).all(|i| is_removed(&device, &[51 + i as u8; 32]));
+    (sent.len(), distinct.len(), all)
+}
+
+#[test]
+fn control_messages_on_sf12_are_not_resent_before_their_ack_can_arrive() {
+    use crate::link::Config;
+    // Scaled from the link: the first resend waits 10 s or more (the message
+    // and its ack take about 6 s), so every message is sent exactly once.
+    let cfg = Config::for_airtime(Duration::from_millis(7_062));
+    let (total, distinct, all) = slow_sync(Some((cfg.retry_initial, cfg.retry_max)));
+    assert!(all, "the removals did not all arrive");
+    assert_eq!(total, distinct, "a message was sent twice");
+    // With the fast-link 2 s retry the same exchange sends duplicates.
+    let (total, distinct, all) = slow_sync(None);
+    assert!(all);
+    assert!(total > distinct, "{total} sent, {distinct} different");
+}
+
+#[test]
+fn control_retry_settings_never_go_below_the_default_and_stay_jittered() {
+    let dir = tempdir("ctl-retry");
+    trust(&dir, ADMIN, "admin", Role::Admin);
+    let c = control(&dir, DEVICE, ADMIN, 1).with_retry(secs(0), secs(0));
+    assert_eq!(
+        (c.retry_initial, c.retry_max),
+        (RETRY_INITIAL, RETRY_INITIAL)
+    );
+    let c = control(&dir, DEVICE, ADMIN, 1).with_retry(secs(12), secs(60));
+    assert_eq!((c.retry_initial, c.retry_max), (secs(12), secs(60)));
 }

@@ -15,6 +15,10 @@ docs = [
   "docs/oasa-sec-v0-pairing.md",
   "docs/oasa-sec-v0-link.md",
   "docs/oasa-sec-v0-rotation.md",
+  "docs/oasa-sec-v0-group.md",
+  "docs/guide-pairing.md",
+  "docs/training-r-sec1.md",
+  "docs/release-r-sec1.md",
 ]
 
 [review]

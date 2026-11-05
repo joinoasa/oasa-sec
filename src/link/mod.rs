@@ -28,6 +28,7 @@ mod source;
 mod stamp;
 #[cfg(test)]
 mod tests;
+mod timing;
 
 use std::fmt;
 use std::time::Duration;
@@ -47,6 +48,9 @@ pub use source::{SourceLimiter, looks_like_handshake1};
 pub use stamp::{
     FileTimestampStore, MemoryTimestampStore, StoredStamps, Timestamp, TimestampStore,
 };
+#[cfg(test)]
+pub(crate) use timing::lora_airtime;
+pub use timing::{RadioProfile, jittered};
 
 /// The Noise protocol used for the link.
 pub const LINK_NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -153,6 +157,23 @@ impl Config {
         }
         if self.stale_after.is_zero() {
             return bad("stale_after must be above zero");
+        }
+        // Timers that must fit together on a slow radio (spec section 5).
+        if self.stale_after < self.retry_initial.saturating_mul(2) {
+            return bad("stale_after must be at least twice retry_initial");
+        }
+        if self.peer_handshake_gap > self.retry_initial {
+            return bad("peer_handshake_gap must not be above retry_initial");
+        }
+        // A slow retry with a short rekey time would be rekeying all the time.
+        // (Fast timers keep any rekey time: short ones are used in tests.)
+        if self.retry_initial > Config::default().retry_initial
+            && self.rekey_after < self.retry_initial.saturating_mul(4)
+        {
+            return bad("rekey_after must be at least 4 times retry_initial");
+        }
+        if self.reject_after.saturating_sub(self.rekey_after) < self.retry_initial {
+            return bad("reject_after must be at least retry_initial above rekey_after");
         }
         // Time arithmetic never overflows if every setting stays under ten years.
         let cap = Duration::from_secs(10 * 365 * 86_400);

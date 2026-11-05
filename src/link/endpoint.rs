@@ -32,6 +32,7 @@ use zeroize::Zeroizing;
 use super::packet::{self, CounterLen, Packet};
 use super::session::Session;
 use super::stamp::{StoredStamps, Timestamp, TimestampStore};
+use super::timing::jittered;
 use super::{
     CONTENT_APP, CONTENT_CONTROL, Config, Dest, DropReason, Entropy, Event, LINK_NOISE,
     LINK_PROLOGUE, SendError, Stats, private_copy,
@@ -126,6 +127,19 @@ struct PeerLink {
     /// We tried to send with no session: start a handshake ourselves.
     wants_session: Option<Duration>,
     hs: Option<InFlight>,
+    /// The attempt before `hs`, kept for exactly one more round so a late
+    /// handshake 2 that answers it still completes (on a slow radio the
+    /// answer can arrive after the retry went out). Wiped when a third
+    /// attempt supersedes it and when any session is established. (`snow`
+    /// does not zeroize its handshake state when dropped; see the spec.)
+    hs_old: Option<InFlight>,
+    /// We finished on `hs_old` while a newer attempt (`hs`) is still open.
+    /// The responder may already have replaced the older attempt's session
+    /// with the newer one (it keeps only the latest), so the session we just
+    /// made may be dead at its end. `hs` stays open until the session we made
+    /// is confirmed by a valid packet; if the newer answer arrives first we
+    /// move to that session instead.
+    hs_follows: bool,
     current: Option<Session>,
     /// A replaced session and when it last carried a valid packet.
     previous: Option<(Session, Duration)>,
@@ -202,6 +216,8 @@ impl Endpoint {
             owe_ack_since: None,
             wants_session: None,
             hs: None,
+            hs_old: None,
+            hs_follows: false,
             current: None,
             previous: None,
             pending: None,
@@ -238,6 +254,7 @@ impl Endpoint {
         let mut v = Vec::new();
         for p in self.peers.iter().flatten() {
             v.extend(p.hs.iter().map(|h| h.local_index));
+            v.extend(p.hs_old.iter().map(|h| h.local_index));
             v.extend(p.current.iter().map(|s| s.local_index));
             v.extend(p.previous.iter().map(|(s, _)| s.local_index));
             v.extend(p.pending.iter().map(|s| s.local_index));
@@ -282,15 +299,15 @@ impl Endpoint {
                 mac1,
             } => self.on_handshake1(now, signed, mac1, noise, &mut out),
             Packet::Handshake2 { receiver, noise } => {
-                let found = self.peers.iter().position(|p| {
-                    p.as_ref()
-                        .is_some_and(|p| p.hs.as_ref().is_some_and(|h| h.local_index == receiver))
-                });
+                let found = self
+                    .peers
+                    .iter()
+                    .position(|p| p.as_ref().is_some_and(|p| p.has_inflight_index(receiver)));
                 match found {
                     Some(i) => {
                         let mut ev = Vec::new();
                         let peer = self.peers[i].as_mut().expect("found above");
-                        peer.on_handshake2(&mut self.sh, now, noise, &mut ev);
+                        peer.on_handshake2(&mut self.sh, now, receiver, noise, &mut ev);
                         out.extend(ev.into_iter().map(|e| (Some(PeerId(i)), e)));
                     }
                     None => self.drop_packet(DropReason::UnknownIndex, &mut out),
@@ -501,6 +518,12 @@ fn backoff(cfg: &Config, attempt: u32) -> Duration {
 }
 
 impl PeerLink {
+    /// Is `i` the index of one of our two newest handshake attempts?
+    fn has_inflight_index(&self, i: u16) -> bool {
+        self.hs.as_ref().is_some_and(|h| h.local_index == i)
+            || self.hs_old.as_ref().is_some_and(|h| h.local_index == i)
+    }
+
     fn has_session_index(&self, i: u16) -> bool {
         self.current.as_ref().is_some_and(|s| s.local_index == i)
             || self
@@ -545,10 +568,13 @@ impl PeerLink {
         self.store.save(&next)?;
         self.stamps = next;
         let packet = packet::encode_handshake1(&self.public, &buf[..n]);
-        self.hs = Some(InFlight {
+        self.hs_follows = false;
+        // The newest attempt moves to the spare slot; the one that was
+        // there before it is dropped (wiped as far as `snow` allows).
+        self.hs_old = self.hs.replace(InFlight {
             state: hs,
             local_index: index,
-            next_retry: now + backoff(&sh.cfg, attempt),
+            next_retry: now + jittered(backoff(&sh.cfg, attempt), &mut *sh.rng),
             attempt,
         });
         sh.stats.handshakes_sent += 1;
@@ -651,10 +677,22 @@ impl PeerLink {
         &mut self,
         sh: &mut Shared,
         now: Duration,
+        receiver: u16,
         noise: &[u8],
         out: &mut Vec<Event>,
     ) {
-        let Some(mut f) = self.hs.take() else {
+        // Either of the two newest attempts may be the one answered.
+        let in_old = self
+            .hs_old
+            .as_ref()
+            .is_some_and(|h| h.local_index == receiver);
+        let slot = if in_old {
+            &mut self.hs_old
+        } else {
+            &mut self.hs
+        };
+        let matches = slot.as_ref().is_some_and(|f| f.local_index == receiver);
+        let Some(mut f) = slot.take().filter(|_| matches) else {
             sh.stats.count_drop(DropReason::UnknownIndex);
             out.push(Event::Dropped(DropReason::UnknownIndex));
             return;
@@ -671,7 +709,11 @@ impl PeerLink {
                 // Authentic Noise but a payload that is not what the spec says
                 // (cannot come from a correct peer). snow has used up this
                 // handshake, so the retry timer starts a new one.
-                self.hs = Some(f);
+                *(if in_old {
+                    &mut self.hs_old
+                } else {
+                    &mut self.hs
+                }) = Some(f);
                 sh.stats.count_drop(DropReason::BadHeader);
                 out.push(Event::Dropped(DropReason::BadHeader));
                 return;
@@ -679,7 +721,11 @@ impl PeerLink {
             Err(_) => {
                 // snow restores its state on a failed read, so a forged
                 // handshake 2 does not spoil the real one.
-                self.hs = Some(f);
+                *(if in_old {
+                    &mut self.hs_old
+                } else {
+                    &mut self.hs
+                }) = Some(f);
                 sh.stats.count_drop(DropReason::BadTag);
                 out.push(Event::Dropped(DropReason::BadTag));
                 return;
@@ -693,6 +739,15 @@ impl PeerLink {
             }
         };
         sh.stats.handshakes_completed += 1;
+        // The first answer wins and the other attempt is dropped, with one
+        // exception: if the answer was for the older attempt, the newer one
+        // stays open until this session is confirmed (see `hs_follows`).
+        let keep_newer = in_old && self.hs.is_some();
+        if !keep_newer {
+            self.hs = None;
+        }
+        self.hs_follows = keep_newer;
+        self.hs_old = None;
         let remote_index = u16::from_be_bytes([payload[0], payload[1]]);
         let session = Session::new(transport, f.local_index, remote_index, true, now);
         let rekey = self.install_current(session, now, true);
@@ -716,6 +771,7 @@ impl PeerLink {
         self.awaiting_since = None;
         self.silent_since = None;
         self.wants_session = None;
+        self.hs_old = None;
         if let Some(old) = self.current.take()
             && (old.confirmed || self.previous.is_none() || !from_handshake_2)
         {
@@ -803,6 +859,11 @@ impl PeerLink {
                 if session_is_initiator {
                     self.previous = None;
                     self.unconfirmed_rounds = 0;
+                    // Confirmed: the newer attempt kept open for it is not needed.
+                    if self.hs_follows {
+                        self.hs = None;
+                        self.hs_follows = false;
+                    }
                 }
             }
             Slot::Previous => {

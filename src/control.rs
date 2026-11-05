@@ -40,7 +40,7 @@ use std::time::Duration;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::identity::{check_peer_public, fingerprint};
-use crate::link::Entropy;
+use crate::link::{Entropy, jittered};
 use crate::removal::{self, Applied, Entry, LogId};
 use crate::rotation::{self, CommitOutcome, NextOutcome};
 use crate::signing::{AUTOPILOT_KEY_FILE, peer_key_path};
@@ -390,6 +390,8 @@ pub struct Control {
     peer: [u8; 32],
     peer_fp: String,
     rng: Box<dyn Entropy>,
+    retry_initial: Duration,
+    retry_max: Duration,
     session: SessionState,
     peer_gone: bool,
 }
@@ -410,9 +412,23 @@ impl Control {
             peer,
             peer_fp: fingerprint(&peer),
             rng,
+            retry_initial: RETRY_INITIAL,
+            retry_max: RETRY_MAX,
             session: SessionState::default(),
             peer_gone: false,
         }
+    }
+
+    /// Resend timing for a slow radio: the first resend after `initial`
+    /// (at least [`RETRY_INITIAL`]), doubling up to `max` (at least
+    /// `initial`). Give it the link's `retry_initial` and `retry_max` when
+    /// the link is scaled to the radio's airtime: a message and its ack must
+    /// be able to cross the air before the first resend. Every wait is
+    /// spread by up to 20% so resends do not line up with other traffic.
+    pub fn with_retry(mut self, initial: Duration, max: Duration) -> Self {
+        self.retry_initial = initial.max(RETRY_INITIAL);
+        self.retry_max = max.max(self.retry_initial);
+        self
     }
 
     fn new_id(&mut self) -> RequestId {
@@ -433,8 +449,8 @@ impl Control {
         let out = Outgoing {
             id: msg.id(),
             bytes,
-            next_try: now + RETRY_INITIAL,
-            backoff: RETRY_INITIAL,
+            next_try: now + jittered(self.retry_initial, &mut *self.rng),
+            backoff: self.retry_initial,
             resends: 0,
         };
         (out, send)
@@ -564,20 +580,31 @@ impl Control {
             return Vec::new();
         }
         let mut out = Vec::new();
-        let due = |o: &mut Outgoing| {
+        fn due(
+            o: &mut Outgoing,
+            now: Duration,
+            rng: &mut dyn Entropy,
+            retry_max: Duration,
+        ) -> Option<Action> {
             if now < o.next_try {
                 return None;
             }
-            o.backoff = (o.backoff * 2).min(RETRY_MAX);
-            o.next_try = now + o.backoff;
+            o.backoff = o.backoff.saturating_mul(2).min(retry_max);
+            o.next_try = now + jittered(o.backoff, rng);
             Some(Action::Send(o.bytes.clone()))
-        };
-        if let Some(a) = self.session.head.as_mut().and_then(due) {
+        }
+        let retry_max = self.retry_max;
+        if let Some(a) = self
+            .session
+            .head
+            .as_mut()
+            .and_then(|o| due(o, now, &mut *self.rng, retry_max))
+        {
             out.push(a);
         }
         let mut restart = false;
         if let Some((o, kind)) = self.session.signing.as_mut()
-            && let Some(a) = due(o)
+            && let Some(a) = due(o, now, &mut *self.rng, retry_max)
         {
             o.resends += 1;
             if matches!(kind, SigningKind::Commit(_)) && o.resends >= COMMIT_RESENDS_BEFORE_RESTART
@@ -596,7 +623,7 @@ impl Control {
             }
         }
         for o in self.session.entries.values_mut() {
-            if let Some(a) = due(o) {
+            if let Some(a) = due(o, now, &mut *self.rng, retry_max) {
                 out.push(a);
             }
         }

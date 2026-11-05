@@ -20,7 +20,7 @@ use oasa_sec::control::{Action, Control, Note};
 use oasa_sec::identity::{Identity, fingerprint};
 use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
-    SendError, SourceLimiter, looks_like_handshake1,
+    RadioProfile, SendError, SourceLimiter, looks_like_handshake1,
 };
 use oasa_sec::mavguard::{Block, Guard, max_verified_timestamp};
 use oasa_sec::removal::{LOG_FILE, REMOVED_FILE};
@@ -37,6 +37,7 @@ USAGE:
             --plain-listen HOST:PORT --plain-send HOST:PORT
             [--remote HOST:PORT] [--initiate] [--allow-remote-plain] [--trusted-clock]
             [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N]
+            [--radio-profile NAME | --handshake-rtt-ms N] [--retry-secs N]
             [--mtu BYTES] [--duration SECS]
             [--mavlink-guard | --no-mavlink-guard] [--allow-mavlink-ftp]
             [--allow-rtk] [--allow-fence-rally]
@@ -64,6 +65,23 @@ USAGE:
   --counter-bytes  2 (default) or 4: how much of the packet counter goes on the wire.
   --rekey-secs     New handshake after this many seconds (default 600).
   --keepalive-secs Send an empty packet after this many idle seconds (default 25, 0 = off).
+  --radio-profile  Scale the handshake timers to a radio's airtime: lora-sf7-bw125,
+                   lora-sf9-bw125, lora-sf12-bw125, sik-64k, sik-64k-ecc, mlrs-19hz,
+                   mlrs-31hz, mlrs-50hz or wifi-wfb (the oasa-lab profile names). Default:
+                   the fast-link timers (retry 5 s, stale 30 s, keepalive 25 s). On a slow
+                   radio a handshake can take longer than the 5 s retry, so the retry goes
+                   out too early; give both devices the same profile. Slow profiles turn
+                   keepalives off unless --keepalive-secs says otherwise.
+  --handshake-rtt-ms
+                   Same as --radio-profile, for a radio without a profile: the airtime of
+                   one handshake (119 bytes out plus 55 bytes back) in milliseconds.
+                   Not with --radio-profile.
+  --retry-secs     First handshake retry delay in seconds (default 5, backing off to at
+                   least 60 s; every wait varies by up to 20%). Must be longer than the
+                   handshake takes on the air (over 1.25 times the round trip). Raises the
+                   stale time to at least 4 times this, and needs --rekey-secs of at least 4
+                   times this when it is over 5 s. Overrides the profile's retry. Control
+                   messages (device removal, key rotation) are resent on the same timer.
   --mtu            Largest encrypted packet in bytes (default 128, the smallest radio the
                    link supports). Plaintext must fit in MTU minus 22 bytes (24 with 4).
   --mavlink-guard  Check every packet from the link before it goes to --plain-send. Only
@@ -192,6 +210,9 @@ struct Args {
     counter: CounterLen,
     rekey_secs: Option<u64>,
     keepalive_secs: Option<u64>,
+    radio: Option<RadioProfile>,
+    handshake_rtt_ms: Option<u64>,
+    retry_secs: Option<u64>,
     mtu: usize,
     duration: Option<Duration>,
 }
@@ -249,7 +270,7 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
             }
         }
     }
-    const KNOWN: [&str; 11] = [
+    const KNOWN: [&str; 14] = [
         "dir",
         "peer",
         "bind",
@@ -259,6 +280,9 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         "counter-bytes",
         "rekey-secs",
         "keepalive-secs",
+        "radio-profile",
+        "handshake-rtt-ms",
+        "retry-secs",
         "mtu",
         "duration",
     ];
@@ -322,12 +346,36 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
             .filter(|n| (MIN_MTU..=65_535).contains(n))
             .ok_or("--mtu must be 128 to 65535")?,
     };
+    let radio = match named.get("radio-profile") {
+        None => None,
+        Some(n) => Some(RadioProfile::from_name(n).ok_or_else(|| {
+            format!(
+                "--radio-profile {n}: unknown profile. Profiles: {}",
+                RadioProfile::ALL.map(|p| p.name()).join(", ")
+            )
+        })?),
+    };
     // The most we allow for a time option: about ten years.
     let secs = |k: &str, max: u64| -> R<Option<u64>> {
         match num(k)? {
             Some(n) if n > max => Err(format!("--{k} is too large (at most {max})").into()),
             other => Ok(other),
         }
+    };
+    let handshake_rtt_ms = match num("handshake-rtt-ms")? {
+        Some(n) if !(1..=3_600_000).contains(&n) => {
+            return Err("--handshake-rtt-ms must be 1 to 3600000".into());
+        }
+        other => other,
+    };
+    if radio.is_some() && handshake_rtt_ms.is_some() {
+        return Err("--radio-profile and --handshake-rtt-ms together make no sense".into());
+    }
+    let retry_secs = match num("retry-secs")? {
+        Some(n) if !(1..=3600).contains(&n) => {
+            return Err("--retry-secs must be 1 to 3600".into());
+        }
+        other => other,
     };
     let plain_listen = addr("plain-listen")?;
     if !plain_listen.ip().is_loopback() && !allow_remote_plain {
@@ -357,6 +405,9 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         counter,
         rekey_secs: secs("rekey-secs", MAX_SECS / 2)?,
         keepalive_secs: secs("keepalive-secs", MAX_SECS)?,
+        radio,
+        handshake_rtt_ms,
+        retry_secs,
         mtu,
         duration: secs("duration", MAX_SECS)?.map(Duration::from_secs),
     }))
@@ -417,11 +468,42 @@ fn widened(a: &Args) -> Vec<String> {
 }
 
 fn config_from(a: &Args) -> R<Config> {
+    let base = match (a.radio, a.handshake_rtt_ms) {
+        (Some(p), _) => p.config(),
+        (None, Some(ms)) => Config::for_airtime(Duration::from_millis(ms)),
+        (None, None) => Config::default(),
+    };
     let mut c = Config {
         counter_len: a.counter,
         mtu: a.mtu,
-        ..Config::default()
+        ..base
     };
+    if let Some(n) = a.retry_secs {
+        let rtt = match (a.radio, a.handshake_rtt_ms) {
+            (Some(p), _) => Some((
+                p.handshake_round_trip(),
+                format!("--radio-profile {}", p.name()),
+            )),
+            (None, Some(ms)) => Some((
+                Duration::from_millis(ms),
+                format!("--handshake-rtt-ms {ms}"),
+            )),
+            (None, None) => None,
+        };
+        // Retries vary by up to 20% (jitter), so the shortest is 80% of this.
+        if let Some((rtt, from)) = rtt
+            && Duration::from_secs(n).mul_f64(0.8) <= rtt
+        {
+            return Err(format!(
+                "--retry-secs {n} is too short for {from}: a handshake takes {} ms on the air and \
+                 retries vary by 20%, so the retry must be over {} ms",
+                rtt.as_millis(),
+                rtt.mul_f64(1.25).as_millis()
+            )
+            .into());
+        }
+        c = c.with_retry(Duration::from_secs(n));
+    }
     if let Some(n) = a.rekey_secs {
         c.rekey_after = Duration::from_secs(n);
         // Keep the usual margin of a half again, but never below 15 minutes.
@@ -437,8 +519,43 @@ fn config_from(a: &Args) -> R<Config> {
     if a.trusted_clock {
         c.max_future = Some(Duration::from_secs(600));
     }
-    c.validate()?;
+    // With a slow retry the rekey time must leave room for a few retries
+    // (the library refuses less); say which flags are involved.
+    let slow = c.retry_initial > Config::default().retry_initial;
+    if slow && c.rekey_after < c.retry_initial * 4 {
+        return Err(format!(
+            "the rekey time ({} s, set with --rekey-secs; default 600) is too short for a \
+             handshake retry of {} s (from --radio-profile, --handshake-rtt-ms or \
+             --retry-secs): use --rekey-secs {} or more",
+            c.rekey_after.as_secs(),
+            c.retry_initial.as_secs(),
+            (c.retry_initial * 4).as_secs() + 1
+        )
+        .into());
+    }
+    // Room to retry a rekey before the session ends.
+    c.reject_after = c.reject_after.max(c.rekey_after + c.retry_initial * 4);
+    c.validate().map_err(|e| {
+        format!(
+            "the timer settings do not fit together ({e}); check --radio-profile, \
+             --handshake-rtt-ms, --retry-secs, --rekey-secs and --keepalive-secs"
+        )
+    })?;
     Ok(c)
+}
+
+/// Resend timing for control messages: the link's, when it was scaled to the
+/// radio (a message and its ack must be able to cross the air first),
+/// otherwise the control layer's own fast-link defaults.
+fn control_retry(a: &Args, c: &Config) -> (Duration, Duration) {
+    if a.radio.is_some() || a.handshake_rtt_ms.is_some() || a.retry_secs.is_some() {
+        (c.retry_initial, c.retry_max)
+    } else {
+        (
+            oasa_sec::control::RETRY_INITIAL,
+            oasa_sec::control::RETRY_MAX,
+        )
+    }
 }
 
 /// Limits drop lines on standard output: 10 a second, then one summary line
@@ -876,10 +993,12 @@ fn run(args: &[String]) -> R<u8> {
     let wall_base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "the clock is before 1970")?;
+    let config = config_from(&a)?;
+    let control_retry = control_retry(&a, &config);
     let link = Link::new(
         &me,
         peer.public,
-        config_from(&a)?,
+        config,
         Box::new(OsEntropy),
         wall_base,
         Box::new(FileTimestampStore::new(&a.dir, &peer.public)),
@@ -944,7 +1063,8 @@ fn run(args: &[String]) -> R<u8> {
 
     let mut t = Tunnel {
         link,
-        control: Control::new(&a.dir, own_public, peer.public, Box::new(OsEntropy)),
+        control: Control::new(&a.dir, own_public, peer.public, Box::new(OsEntropy))
+            .with_retry(control_retry.0, control_retry.1),
         enc,
         plain_out,
         plain_send: a.plain_send,
@@ -1338,6 +1458,124 @@ mod tests {
         assert_eq!(log.roll(t0 + Duration::from_millis(1100)), 0);
         // A new second starts with a new allowance.
         assert_eq!((0..50).filter(|_| log.allow()).count(), 10);
+    }
+
+    #[test]
+    fn radio_profile_and_retry_options_set_the_timers() {
+        let cfg = |extra: &str| {
+            let a = parse_args(&v(&format!("{BASE} {extra}"))).unwrap().unwrap();
+            config_from(&a).unwrap()
+        };
+        let d = Config::default();
+        // No option: the fast-link defaults, unchanged.
+        let c = cfg("");
+        assert_eq!(
+            (c.retry_initial, c.stale_after, c.keepalive),
+            (d.retry_initial, d.stale_after, d.keepalive)
+        );
+        // SF12: retry above the 7.1 s handshake, keepalives off.
+        let c = cfg("--radio-profile lora-sf12-bw125");
+        assert!(c.retry_initial > Duration::from_millis(7_062));
+        assert_eq!(c.keepalive, None);
+        assert!(c.stale_after >= c.retry_initial * 2);
+        // An explicit keepalive wins over the profile.
+        let c = cfg("--radio-profile lora-sf12-bw125 --keepalive-secs 120");
+        assert_eq!(c.keepalive, Some(Duration::from_secs(120)));
+        // A fast profile equals the defaults.
+        let c = cfg("--radio-profile wifi-wfb");
+        assert_eq!(c.retry_initial, d.retry_initial);
+        // A raw round trip gives the same as the profile of that speed.
+        let c = cfg("--handshake-rtt-ms 7062");
+        assert_eq!(
+            c.retry_initial,
+            RadioProfile::LoraSf12Bw125.config().retry_initial
+        );
+        // --retry-secs overrides, and pulls stale and the cap along.
+        let c = cfg("--retry-secs 30");
+        assert_eq!(c.retry_initial, Duration::from_secs(30));
+        assert!(c.stale_after >= Duration::from_secs(120));
+        assert!(c.retry_max >= Duration::from_secs(120));
+        let c = cfg("--radio-profile lora-sf12-bw125 --retry-secs 20");
+        assert_eq!(c.retry_initial, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn bad_radio_and_retry_options_are_refused() {
+        for bad in [
+            "--radio-profile nonsense",
+            "--radio-profile ideal",
+            "--radio-profile",
+            "--radio-profile lora-sf12-bw125 --handshake-rtt-ms 7000",
+            "--handshake-rtt-ms 0",
+            "--handshake-rtt-ms x",
+            "--handshake-rtt-ms 3600001",
+            "--retry-secs 0",
+            "--retry-secs 3601",
+            "--retry-secs -1",
+            "--retry-secs 18446744073709551615",
+        ] {
+            assert!(parse_args(&v(&format!("{BASE} {bad}"))).is_err(), "{bad}");
+        }
+        // A huge round trip parses but the rekey margin refuses it.
+        let a = parse_args(&v(&format!("{BASE} --handshake-rtt-ms 3600000")))
+            .unwrap()
+            .unwrap();
+        assert!(config_from(&a).is_err());
+    }
+
+    #[test]
+    fn slow_timer_combinations_are_checked_with_messages_that_name_the_flags() {
+        let err = |extra: &str| -> String {
+            let a = parse_args(&v(&format!("{BASE} {extra}"))).unwrap().unwrap();
+            config_from(&a).unwrap_err().to_string()
+        };
+        let ok = |extra: &str| -> Config {
+            let a = parse_args(&v(&format!("{BASE} {extra}"))).unwrap().unwrap();
+            config_from(&a).unwrap()
+        };
+        // A rekey time under 4 retries: names --rekey-secs, not a library field.
+        for bad in [
+            "--radio-profile lora-sf12-bw125 --rekey-secs 1",
+            "--retry-secs 3600",
+            "--retry-secs 400",
+        ] {
+            let e = err(bad);
+            assert!(e.contains("--rekey-secs"), "{bad}: {e}");
+            assert!(!e.contains("reject_after") && !e.contains("peer_handshake_gap"));
+        }
+        // A retry that is not longer than the handshake (with jitter) is refused.
+        let e = err("--radio-profile lora-sf12-bw125 --retry-secs 7");
+        assert!(
+            e.contains("--retry-secs 7") && e.contains("--radio-profile"),
+            "{e}"
+        );
+        let e = err("--handshake-rtt-ms 7062 --retry-secs 8");
+        assert!(e.contains("--handshake-rtt-ms"), "{e}");
+        // The same retry with a long enough rekey works, and the reject time
+        // follows so a retry fits before the session ends.
+        let c = ok("--retry-secs 400 --rekey-secs 2000");
+        assert!(c.reject_after >= c.rekey_after + c.retry_initial * 4);
+        // Fast timers still take short rekey times (the lab uses 3 s).
+        ok("--rekey-secs 1");
+        ok("--radio-profile wifi-wfb --rekey-secs 3");
+        ok("--radio-profile lora-sf12-bw125 --rekey-secs 600");
+    }
+
+    #[test]
+    fn control_messages_follow_the_link_retry_only_when_it_was_scaled() {
+        let args = |extra: &str| parse_args(&v(&format!("{BASE} {extra}"))).unwrap().unwrap();
+        let a = args("");
+        assert_eq!(
+            control_retry(&a, &config_from(&a).unwrap()),
+            (
+                oasa_sec::control::RETRY_INITIAL,
+                oasa_sec::control::RETRY_MAX
+            )
+        );
+        let a = args("--radio-profile lora-sf12-bw125");
+        let c = config_from(&a).unwrap();
+        assert_eq!(control_retry(&a, &c), (c.retry_initial, c.retry_max));
+        assert!(c.retry_initial > Duration::from_secs(10));
     }
 
     #[test]
