@@ -553,26 +553,56 @@ fn handshake_retries_back_off_to_the_cap() {
 }
 
 #[test]
-fn only_the_initiator_rekeys_and_only_when_due() {
+fn the_initiator_rekeys_when_due_and_the_responder_only_if_it_does_not() {
     let cfg = Config {
         rekey_after: Duration::from_secs(100),
         reject_after: Duration::from_secs(150),
         keepalive: None,
         ..Config::default()
     };
-    let (mut p, t0) = established(cfg);
+    let (mut p, t0) = established(cfg.clone());
     for s in [10u64, 50, 99] {
         assert!(p.a.poll_timers(t0 + Duration::from_secs(s)).is_empty());
         assert!(p.b.poll_timers(t0 + Duration::from_secs(s)).is_empty());
     }
-    // The responder never starts one, even long past the rekey age.
-    assert!(sends(&p.b.poll_timers(t0 + Duration::from_secs(120))).is_empty());
     let ev = p.a.poll_timers(t0 + Duration::from_secs(100));
     assert!(ev.contains(&Event::HandshakeSent {
         retry: false,
         rekey: true
     }));
-    assert_eq!(sends(&ev)[0].len(), 119);
+    let hs1 = sends(&ev).remove(0);
+    assert_eq!(hs1.len(), 119);
+    // The responder waits for the initiator: at least 27% of the 50 s
+    // between the rekey and reject times.
+    assert!(sends(&p.b.poll_timers(t0 + Duration::from_secs(113))).is_empty());
+    // Once the initiator's handshake has arrived, it never starts one.
+    let mut q = p;
+    let t = t0 + Duration::from_secs(101);
+    q.b.handle_packet(t, &hs1);
+    assert!(sends(&q.b.poll_timers(t0 + Duration::from_secs(149))).is_empty());
+
+    // If the initiator's rekey never arrives, the responder starts one: at
+    // 27 to 40% of the 50 s if its public key is the lower one, else at 53
+    // to 80%.
+    let (mut p, t0) = established(cfg);
+    let mut started = None;
+    for s in 100..150u64 {
+        let ev = p.b.poll_timers(t0 + Duration::from_secs(s));
+        if ev.contains(&Event::HandshakeSent {
+            retry: false,
+            rekey: true,
+        }) {
+            started = Some(s);
+            break;
+        }
+    }
+    let s = started.expect("the responder rekeyed");
+    let range = if pub_of(&p.b_key) < pub_of(&p.a_key) {
+        113..=120
+    } else {
+        126..=140
+    };
+    assert!(range.contains(&s), "{s}");
 }
 
 #[test]
@@ -2317,4 +2347,203 @@ fn a_queued_radio_with_default_timers_wastes_no_handshakes_or_sessions() {
     assert!(a.handshakes_sent <= 36 * 2 + 2, "{}", a.handshakes_sent);
     assert!(unknown <= 50, "{unknown}");
     assert!(b.delivered >= 150, "{}", b.delivered);
+}
+
+// Crossed handshakes (review finding M1). When both sides start a handshake
+// at once, each ends up sending on the session the other one made. Someone
+// must still rekey before `reject_after`, or both sides lose the link, and
+// each side must keep reading the session the other one sends on.
+
+struct Crossed {
+    /// When each side (a, b) got a new session.
+    established: [Vec<Duration>; 2],
+    handshakes: usize,
+    sent: [usize; 2],
+    delivered: [usize; 2],
+}
+
+/// Run both sides for `secs` seconds after both start a handshake at the same
+/// moment. Each side has one radio: it sends one packet at a time, in order,
+/// each taking `air(len)`. Both sides send a packet every `every`; once both
+/// can send, a send must never fail. Sending stops 30 s before the end, so
+/// everything sent has arrived.
+fn crossed_run(
+    cfg: Config,
+    secs: u64,
+    every: Duration,
+    air: impl Fn(usize) -> Duration,
+) -> Crossed {
+    let mut p = pair(cfg);
+    let mut now = ms(10);
+    // (arrives at, to a?, packet), and when each side's radio is free.
+    let mut wire: Vec<(Duration, bool, Vec<u8>)> = Vec::new();
+    let mut busy = [Duration::ZERO; 2];
+    let mut put = |wire: &mut Vec<_>, now: Duration, from: usize, pkt: Vec<u8>| {
+        let arrives = now.max(busy[from]) + air(pkt.len());
+        busy[from] = arrives;
+        wire.push((arrives, from == 1, pkt));
+    };
+    let ev = p.a.start_handshake(now).unwrap();
+    put(&mut wire, now, 0, sends(&ev).remove(0));
+    let ev = p.b.start_handshake(now).unwrap();
+    put(&mut wire, now, 1, sends(&ev).remove(0));
+    let mut r = Crossed {
+        established: [Vec::new(), Vec::new()],
+        handshakes: 2,
+        sent: [0; 2],
+        delivered: [0; 2],
+    };
+    let mut up = false;
+    let mut next_send = now;
+    let end = now + Duration::from_secs(secs);
+    while now < end {
+        now += ms(50);
+        let mut evs = vec![(0, p.a.poll_timers(now)), (1, p.b.poll_timers(now))];
+        let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut wire)
+            .into_iter()
+            .partition(|(t, _, _)| *t <= now);
+        wire = rest;
+        for (_, to_a, pkt) in due {
+            if to_a {
+                evs.push((0, p.a.handle_packet(now, &pkt)));
+            } else {
+                evs.push((1, p.b.handle_packet(now, &pkt)));
+            }
+        }
+        up |= p.a.can_send() && p.b.can_send();
+        if up && now >= next_send && now + Duration::from_secs(30) < end {
+            next_send = now + every;
+            for (side, link) in [&mut p.a, &mut p.b].into_iter().enumerate() {
+                match link.send(now, b"telemetry") {
+                    Ok(pkt) => put(&mut wire, now, side, pkt),
+                    Err(e) => panic!("send from {} at {now:?}: {e:?}", ["a", "b"][side]),
+                }
+                r.sent[side] += 1;
+            }
+        }
+        for (side, ev) in evs {
+            for e in &ev {
+                match e {
+                    Event::SessionEstablished { .. } => r.established[side].push(now),
+                    Event::HandshakeSent { .. } => r.handshakes += 1,
+                    // Counted against the side that sent it.
+                    Event::Deliver(_) => r.delivered[1 - side] += 1,
+                    _ => {}
+                }
+            }
+            for pkt in sends(&ev) {
+                put(&mut wire, now, side, pkt);
+            }
+        }
+    }
+    r
+}
+
+/// Each side gets a new session at least once per `reject_after`, every
+/// packet arrives, and the rekeys cost at most two handshakes per rekey
+/// period (one each if they cross again), plus the two at the start.
+fn assert_rekeyed(cfg: &Config, secs: u64, r: &Crossed) {
+    let periods = secs / cfg.rekey_after.as_secs();
+    for (name, est) in ["a", "b"].iter().zip(&r.established) {
+        assert!(est.len() as u64 > periods, "{name}: {est:?}");
+        for w in est.windows(2) {
+            assert!(w[1] - w[0] < cfg.reject_after, "{name}: {est:?}");
+        }
+    }
+    assert_eq!(r.sent, r.delivered, "sent and delivered, by sender (a, b)");
+    assert!(r.sent[0] > 0);
+    let most = 2 * (periods as usize + 1);
+    assert!(r.handshakes <= most, "{} handshakes", r.handshakes);
+}
+
+fn crossed_fast_config() -> Config {
+    Config {
+        rekey_after: Duration::from_secs(60),
+        reject_after: Duration::from_secs(90),
+        ..Config::default()
+    }
+}
+
+#[test]
+fn crossed_sessions_are_rekeyed_before_they_expire() {
+    // Four rekey periods on a fast link with steady traffic.
+    let cfg = crossed_fast_config();
+    let secs = 4 * 60 + 40;
+    let r = crossed_run(cfg.clone(), secs, Duration::from_secs(1), |_| ms(20));
+    assert_rekeyed(&cfg, secs, &r);
+}
+
+#[test]
+fn crossed_sessions_keep_working_with_gaps_longer_than_the_grace() {
+    // Traffic every 20 s, longer than the 10 s previous-session grace: each
+    // side receives on the session it made, so it must not expire.
+    let cfg = crossed_fast_config();
+    let secs = 4 * 60 + 40;
+    let r = crossed_run(cfg.clone(), secs, Duration::from_secs(20), |_| ms(20));
+    assert_rekeyed(&cfg, secs, &r);
+}
+
+#[test]
+fn crossed_sessions_are_rekeyed_before_they_expire_on_a_slow_link() {
+    // LoRa SF12 timers from the airtime rule, a rekey every 2 minutes and
+    // telemetry every 15 s (the previous-session grace is 14.2 s here).
+    let cfg = Config {
+        rekey_after: Duration::from_secs(120),
+        reject_after: Duration::from_secs(180),
+        ..sf12_config()
+    };
+    cfg.validate().unwrap();
+    let secs = 4 * 120 + 60;
+    let r = crossed_run(cfg.clone(), secs, Duration::from_secs(15), sf12_air);
+    assert_rekeyed(&cfg, secs, &r);
+}
+
+#[test]
+fn a_rekey_from_crossed_sessions_keeps_reading_what_the_peer_sends() {
+    let (mut p, t0) = established(Config::default());
+    // Both sides start a handshake at once (as in the test above).
+    let t = t0 + Duration::from_secs(3);
+    let h_a = sends(&p.a.start_handshake(t).unwrap()).remove(0);
+    let h_b = sends(&p.b.start_handshake(t).unwrap()).remove(0);
+    let r_b = sends(&p.b.handle_packet(t, &h_a)).remove(0);
+    let r_a = sends(&p.a.handle_packet(t, &h_b)).remove(0);
+    let ka_a = sends(&p.a.handle_packet(t, &r_b));
+    let ka_b = sends(&p.b.handle_packet(t, &r_a));
+    for pkt in ka_a {
+        p.b.handle_packet(t, &pkt);
+    }
+    for pkt in ka_b {
+        p.a.handle_packet(t, &pkt);
+    }
+    // Crossed: b sends on the session a made, and a reads it.
+    let t1 = t + Duration::from_secs(1);
+    let y = p.b.send(t1, b"before").unwrap();
+    assert_eq!(
+        delivered(&p.a.handle_packet(t1, &y)),
+        vec![b"before".to_vec()]
+    );
+    // a rekeys (its late rekey). b answers, and sends on the old session
+    // until a's first packet on the new one arrives.
+    let hs1 = sends(&p.a.start_handshake(t1).unwrap()).remove(0);
+    let hs2 = sends(&p.b.handle_packet(t1, &hs1)).remove(0);
+    let in_flight = p.b.send(t1, b"in flight").unwrap();
+    let ev = p.a.handle_packet(t1, &hs2);
+    assert!(ev.contains(&Event::SessionEstablished {
+        initiator: true,
+        rekey: true
+    }));
+    // a kept the session b sends on, not the one a was sending on.
+    assert_eq!(
+        delivered(&p.a.handle_packet(t1, &in_flight)),
+        vec![b"in flight".to_vec()]
+    );
+    // a's first packet on the new session switches b over to it.
+    let t2 = t1 + Duration::from_secs(1);
+    let ka = sends(&ev).remove(0);
+    p.b.handle_packet(t2, &ka);
+    let fresh = p.b.send(t2, b"new").unwrap();
+    assert_eq!(
+        delivered(&p.a.handle_packet(t2, &fresh)),
+        vec![b"new".to_vec()]
+    );
 }

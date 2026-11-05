@@ -509,6 +509,25 @@ fn pick_index(rng: &mut dyn Entropy, taken: &[u16]) -> Option<u16> {
         .find(|i| !taken.contains(i))
 }
 
+/// When a side that answered the handshake starts one itself if the peer
+/// has not rekeyed (spec section 5): `rekey_after` plus a share of the time
+/// left before `reject_after`, jittered by up to 20%. The peer has time for
+/// its own rekey and its retries first. After crossed handshakes both sides
+/// wait like this; the side with the lower public key waits about a third
+/// of the time left (27 to 40%) and the other about two thirds (53 to 80%),
+/// so they do not start at once and cross again. At least 20% is left for
+/// the handshake to finish before the session expires.
+fn late_rekey_wait(sh: &mut Shared, peer: &[u8; 32]) -> Duration {
+    let cfg = &sh.cfg;
+    let left = cfg.reject_after.saturating_sub(cfg.rekey_after);
+    let share = if sh.public < *peer {
+        left / 3
+    } else {
+        left / 3 * 2
+    };
+    cfg.rekey_after + jittered(share, &mut *sh.rng)
+}
+
 fn backoff(cfg: &Config, attempt: u32) -> Duration {
     let mult = 1u32 << attempt.min(16);
     cfg.retry_initial
@@ -666,7 +685,9 @@ impl PeerLink {
         self.last_accept = Some(now);
         sh.stats.handshakes_accepted += 1;
         // Replaces an older unconfirmed session, if any.
-        self.pending = Some(Session::new(transport, index, remote_index, false, now));
+        let mut session = Session::new(transport, index, remote_index, false, now);
+        session.late_rekey_at = Some(now + late_rekey_wait(sh, &self.public));
+        self.pending = Some(session);
         out.push(Event::Send {
             packet: packet::encode_handshake2(remote_index, &buf[..n]),
             to: Dest::Source,
@@ -772,13 +793,31 @@ impl PeerLink {
         self.silent_since = None;
         self.wants_session = None;
         self.hs_old = None;
+        // After crossed handshakes the peer sends on the session we made,
+        // kept in `previous`; it stays readable rather than our current one,
+        // which the peer has stopped using.
+        let peer_uses_previous = self.peer_uses_previous();
         if let Some(old) = self.current.take()
             && (old.confirmed || self.previous.is_none() || !from_handshake_2)
+            && !peer_uses_previous
         {
             self.previous = Some((old, now));
         }
         self.current = Some(session);
         rekey
+    }
+
+    /// Crossed handshakes (both sides started one at once): we send on the
+    /// session the peer made, and the peer sends on the one we made, which
+    /// is in `previous`. True while the peer's latest packet came on
+    /// `previous`.
+    fn peer_uses_previous(&self) -> bool {
+        match (&self.current, &self.previous) {
+            (Some(c), Some((p, _))) => {
+                !c.initiator && p.initiator && p.last_received > c.last_received
+            }
+            _ => false,
+        }
     }
 
     fn send_keepalive(&mut self, sh: &mut Shared, now: Duration, out: &mut Vec<Event>) {
@@ -912,8 +951,12 @@ impl PeerLink {
         {
             self.current = None;
         }
+        // The grace does not apply while the peer still sends on `previous`
+        // after crossed handshakes: it is then the session we receive on.
+        let crossed = self.peer_uses_previous();
         if self.previous.as_ref().is_some_and(|(s, used)| {
-            s.expired(now, &sh.cfg) || now.saturating_sub(*used) >= sh.cfg.previous_grace
+            s.expired(now, &sh.cfg)
+                || (!crossed && now.saturating_sub(*used) >= sh.cfg.previous_grace)
         }) {
             self.previous = None;
         }
@@ -942,8 +985,10 @@ impl PeerLink {
                 || self.silent_since.is_some_and(|t| {
                     now.saturating_sub(t) >= sh.cfg.stale_after.saturating_mul(2)
                 });
-            // Whoever made the current session renews it; a side with no
-            // session starts one if it is the dialing side or has data to send.
+            // Whoever made the current session renews it at the rekey time.
+            // The other side does it later (`late_rekey_wait`) if the peer
+            // has not, which renews crossed sessions. A side with no session
+            // starts one if it is the dialing side or has data to send.
             match &self.current {
                 None if self.initiator_role => start = Some(0),
                 // Data to send and no session: start one, after giving the
@@ -966,6 +1011,16 @@ impl PeerLink {
                 {
                     self.unconfirmed_rounds = self.unconfirmed_rounds.saturating_add(1);
                     start = Some(self.unconfirmed_rounds);
+                }
+                // We answered the peer's handshake and the peer has not started
+                // a newer one in time: after crossed handshakes it never will
+                // (it sends on the session we made), so we rekey (M1).
+                Some(c)
+                    if !c.initiator
+                        && c.late_rekey_at.is_some_and(|t| now >= t)
+                        && self.pending.as_ref().is_none_or(|p| p.created <= c.created) =>
+                {
+                    start = Some(0)
                 }
                 Some(_) if stale => start = Some(0),
                 Some(_) => {}

@@ -1415,6 +1415,11 @@ fn removal_sync_converges_through_a_lossy_reordering_channel_on_many_seeds() {
                 s.replay_random();
             }
         });
+        // Then a clean channel for longer than the longest control resend
+        // (60 s, +20%): a message still waiting for its answer when the lossy
+        // part ends gets it, wherever the last rekey fell.
+        f.sim.channel = Channel::clean();
+        f.sim.run(Duration::from_secs(90), ms(10), ms(250), |_| {});
         assert!(
             f.all_removed(6),
             "seed {seed}: not every victim was removed"
