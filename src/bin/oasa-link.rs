@@ -73,9 +73,10 @@ USAGE:
                    out too early; give both devices the same profile. Slow profiles turn
                    keepalives off unless --keepalive-secs says otherwise.
   --handshake-rtt-ms
-                   Same as --radio-profile, for a radio without a profile: the airtime of
-                   one handshake (119 bytes out plus 55 bytes back) in milliseconds.
-                   Not with --radio-profile.
+                   Same as --radio-profile, for a radio without a profile: the worst
+                   round trip of one handshake (119 bytes out plus 55 bytes back) in
+                   milliseconds, including queueing, relays and half-duplex turns, not
+                   only airtime. Not with --radio-profile.
   --retry-secs     First handshake retry delay in seconds (default 5, backing off to at
                    least 60 s; every wait varies by up to 20%). Must be longer than the
                    handshake takes on the air (over 1.25 times the round trip). Raises the
