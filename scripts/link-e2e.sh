@@ -278,7 +278,8 @@ rm -f "$T/rd3/removed"
 kill -HUP "$RD3"
 sleep 1
 $B/oasa-pair remove --dir "$T/rd3" rg3 >/dev/null
-kill -HUP "$RD3"
+# The link may notice the removal and exit before this signal arrives.
+kill -HUP "$RD3" 2>/dev/null || true
 wait_exit "$RD3" 5; [ "$EXIT_RC" = 3 ] || fail "after the file was fixed, a removal did not end the link with code 3"
 kill -TERM "$RG3" 2>/dev/null || true
 pass "an unreadable trust file while running: trust_unreadable is logged, the link keeps running on the last good state, and it works again once the file is fixed"
