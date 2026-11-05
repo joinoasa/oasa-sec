@@ -2,6 +2,8 @@
 
 Read by AI coding agents (Claude Code, Codex, Cursor and others) and useful for people too. This repo is **OASA-SEC**: device identity, encrypted pairing and link keys for OASA systems. It covers tech tree nodes R-SEC1 (identity, keys, pairing) and R-COM2 (the encrypted link), and R-SEC2 (roles, device removal and signing-key rotation).
 
+**Start here:** [Building with AI agents](https://joinoasa.org/docs/agents/) holds the rules every OASA repo shares; this file adds to them and never loosens them. `oasa.toml` lists setup and the checks; `python3 .oasa/oasa_toml.py run --markdown` runs them (in the dev container): paste the table into the pull request. Find work: issues labeled `agent-ready`.
+
 ## Rules that never bend
 
 Follow the [OASA software standard](https://joinoasa.org/docs/software-standard/). In this repo especially:
