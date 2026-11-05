@@ -20,6 +20,8 @@ One encrypted, authenticated link between two trusted devices, over any radio th
 - **`oasa_sec::link`** is a library with no sockets, threads or clock inside: bytes and the time go in, events come out. `Link` is one peer; `Endpoint` serves several (one ground station, many drones).
 - **`oasa-link`** carries local UDP packets (for example MAVLink) over the link and logs one JSON line per event.
 
+Training guide (build, run, radio, attacker checks): [docs/training-r-com2.md](docs/training-r-com2.md).
+
 Try it on one machine, with no hardware:
 
 ```sh

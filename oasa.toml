@@ -17,6 +17,7 @@ docs = [
   "docs/oasa-sec-v0-rotation.md",
   "docs/oasa-sec-v0-group.md",
   "docs/guide-pairing.md",
+  "docs/training-r-com2.md",
   "docs/training-r-sec1.md",
   "docs/release-r-sec1.md",
 ]
