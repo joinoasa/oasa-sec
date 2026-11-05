@@ -84,7 +84,7 @@ Sending can fail locally (`empty`, `too_large`, `no_session`, `unknown_peer`); n
 | Nobody sends or accepts on a session after | 15 minutes or 2⁶⁰ packets |
 | Handshake retry if no answer | 5 s, then backing off to 60 s |
 | Keepalive if nothing sent for | 25 s (off by default on slow radios) |
-| Stale: sent payload, heard nothing for | 30 s, then a new handshake |
+| Stale: sent payload, heard nothing for | 30 s, then a new handshake (set per radio: `--stale-secs`) |
 | Stale: only keepalives sent, heard nothing for | 60 s (2 × stale), then a new handshake |
 
 - The **initiator** may send data as soon as it gets message 2. It sends a keepalive at once so the responder learns the session works.
@@ -94,6 +94,7 @@ Sending can fail locally (`empty`, `too_large`, `no_session`, `unknown_peer`); n
 - **Stale rule** (as WireGuard): a side that has sent payload on its session and heard nothing authenticated for 30 s starts a new handshake, whichever side it is and with keepalives off too. This heals a peer that rebooted and lost its session, and counters that drifted apart in a long one-way loss. If it has only sent idle keepalives (a restarted peer that has no address to dial, and nothing to say) the wait is twice as long. A side that has received payload and sent nothing answers with a keepalive after 15 s (half the stale time), so a healthy one-way link never looks stale.
 - A side with **no session** and something to send starts a handshake itself after the retry time, if the other side has not already done it. Rekeys are done by whoever made the current session.
 - If both sides start a handshake at once, both sessions work; each side may send on a different one until the next rekey.
+- The stale time is set per radio too: more than twice the longest round trip (the peer may wait half the stale time before it answers), or a slow link re-handshakes over and over. Set it the same on both sides.
 - Rekey limits are set per radio from its airtime: a LoRa link may rekey hourly instead. **Set the same rekey and reject limits on both sides.** If they differ, the side with the shorter limit refuses the session first and the stale rule or a new handshake repairs it, at the cost of a gap of a few seconds at each rekey.
 - Keys and session state are wiped when a session ends, as far as this crate controls them. `snow` does not wipe its session or handshake state when dropped, and keeps its own copy of our static private key for as long as a handshake or session lives, so a memory dump of the process can contain them. Our own copy is zeroized.
 

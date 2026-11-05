@@ -36,7 +36,7 @@ USAGE:
   oasa-link --dir DIR --peer PEERNAME --bind HOST:PORT
             --plain-listen HOST:PORT --plain-send HOST:PORT
             [--remote HOST:PORT] [--initiate] [--allow-remote-plain] [--trusted-clock]
-            [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N]
+            [--counter-bytes 2|4] [--rekey-secs N] [--keepalive-secs N] [--stale-secs N]
             [--mtu BYTES] [--duration SECS]
             [--mavlink-guard | --no-mavlink-guard] [--allow-mavlink-ftp]
             [--allow-rtk] [--allow-fence-rally]
@@ -64,6 +64,10 @@ USAGE:
   --counter-bytes  2 (default) or 4: how much of the packet counter goes on the wire.
   --rekey-secs     New handshake after this many seconds (default 600).
   --keepalive-secs Send an empty packet after this many idle seconds (default 25, 0 = off).
+  --stale-secs     Start a new handshake when payload was sent and nothing was heard back for
+                   this long (default 30; twice this if only keepalives were sent). On a slow or
+                   half-duplex radio make it more than twice the longest round trip, or the
+                   link keeps re-handshaking. Set the same value on both sides.
   --mtu            Largest encrypted packet in bytes (default 128, the smallest radio the
                    link supports). Plaintext must fit in MTU minus 22 bytes (24 with 4).
   --mavlink-guard  Check every packet from the link before it goes to --plain-send. Only
@@ -192,6 +196,7 @@ struct Args {
     counter: CounterLen,
     rekey_secs: Option<u64>,
     keepalive_secs: Option<u64>,
+    stale_secs: Option<u64>,
     mtu: usize,
     duration: Option<Duration>,
 }
@@ -249,7 +254,7 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
             }
         }
     }
-    const KNOWN: [&str; 11] = [
+    const KNOWN: [&str; 12] = [
         "dir",
         "peer",
         "bind",
@@ -259,6 +264,7 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         "counter-bytes",
         "rekey-secs",
         "keepalive-secs",
+        "stale-secs",
         "mtu",
         "duration",
     ];
@@ -357,6 +363,7 @@ fn parse_args(args: &[String]) -> R<Option<Args>> {
         counter,
         rekey_secs: secs("rekey-secs", MAX_SECS / 2)?,
         keepalive_secs: secs("keepalive-secs", MAX_SECS)?,
+        stale_secs: secs("stale-secs", MAX_SECS / 2)?,
         mtu,
         duration: secs("duration", MAX_SECS)?.map(Duration::from_secs),
     }))
@@ -433,6 +440,12 @@ fn config_from(a: &Args) -> R<Config> {
     }
     if let Some(n) = a.keepalive_secs {
         c.keepalive = (n > 0).then(|| Duration::from_secs(n));
+    }
+    if let Some(n) = a.stale_secs {
+        if n == 0 {
+            return Err("--stale-secs must be at least 1".into());
+        }
+        c.stale_after = Duration::from_secs(n);
     }
     if a.trusted_clock {
         c.max_future = Some(Duration::from_secs(600));
@@ -1299,6 +1312,26 @@ mod tests {
     }
 
     #[test]
+    fn stale_secs_sets_the_stale_time() {
+        let d = parse_args(&v(BASE)).unwrap().unwrap();
+        assert_eq!(
+            config_from(&d).unwrap().stale_after,
+            Duration::from_secs(30)
+        );
+        let a = parse_args(&v(&format!("{BASE} --stale-secs 120")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config_from(&a).unwrap().stale_after,
+            Duration::from_secs(120)
+        );
+        let z = parse_args(&v(&format!("{BASE} --stale-secs 0")))
+            .unwrap()
+            .unwrap();
+        assert!(config_from(&z).is_err());
+    }
+
+    #[test]
     fn huge_numbers_are_refused_not_wrapped() {
         for bad in [
             "--duration 18446744073709551615",
@@ -1306,6 +1339,8 @@ mod tests {
             "--rekey-secs 18446744073709551615",
             "--rekey-secs 9999999999999",
             "--keepalive-secs 18446744073709551615",
+            "--stale-secs 18446744073709551615",
+            "--stale-secs 9999999999999",
             "--mtu 18446744073709551615",
             "--mtu 70000",
             "--mtu 127",
@@ -1315,9 +1350,10 @@ mod tests {
         }
         // The largest allowed values still make a valid config.
         let a = parse_args(&v(&format!(
-            "{BASE} --rekey-secs {} --keepalive-secs {} --duration {}",
+            "{BASE} --rekey-secs {} --keepalive-secs {} --stale-secs {} --duration {}",
             MAX_SECS / 2,
             MAX_SECS,
+            MAX_SECS / 2,
             MAX_SECS
         )))
         .unwrap()
