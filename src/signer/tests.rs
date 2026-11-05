@@ -81,6 +81,10 @@ struct Ap {
     on_setup: Option<Box<dyn FnMut()>>,
     /// Answer requests to somebody else instead of to the signer.
     ack_to: Option<(u8, u8)>,
+    /// The link is lost: every send and receive fails (time still passes).
+    down: bool,
+    /// Lose the link as soon as a `SETUP_SIGNING` was applied (a reboot).
+    down_after_setup: bool,
     /// The system id on every frame it sends, if not `SYS`.
     sys: Option<u32>,
     /// The system id on its `COMMAND_ACK`s only, if not its own.
@@ -123,6 +127,9 @@ impl Port for FakePort {
 
     fn send(&mut self, key: Option<&SigningKey>, msg: &MavMessage, _min_ts: u64) -> Result<u64> {
         let mut ap = self.0.borrow_mut();
+        if ap.down {
+            return Err(Error::Link("autopilot link lost"));
+        }
         if matches!(msg, MavMessage::HEARTBEAT(_)) {
             return Ok(7);
         }
@@ -147,6 +154,10 @@ impl Port for FakePort {
                     }
                     if ap.mute_after_setup {
                         ap.silent = true;
+                    }
+                    if ap.down_after_setup {
+                        ap.down_after_setup = false;
+                        ap.down = true;
                     }
                 }
             }
@@ -183,6 +194,10 @@ impl Port for FakePort {
     fn recv(&mut self, wait: Duration, keys: &[&SigningKey]) -> Result<Option<Inbound>> {
         let mut ap = self.0.borrow_mut();
         let until = ap.t + wait;
+        if ap.down {
+            ap.t = until;
+            return Err(Error::Link("autopilot link lost"));
+        }
         if ap.silent {
             ap.t = until;
             return Ok(None);
@@ -881,4 +896,84 @@ fn a_pending_key_with_no_saved_generation_is_not_guessed() {
         .save(&r.dir.join(rotation::NEXT_KEY_FILE))
         .unwrap();
     assert!(rotation::load_drone_keys(&r.dir).is_err());
+}
+
+// ---- a lost autopilot link (review R-SEC2 M1) ------------------------------
+
+/// Run rounds while the link is down; each fails and changes no file.
+fn rounds_while_down(r: &mut Rig, n: usize) {
+    let before = r.keys();
+    for _ in 0..n {
+        assert!(r.signer.tick().is_err());
+        r.ap.borrow_mut().t += Duration::from_secs(5);
+    }
+    let after = r.keys();
+    assert_eq!(after.current, before.current);
+    assert_eq!(after.current_gen, before.current_gen);
+    assert_eq!(
+        after.next.map(|(g, k)| (g, *k.as_bytes())),
+        before.next.map(|(g, k)| (g, *k.as_bytes()))
+    );
+}
+
+#[test]
+fn a_link_lost_before_a_rotation_waits_and_the_rotation_runs_when_it_is_back() {
+    let mut r = rig("sig-down-idle");
+    r.run(2);
+    r.ap.borrow_mut().down = true;
+    r.want();
+    rounds_while_down(&mut r, 20);
+    assert!(!r.files("mavlink-signing-key.next"));
+    r.ap.borrow_mut().down = false;
+    let ev = r.run(3);
+    assert_eq!(ev, vec![Event::Issued(1), Event::Rotated(1)]);
+    assert_eq!(r.ap.borrow().key, Some(*r.keys().current.as_bytes()));
+}
+
+#[test]
+fn a_link_lost_right_after_the_key_change_keeps_both_keys_and_the_generation() {
+    let mut r = rig("sig-down-mid");
+    r.run(2);
+    r.ap.borrow_mut().down_after_setup = true;
+    r.want();
+    // The autopilot takes the new key, then the link drops (a reboot).
+    assert!(r.signer.tick().is_err());
+    let keys = r.keys();
+    let (g, next) = keys.next.expect("the pending key is kept");
+    assert_eq!(g, 1);
+    assert_eq!(r.ap.borrow().key, Some(*next.as_bytes()));
+    rounds_while_down(&mut r, 20);
+    // Back: the probe finds the new key in use and commits the same
+    // generation; nothing new is issued.
+    r.ap.borrow_mut().down = false;
+    let ev = r.run(3);
+    assert_eq!(ev, vec![Event::Rotated(1)]);
+    let keys = r.keys();
+    assert!(keys.next.is_none());
+    assert_eq!(keys.current_gen, 1);
+    assert_eq!(keys.current.as_bytes(), next.as_bytes());
+}
+
+#[test]
+fn a_heartbeat_from_before_a_lost_link_does_not_count_as_disarmed() {
+    let mut r = rig("sig-down-hb");
+    r.run(1); // a fresh "disarmed" heartbeat
+    r.ap.borrow_mut().down = true;
+    r.want();
+    assert!(r.signer.tick().is_err());
+    // Back at once, but the autopilot says nothing yet (still booting).
+    {
+        let mut a = r.ap.borrow_mut();
+        a.down = false;
+        a.silent = true;
+    }
+    let ev = r.run(1);
+    assert_eq!(ev, vec![Event::WaitingHeartbeat]);
+    assert!(
+        r.ap.borrow().sends.is_empty(),
+        "nothing sent: {:?}",
+        r.ap.borrow().sends
+    );
+    r.ap.borrow_mut().silent = false;
+    assert_eq!(r.run(3), vec![Event::Issued(1), Event::Rotated(1)]);
 }

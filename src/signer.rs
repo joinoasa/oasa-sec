@@ -5,7 +5,8 @@
 //! UDP port, never a router endpoint), so `SETUP_SIGNING` never reaches
 //! routers or logs. The state machine ([`Signer`]) does its I/O through the
 //! [`Port`] trait and takes its time from it, so tests drive it against a
-//! simulated autopilot in virtual time. [`port::UdpPort`] is the real one.
+//! simulated autopilot in virtual time. [`port::AutopilotPort`] is the real one
+//! (UDP or TCP; it reconnects a lost link).
 //!
 //! One [`Signer::tick`] watches the autopilot for about a second, and then:
 //! 1. If a `.next` key exists (a crash, a lost reply, or a stuck rotation):
@@ -331,11 +332,15 @@ impl<P: Port> Signer<P> {
 
     /// One round: watch, then probe or rotate if there is work. After an
     /// error (a lost link, a full disk) the next round works out which key
-    /// the autopilot has before it does anything else.
+    /// the autopilot has before it does anything else, and no heartbeat from
+    /// before the error says the autopilot is disarmed (it may have rebooted
+    /// or armed meanwhile). The port reconnects a lost link by itself; the
+    /// files, and so the generations and any pending key, are untouched.
     pub fn tick(&mut self) -> Result<Vec<Event>> {
         let r = self.tick_inner();
         if r.is_err() {
             self.probe_due = true;
+            self.heartbeat = None;
         }
         r
     }
