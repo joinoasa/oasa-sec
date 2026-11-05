@@ -79,16 +79,29 @@ pub(crate) fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// read or write, and files over `cap` bytes. Checks and reads the same open
 /// file, so it can't be swapped in between. Returns the file and its length.
 pub(crate) fn open_private_file(path: &Path, cap: u64) -> Result<(fs::File, u64)> {
-    let link = fs::symlink_metadata(path)?;
-    if link.file_type().is_symlink() {
-        return Err(Error::BadKeyFile(format!(
-            "{} is a symlink; refusing",
-            path.display()
-        )));
-    }
-    let f = fs::File::open(path)?;
-    let meta = f.metadata()?;
-    check_private_meta(path, &link, &meta)?;
+    // Writers replace files by renaming a new one over them, and readers
+    // don't take the folder lock. A rename between the check and the open
+    // shows up as a different file: look again. Every attempt checks the
+    // file it opened, so a retry never accepts anything a first try would
+    // refuse; only a path that keeps changing gives up.
+    let mut attempt = 0;
+    let (f, meta) = loop {
+        let link = fs::symlink_metadata(path)?;
+        if link.file_type().is_symlink() {
+            return Err(Error::BadKeyFile(format!(
+                "{} is a symlink; refusing",
+                path.display()
+            )));
+        }
+        let f = fs::File::open(path)?;
+        let meta = f.metadata()?;
+        attempt += 1;
+        if !same_file(&link, &meta) && attempt < OPEN_ATTEMPTS {
+            continue;
+        }
+        check_private_meta(path, &link, &meta)?;
+        break (f, meta);
+    };
     if !meta.is_file() || meta.len() > cap {
         return Err(Error::BadKeyFile(format!(
             "{} is not a regular file of at most {cap} bytes",
@@ -96,6 +109,21 @@ pub(crate) fn open_private_file(path: &Path, cap: u64) -> Result<(fs::File, u64)
         )));
     }
     Ok((f, meta.len()))
+}
+
+/// How many times [`open_private_file`] looks again when the file is
+/// replaced between its check and its open.
+const OPEN_ATTEMPTS: u32 = 8;
+
+#[cfg(unix)]
+fn same_file(link: &fs::Metadata, meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.dev() == link.dev() && meta.ino() == link.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -360,6 +388,48 @@ mod tests {
         assert_eq!(&read_private_file(&p).unwrap()[..], b"three");
         // No temp files left behind.
         assert_eq!(fs::read_dir(&d).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_reader_racing_atomic_replaces_never_fails() {
+        // Readers don't lock; writers rename new files over the old. Before
+        // the retry, a rename between the check and the open was an error
+        // ("changed while opening"), which made a CI test flaky.
+        let d = tempdir("files-race");
+        let p = d.join("secret");
+        write_private_file(&p, b"v0").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (p, stop) = (p.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    write_private_file(&p, format!("v{n}").as_bytes()).unwrap();
+                    n += 1;
+                }
+                n
+            })
+        };
+        for _ in 0..20_000 {
+            let b = read_private_file(&p).unwrap();
+            assert!(b.starts_with(b"v"));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(writer.join().unwrap() > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_and_an_open_mode_are_still_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir("files-refuse");
+        let p = d.join("secret");
+        write_private_file(&p, b"x").unwrap();
+        let l = d.join("link");
+        std::os::unix::fs::symlink(&p, &l).unwrap();
+        assert!(matches!(read_private_file(&l), Err(Error::BadKeyFile(_))));
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(read_private_file(&p), Err(Error::BadKeyFile(_))));
     }
 
     #[test]
