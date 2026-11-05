@@ -118,6 +118,7 @@ Generations (`mavlink-signing-gen`) are never reused. Details and what was check
 
 - [Pairing guide](docs/guide-pairing.md): set up, pair, remove, rotate (R-SEC1)
 - [Training](docs/training-r-sec1.md): a 1 to 2 hour course on a laptop
+- [Training: roles, removal, key rotation](docs/training-r-sec2.md): a 1 hour course on a laptop (R-SEC2)
 - [Release record](docs/release-r-sec1.md): test results and security review status
 
 Licensed under [Apache-2.0](LICENSE).
