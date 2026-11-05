@@ -143,6 +143,14 @@ The signer owns SERIAL1 (`tcpout:127.0.0.1:5782`); test clients use SERIAL2. The
 
 A signed `SETUP_SIGNING` from the signer changed the key without a restart, and the new key worked afterwards in every rotation. Not tested on ArduPilot: a lost `COMMAND_ACK` and a silent autopilot (the gate is UDP only; both are covered on PX4 and in unit tests), and a UDP link.
 
+**Not yet run in SITL: an ArduPilot reboot under a running signer** (security review R-SEC2 M1). Over `tcpout:` an ArduPilot reboot closes the signer's TCP connection. Before the fix the signer's reader stopped for good and it logged `signer_error` every 5 s without reconnecting; now it reconnects with backoff and prints `autopilot_reconnected`. Covered so far by unit tests (`src/signer/port/tests.rs`: a stand-in TCP autopilot that closes after taking the new key and comes back; the rotation completes under the same generation) and `scripts/e2e.sh` (the stand-in autopilot killed and restarted). For the lab's `l1-mavlink-sitl` in oasa-lab, add:
+
+1. Start ArduPilot SITL and the signer on SERIAL1 (`tcpout:127.0.0.1:5782`), wait for `signer_started` and a few seconds of heartbeats.
+2. Restart SITL (same `eeprom.bin`, so it keeps the key). Expect `signer_error` while it is down, then `autopilot_reconnected` within about 10 s of SERIAL1 listening again.
+3. `oasa-pair rotate-signing`. Expect `rotation_done` (ArduPilot may refuse new signed streams for up to a minute after the reboot; the probe waits 75 s), and the new key works on SERIAL2.
+4. Again, but restart SITL right after `rotation_started` (before `rotation_done`): expect the same generation to finish (`rotation_done` with it, no second `rotation_started`), `.next` gone, and both the drone and ArduPilot on the new key.
+5. Send one empty UDP datagram to the signer if it runs over `udpout:` (PX4): it must keep working.
+
 ## Helpers
 
 Test tools only, in `tests/sitl/`: `px4_client.py` (send a signed or unsigned command), `px4_setup.py` (send `SETUP_SIGNING`), `approbe.py` (same for ArduPilot, plus a check that frames are signed), `udp_gate.py` (a UDP go-between that drops PX4's replies or the key change on command), `arm.py` (arm or disarm with a signed command).

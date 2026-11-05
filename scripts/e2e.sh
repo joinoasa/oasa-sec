@@ -239,4 +239,50 @@ wait_count 90 rotation_done "$T/signer2.log" 2 || fail "the retry after a rollba
 [ "$(cat "$T/drone/mavlink-signing-gen")" = 5 ] || fail "retry did not use a new generation"
 pass "a refused change is rolled back; the retry uses a new generation"
 
+# Security review R-SEC2 M1: datagrams from anyone else, and an empty one, don't stop the signer.
+SPORT=$($PYTHON -I -c '
+import os, sys
+pid = sys.argv[1]
+inodes = set()
+for fd in os.listdir(f"/proc/{pid}/fd"):
+    try:
+        l = os.readlink(f"/proc/{pid}/fd/" + fd)
+    except OSError:
+        continue
+    if l.startswith("socket:["):
+        inodes.add(l[8:-1])
+for line in open("/proc/net/udp").readlines()[1:]:
+    f = line.split()
+    if f[9] in inodes:
+        print(int(f[1].split(":")[1], 16)); break
+' "$SIGNER")
+[ -n "$SPORT" ] || fail "could not find the signer's UDP port"
+$PYTHON -I -c 'import socket, sys; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"", ("127.0.0.1", int(sys.argv[1])))' "$SPORT"
+sleep 1
+$B/oasa-pair rotate-signing --dir "$T/drone" >/dev/null
+wait_count 40 rotation_done "$T/signer2.log" 3 || fail "an empty datagram stopped the signer"
+[ "$(cat "$T/drone/mavlink-signing-gen")" = 6 ] || fail "generation is not 6"
+pass "an empty datagram from another host does not stop the signer"
+
+# An autopilot on TCP that reboots (ArduPilot on tcpout:): the signer reconnects and rotates.
+kill "$SIGNER"; wait "$SIGNER" 2>/dev/null || true
+head -c 32 "$T/drone/mavlink-signing-key.bin" > "$T/ap-tcp-state"
+start_tcp_ap() {
+  $B/examples/fake_autopilot tcpin:127.0.0.1:14560 --state-file "$T/ap-tcp-state" >> "$T/ap-tcp.log" 2>&1 & APT=$!; PIDS+=($APT)
+  wait_tcp_listen 10 14560 || fail "TCP autopilot did not start"
+}
+start_tcp_ap
+$B/oasa-pair signer --dir "$T/drone" --autopilot tcpout:127.0.0.1:14560 > "$T/signer3.log" 2>&1 & SIGNER=$!; PIDS+=($SIGNER)
+wait_for 10 signer_started "$T/signer3.log" || fail "TCP signer did not start"
+sleep 2
+kill "$APT"; wait "$APT" 2>/dev/null || true
+sleep 2
+start_tcp_ap
+wait_for 30 autopilot_reconnected "$T/signer3.log" || fail "the signer did not reconnect after the autopilot rebooted"
+$B/oasa-pair rotate-signing --dir "$T/drone" >/dev/null
+wait_for 60 rotation_done "$T/signer3.log" || fail "no rotation after the autopilot rebooted"
+[ "$(cat "$T/drone/mavlink-signing-gen")" = 7 ] || fail "generation is not 7"
+[ "$(key32 "$T/ap-tcp-state")" = "$(key32 "$T/drone/mavlink-signing-key.bin")" ] || fail "the TCP autopilot does not have the drone's key"
+pass "a TCP autopilot that reboots is reconnected and the rotation completes"
+
 echo "All end-to-end checks passed."

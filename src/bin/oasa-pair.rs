@@ -16,7 +16,7 @@ use oasa_sec::identity::{self, Identity, fingerprint};
 use oasa_sec::pairing::{DeadlineStream, check_name, pair_as_drone_checked, pair_as_ground};
 use oasa_sec::removal;
 use oasa_sec::rotation;
-use oasa_sec::signer::{self, port::UdpPort};
+use oasa_sec::signer::{self, port::AutopilotPort};
 use oasa_sec::signing::{AUTOPILOT_KEY_FILE, SigningKey, peer_key_path};
 use oasa_sec::store::{self, Role};
 
@@ -96,8 +96,12 @@ USAGE:
             acknowledgment, then commits. At every start, and after any failed step, it
             works out which key the autopilot has before it does anything (listens, then
             asks under each key for 75 s) and never deletes a key that might be in use.
+            --autopilot is udpout:HOST:PORT or tcpout:HOST:PORT (listening modes are
+            refused: they would send the new key to whoever spoke last). A lost link
+            (a rebooting autopilot) is reconnected with backoff.
             Prints one JSON line per event: rotation_waiting_armed, rotation_started,
-            rotation_done, rotation_rolled_back, rotation_stuck, rotation_refused. Keep it running.
+            rotation_done, rotation_rolled_back, rotation_stuck, rotation_refused,
+            signer_error, autopilot_reconnected. Keep it running.
   rotate-signing
             Ask the signer to change the drone's signing key (it also does this by itself
             after an operator is removed). Writes rotation-pending.
@@ -1136,20 +1140,28 @@ fn signer(o: &Opts) -> R {
     }
     // One signer per folder: two could each run a rotation on one autopilot.
     let _one = oasa_sec::rotation::lock_signer(&dir)?;
-    let port = UdpPort::connect(o.req("autopilot")?, sys, link_id)?;
+    let port = AutopilotPort::connect(o.req("autopilot")?, sys, link_id)?;
     let mut s = signer::Signer::new(&dir, port, signer::Config { sys, comp });
     s.on_event(|e| println!("{}", json_event(e)));
     println!("{{\"ts\":{},\"event\":\"signer_started\"}}", now_unix());
     loop {
-        if let Err(e) = s.tick() {
+        let r = s.tick();
+        if s.port().take_reconnected() {
+            println!(
+                "{{\"ts\":{},\"event\":\"autopilot_reconnected\"}}",
+                now_unix()
+            );
+        }
+        if let Err(e) = r {
             // The error text never holds a key. The next round looks at which
-            // key the autopilot has before it does anything.
+            // key the autopilot has before it does anything. A lost autopilot
+            // link is reconnected by the port, with backoff.
             println!(
                 "{{\"ts\":{},\"event\":\"signer_error\",\"error\":{:?}}}",
                 now_unix(),
                 e.to_string()
             );
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_secs(2));
         }
     }
 }
