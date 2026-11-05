@@ -244,7 +244,7 @@ impl<P: Port> Signer<P> {
     }
 
     fn sent_by_autopilot(&self, f: &Inbound) -> bool {
-        f.header.system_id == self.cfg.sys && f.header.component_id == self.cfg.comp
+        f.header.system_id == u32::from(self.cfg.sys) && f.header.component_id == self.cfg.comp
     }
 
     /// Take in a frame. Signature times count only when the signature
@@ -252,7 +252,7 @@ impl<P: Port> Signer<P> {
     /// Arming state comes from the autopilot's own heartbeat: signed and
     /// verified, or, until we have seen it sign anything, unsigned.
     fn note(&mut self, f: &Inbound) {
-        if f.header.system_id != self.cfg.sys {
+        if f.header.system_id != u32::from(self.cfg.sys) {
             return;
         }
         let verified = f.sig.is_some_and(|s| s.verified_by.is_some());
