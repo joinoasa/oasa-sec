@@ -15,6 +15,8 @@
 //! A key in `removed` is never trusted, whatever `trusted-peers.v1` says.
 //! A removal writes the tombstone first and edits the list second, so a crash
 //! or a reader in between can only ever see "removed", never "still trusted".
+//! On a drone, removing an operator writes its rotation request before
+//! either, so a failure never leaves a removed operator with no request.
 //!
 //! This module does file work only: no sockets and no clocks (times come in
 //! as arguments).
@@ -294,7 +296,17 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-/// The whole local removal, under the lock the caller holds. Tombstone first.
+/// The whole local removal, under the lock the caller holds. On a drone that
+/// lists the target as operator, the rotation request comes first; then the
+/// tombstone, then the list.
+///
+/// The request goes first because only the list says the target was an
+/// operator: once it is out of the list nothing on disk says a rotation is
+/// owed, so a request that failed after that would be lost for good (a rerun
+/// of `remove`, or an admin's resent entry, would find nothing to do). In
+/// this order a failure at any step leaves the target listed as operator, or
+/// the request saved, or both; a rerun finishes the job, and the worst case
+/// is one extra request, which is harmless (as in [`store::add`]).
 fn remove_key_locked(
     dir: &Path,
     lock: &DirLock,
@@ -309,6 +321,13 @@ fn remove_key_locked(
     let peer = pos.map(|i| listed[i].clone());
     let fp = fingerprint(target);
 
+    // 0. A drone asks for a new signing key when an operator goes, before
+    //    anything else changes (see above).
+    if peer.as_ref().is_some_and(|p| p.role == Role::Operator)
+        && fs::symlink_metadata(dir.join(AUTOPILOT_KEY_FILE)).is_ok()
+    {
+        mark_rotation_pending(dir, lock, &fp, unix)?;
+    }
     // 1. The tombstone. After this line is saved the key is never trusted.
     append_record(
         dir,
@@ -342,12 +361,6 @@ fn remove_key_locked(
                 remove_file_if_exists(&e.path())?;
             }
         }
-    }
-    //    A drone asks for a new signing key when an operator goes.
-    if peer.as_ref().is_some_and(|p| p.role == Role::Operator)
-        && fs::symlink_metadata(dir.join(AUTOPILOT_KEY_FILE)).is_ok()
-    {
-        mark_rotation_pending(dir, lock, &fp, unix)?;
     }
     Ok(RemoveOutcome {
         peer,
