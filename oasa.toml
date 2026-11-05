@@ -14,6 +14,7 @@ docs = [
   "SECURITY.md",
   "docs/oasa-sec-v0-pairing.md",
   "docs/oasa-sec-v0-link.md",
+  "docs/security-review-r-com2.md",
   "docs/oasa-sec-v0-rotation.md",
   "docs/oasa-sec-v0-group.md",
   "docs/guide-pairing.md",
