@@ -19,6 +19,7 @@ docs = [
   "docs/guide-pairing.md",
   "docs/training-r-sec1.md",
   "docs/release-r-sec1.md",
+  "docs/security-review-r-sec1.md",
 ]
 
 [review]
