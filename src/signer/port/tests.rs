@@ -215,7 +215,7 @@ fn ack(seq: u8, to: (u8, u8), key: &[u8; 32], ts: u64) -> Vec<u8> {
     buf[1] = 10;
     buf[2] = consts::v2::IFLAG_SIGNED;
     buf[4] = seq;
-    buf[5] = AP.system_id;
+    buf[5] = u8::try_from(AP.system_id).expect("the test autopilot's id fits a byte");
     buf[6] = AP.component_id;
     buf[7..10].copy_from_slice(&77u32.to_le_bytes()[..3]);
     buf[10..12].copy_from_slice(&(MavCmd::MAV_CMD_REQUEST_MESSAGE as u16).to_le_bytes());
@@ -273,7 +273,12 @@ fn serve(l: TcpListener, ap: Arc<Mutex<Ap>>) {
                 Ok(MavMessage::COMMAND_LONG(c)) if c.command == MavCmd::MAV_CMD_REQUEST_MESSAGE => {
                     seq = seq.wrapping_add(1);
                     ts += 1;
-                    let to = (raw.system_id(), raw.component_id());
+                    // Answer only 8-bit senders, as the stand-in autopilot does (a
+                    // 32-bit id is never narrowed to its low byte).
+                    let Ok(sys) = u8::try_from(raw.system_id()) else {
+                        continue;
+                    };
+                    let to = (sys, raw.component_id());
                     if out.write_all(&ack(seq, to, &key, ts)).is_err() {
                         break 'conn;
                     }

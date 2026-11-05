@@ -1260,7 +1260,7 @@ fn signed_round_trip(
         loop {
             match reader.recv() {
                 Ok((h, MavMessage::COMMAND_ACK(ack)))
-                    if h.system_id == sys
+                    if h.system_id == u32::from(sys)
                         && h.component_id == comp
                         && ack.command == MavCmd::MAV_CMD_REQUEST_MESSAGE =>
                 {
@@ -1319,7 +1319,7 @@ fn companion_header(system_id: u8) -> MavHeader {
     // The drone's companion computer: same system as its autopilot,
     // component 191 (MAV_COMP_ID_ONBOARD_COMPUTER).
     MavHeader {
-        system_id,
+        system_id: system_id.into(),
         component_id: 191,
         sequence: 0,
     }
