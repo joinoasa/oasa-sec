@@ -444,6 +444,12 @@ impl fmt::Debug for Link {
 }
 
 impl Link {
+    /// Tests only: the session this link sends on.
+    #[cfg(test)]
+    pub(crate) fn current_session_mut(&mut self) -> Option<&mut session::Session> {
+        self.ep.current_session_mut(self.id)
+    }
+
     /// Make a link from our identity to `peer_public`.
     ///
     /// `wall_base` is the Unix time (since 1970) at monotonic zero, or

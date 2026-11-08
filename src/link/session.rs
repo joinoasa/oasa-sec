@@ -62,6 +62,20 @@ impl Session {
         }
     }
 
+    /// Tests only: move our send counter (the AEAD nonce) to `next`.
+    #[cfg(test)]
+    pub fn jump_send_counter(&mut self, next: u64) {
+        self.send_counter = next;
+    }
+
+    /// Tests only: forget what was received and take `highest` as the newest
+    /// counter seen, as if the session had run that long.
+    #[cfg(test)]
+    pub fn jump_recv_counter(&mut self, highest: u64) {
+        self.recv = ReplayWindow::new();
+        assert!(self.recv.mark(highest));
+    }
+
     /// Past 15 minutes or 2^60 packets: no sending, no accepting.
     pub fn expired(&self, now: Duration, cfg: &Config) -> bool {
         now.saturating_sub(self.created) >= cfg.reject_after
