@@ -171,7 +171,7 @@ Names are 1 to 32 characters of `A-Z a-z 0-9 - _ .`. `init` prints the **fingerp
 ### Autopilot link
 
 - ArduPilot: put the companion on **SERIAL1 or higher**. Never SERIAL0.
-- Give `oasa-pair` a **dedicated** link to the autopilot: its own UDP or TCP port (for example from a MAVLink router), not shared with the radio. Tested: UDP and TCP (`udpout:HOST:PORT`, `tcpout:HOST:PORT`). `serial:PORT:BAUD` is accepted by the address format but has not been tested.
+- Give `oasa-pair` a **dedicated** link to the autopilot: its own UDP or TCP port (for example from a MAVLink router), not shared with the radio. Tested: UDP and TCP (`udpout:HOST:PORT`, `tcpout:HOST:PORT`). The signer refuses listening modes (`udpin:`, `tcpin:`, `udpbcast:`), which could hand the new key to whoever connected, and `serial:`, which this build doesn't support yet (use a serial-to-UDP bridge such as a MAVLink router).
 - The same link is used for pairing and for the `signer` later. Only one program should hold it at a time.
 - `--target SYS:COMP` is the autopilot's ids (default 1:1).
 
