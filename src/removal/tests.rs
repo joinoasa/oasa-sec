@@ -152,6 +152,79 @@ fn a_drone_removing_an_operator_asks_for_a_rotation_and_a_peer_does_not() {
     assert!(d.join(ROTATION_PENDING_FILE).exists());
 }
 
+/// A drone whose `rotation-pending` cannot be written (a stand-in for a full
+/// disk or a damaged generation file).
+fn drone_that_cannot_ask_for_a_rotation() -> PathBuf {
+    let d = device();
+    write_private_file(&d.join(AUTOPILOT_KEY_FILE), &[7u8; 40]).unwrap();
+    std::fs::create_dir(d.join(ROTATION_PENDING_FILE)).unwrap();
+    d
+}
+
+fn fix_rotation_pending(d: &Path) {
+    std::fs::remove_dir(d.join(ROTATION_PENDING_FILE)).unwrap();
+}
+
+fn pending(d: &Path) -> usize {
+    crate::rotation::pending_lines(d).unwrap()
+}
+
+#[test]
+fn a_failed_rotation_request_leaves_the_operator_listed_and_a_rerun_asks_again() {
+    let d = drone_that_cannot_ask_for_a_rotation();
+    assert!(remove_local(&d, &OWN, &OP, 1).is_err());
+    // Nothing else changed: no tombstone, still listed as operator.
+    assert!(!load_removed(&d).unwrap().is_removed(&OP));
+    assert_eq!(store::get(&d, &OP).unwrap().unwrap().role, Role::Operator);
+    fix_rotation_pending(&d);
+    let out = remove_local(&d, &OWN, &OP, 2).unwrap();
+    assert_eq!(out.peer.unwrap().role, Role::Operator);
+    assert!(!listed(&d, &OP));
+    assert_eq!(pending(&d), 1, "the rerun must ask for the rotation");
+}
+
+#[test]
+fn a_failed_rotation_request_on_an_admins_entry_is_not_acked_and_the_resend_asks_again() {
+    let d = drone_that_cannot_ask_for_a_rotation();
+    let a1 = fingerprint(&A1);
+    on_head(&d, &a1, &[7; 4], 1).unwrap();
+    // An error: the control layer does not ack it, so the admin sends it again.
+    assert!(apply_entry(&d, &OWN, &A1, &entry(7, 1, OP), 9).is_err());
+    assert!(!load_removed(&d).unwrap().is_removed(&OP));
+    assert!(listed(&d, &OP));
+    assert_eq!(sync_state(&d, &a1).unwrap(), Some(([7; 4], 0)));
+    fix_rotation_pending(&d);
+    // The resend is new, not `Known`, and asks for the rotation.
+    assert_eq!(
+        apply_entry(&d, &OWN, &A1, &entry(7, 1, OP), 10).unwrap(),
+        Applied::Removed
+    );
+    assert!(!listed(&d, &OP));
+    assert_eq!(pending(&d), 1);
+    assert_eq!(sync_state(&d, &a1).unwrap(), Some(([7; 4], 1)));
+    // A third copy is known, changes nothing, and asks for nothing more.
+    assert_eq!(
+        apply_entry(&d, &OWN, &A1, &entry(7, 1, OP), 11).unwrap(),
+        Applied::Known
+    );
+    assert_eq!(pending(&d), 1);
+}
+
+#[test]
+fn a_failed_rotation_request_on_revoke_keeps_the_log_entry_and_a_rerun_finishes() {
+    let d = drone_that_cannot_ask_for_a_rotation();
+    assert!(revoke(&d, &OWN, &OP, 1).is_err());
+    // The log entry is saved first (the fleet still learns of it)...
+    assert_eq!(load_log(&d).unwrap().unwrap().entries.len(), 1);
+    // ...but the local removal did not happen.
+    assert!(listed(&d, &OP));
+    fix_rotation_pending(&d);
+    let r = revoke(&d, &OWN, &OP, 2).unwrap();
+    assert!(r.was_in_log);
+    assert!(!listed(&d, &OP));
+    assert_eq!(pending(&d), 1);
+}
+
 #[test]
 fn a_ground_station_removing_a_drone_deletes_its_signing_keys() {
     let d = device();
