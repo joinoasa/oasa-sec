@@ -20,7 +20,8 @@ use oasa_sec::control::{Action, Control, Note};
 use oasa_sec::identity::{Identity, fingerprint};
 use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
-    RadioProfile, SendError, SourceLimiter, looks_like_handshake1,
+    Pass, RadioProfile, SendError, SourceLimiter, StampGate, StoredStamps, TimestampStore,
+    looks_like_handshake1,
 };
 use oasa_sec::mavguard::{Block, Guard, max_verified_timestamp};
 use oasa_sec::removal::{LOG_FILE, REMOVED_FILE};
@@ -108,7 +109,10 @@ USAGE:
   --duration       Stop after this many seconds. Stops on SIGINT or SIGTERM too.
 
 Prints one JSON line per event: handshake_sent, session_established, rekey, drop, hint,
-mavlink_guard (at start), warning. A datagram stopped by the guard is a drop with reason
+mavlink_guard (at start), warning. A handshake is logged as handshake_sent when it is made
+and leaves once its timestamp is on disk (written off the packet path, so data never
+waits): handshake_released (kind 1 or 2, waited_ms), or handshake_dropped (reason
+stamp_not_saved or handshake_backlog) if it never left. A datagram stopped by the guard is a drop with reason
 mavlink_blocked, a why word, the message id and (for commands) the command id
 (never contents). The widening flags each print a warning at start.
 At most 10 drop lines a second are printed; a drops_suppressed line counts the rest.
@@ -606,6 +610,71 @@ enum Msg {
     Plain(Vec<u8>, SocketAddr),
 }
 
+/// Work for the writer thread.
+enum Job {
+    /// Write the link's handshake timestamps (write number, values).
+    Stamps(u64, StoredStamps),
+    /// A drone's highest forwarded MAVLink signature time.
+    SeenTs(u64),
+    /// Finish what is queued, then stop.
+    Stop,
+}
+
+/// What the writer thread did.
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    /// The handshake timestamp write `seq` is durable (`ok`) or failed.
+    Stamps { seq: u64, ok: bool },
+    /// The MAVLink signature time `ts` was saved (`ok`) or not.
+    SeenTs { ts: u64, ok: bool },
+}
+
+/// Start the thread that writes files durably (each write is two `fsync`s,
+/// tens of milliseconds on flash, sometimes over 100). The main loop never
+/// waits for it: the handshake timestamps go through a `StampGate`, which
+/// holds back only the handshake packet that needs them until the write
+/// reports back, while data keeps flowing on the current session. Jobs that
+/// pile up are merged: the newest timestamps cover the older ones, as both
+/// only go up.
+///
+/// Reports come back on their own channel, which the main loop empties on
+/// every pass (at least every 10 ms). They do not share the packet queue, so
+/// a flood of packets cannot hold them up, and the writer does not keep the
+/// packet queue open: if a socket reader dies, the loop still sees it.
+/// After `Job::Stop` (or when every job sender is gone) the thread finishes
+/// what is queued and drops its report sender, so the loop can wait for it.
+fn spawn_writer(dir: PathBuf, peer: [u8; 32]) -> (mpsc::Sender<Job>, mpsc::Receiver<Report>) {
+    let (jobs, rx) = mpsc::channel::<Job>();
+    let (reports, back) = mpsc::channel::<Report>();
+    std::thread::spawn(move || {
+        let mut store = FileTimestampStore::new(&dir, &peer);
+        let mut stop = false;
+        while !stop && let Ok(first) = rx.recv() {
+            let mut stamps = None;
+            let mut seen: Option<u64> = None;
+            for job in std::iter::once(first).chain(rx.try_iter()) {
+                match job {
+                    Job::Stamps(seq, st) => stamps = Some((seq, st)),
+                    Job::SeenTs(t) => seen = Some(seen.map_or(t, |s| s.max(t))),
+                    Job::Stop => {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if let Some((seq, st)) = stamps {
+                let ok = store.save(&st).is_ok();
+                let _ = reports.send(Report::Stamps { seq, ok });
+            }
+            if let Some(ts) = seen {
+                let ok = write_seen_ts(&dir, ts).is_ok();
+                let _ = reports.send(Report::SeenTs { ts, ok });
+            }
+        }
+    });
+    (jobs, back)
+}
+
 /// Read datagrams from `sock` forever and pass them on.
 fn spawn_reader(sock: UdpSocket, tx: mpsc::SyncSender<Msg>, encrypted: bool) {
     std::thread::spawn(move || {
@@ -736,11 +805,18 @@ struct Tunnel {
     /// A drone saves the highest MAVLink signature time it forwards, as a
     /// floor for the next signing-key change (at most every 10 s).
     seen: SeenTs,
+    /// Handshake packets waiting until their timestamps are on disk, with
+    /// where they go. Data packets never wait (see `spawn_writer`).
+    gate: StampGate<(SocketAddr, Instant)>,
+    /// The thread that writes files with `fsync`, off the packet path.
+    writer: mpsc::Sender<Job>,
 }
 
 struct SeenTs {
     dir: PathBuf,
     drone: bool,
+    /// The file is written by the writer thread, never on the packet path.
+    writer: mpsc::Sender<Job>,
     best: u64,
     saved: u64,
     last_save: Instant,
@@ -771,10 +847,12 @@ impl SeenTs {
             ));
         }
         if self.best > self.saved && self.last_save.elapsed() >= Duration::from_secs(10) {
-            // A failed save only means a lower floor; the signer has its own clock.
-            if write_seen_ts(&self.dir, self.best).is_ok() {
-                self.saved = self.best;
-            }
+            // Written on the writer thread: an `fsync` here would hold up
+            // every packet behind it. `saved` moves only when the writer
+            // reports success; a failed save is tried again 10 s later (and
+            // only means a lower floor meanwhile: the signer has its own
+            // clock).
+            let _ = self.writer.send(Job::SeenTs(self.best));
             self.last_save = Instant::now();
         }
     }
@@ -837,11 +915,20 @@ impl Tunnel {
                         Dest::Remote => self.remote,
                         Dest::Source => source,
                     };
-                    match dest {
-                        Some(d) => {
-                            let _ = self.enc.send_to(&packet, d);
+                    let Some(d) = dest else {
+                        self.local_drop("no_remote");
+                        continue;
+                    };
+                    // A handshake waits for its timestamp to be on disk; data
+                    // never waits.
+                    match self.gate.pass(packet, (d, Instant::now())) {
+                        Pass::Send(p, (d, _)) => {
+                            let _ = self.enc.send_to(&p, d);
                         }
-                        None => self.local_drop("no_remote"),
+                        Pass::Held => {}
+                        Pass::HeldDroppedOldest(p, _) => {
+                            self.handshake_dropped(&p, "handshake_backlog")
+                        }
                     }
                 }
                 Event::Deliver(p) => {
@@ -908,6 +995,63 @@ impl Tunnel {
                 }
             }
         }
+        self.flush_writes();
+    }
+
+    /// Hand what the link just saved to the writer thread.
+    fn flush_writes(&mut self) {
+        if let Some((seq, stamps)) = self.gate.take_write()
+            && self.writer.send(Job::Stamps(seq, stamps)).is_err()
+        {
+            // The writer is gone: nothing will be saved, so nothing waits.
+            self.on_report(Report::Stamps { seq, ok: false });
+        }
+    }
+
+    /// The writer thread finished something. For the handshake timestamps:
+    /// send the handshakes the write released (`handshake_released`), or
+    /// drop them if it failed (`handshake_dropped`; the link's retry makes a
+    /// new handshake).
+    fn on_report(&mut self, r: Report) {
+        match r {
+            Report::Stamps { seq, ok } => {
+                let r = self.gate.written(seq, ok);
+                for (p, (d, made)) in r.send {
+                    let _ = self.enc.send_to(&p, d);
+                    println!(
+                        "{{\"ts\":\"{}\",\"event\":\"handshake_released\",\"kind\":{},\"waited_ms\":{}}}",
+                        rfc3339(SystemTime::now()),
+                        p.first().map_or(0, |h| h >> 4),
+                        made.elapsed().as_millis()
+                    );
+                }
+                if !ok {
+                    println!(
+                        "{{\"ts\":\"{}\",\"event\":\"error\",\"what\":\"could not save the handshake timestamp\"}}",
+                        rfc3339(SystemTime::now())
+                    );
+                    for (p, _) in r.dropped {
+                        self.handshake_dropped(&p, "stamp_not_saved");
+                    }
+                }
+            }
+            Report::SeenTs { ts, ok } => {
+                if ok {
+                    self.seen.saved = self.seen.saved.max(ts);
+                }
+            }
+        }
+    }
+
+    /// A handshake the link made never left: counted and logged as a drop
+    /// with `reason`, and as `handshake_dropped`.
+    fn handshake_dropped(&mut self, packet: &[u8], reason: &'static str) {
+        println!(
+            "{{\"ts\":\"{}\",\"event\":\"handshake_dropped\",\"kind\":{},\"reason\":\"{reason}\"}}",
+            rfc3339(SystemTime::now()),
+            packet.first().map_or(0, |h| h >> 4)
+        );
+        self.local_drop(reason);
     }
 
     /// Do what the control layer asked: send its messages on the link, count
@@ -996,13 +1140,17 @@ fn run(args: &[String]) -> R<u8> {
         .map_err(|_| "the clock is before 1970")?;
     let config = config_from(&a)?;
     let control_retry = control_retry(&a, &config);
+    // The timestamps are read here, once, and from then on written by the
+    // writer thread; the gate holds each handshake until its write is done.
+    let on_disk = FileTimestampStore::new(&a.dir, &peer.public).load()?;
+    let (stamps, gate) = StampGate::new(on_disk);
     let link = Link::new(
         &me,
         peer.public,
         config,
         Box::new(OsEntropy),
         wall_base,
-        Box::new(FileTimestampStore::new(&a.dir, &peer.public)),
+        Box::new(stamps),
     )?;
     drop(me);
     let mut link = link;
@@ -1058,6 +1206,7 @@ fn run(args: &[String]) -> R<u8> {
 
     let (tx, rx) = mpsc::sync_channel::<Msg>(4096);
     spawn_reader(enc.try_clone()?, tx.clone(), true);
+    let (writer, reports) = spawn_writer(a.dir.clone(), peer.public);
     spawn_reader(plain_in, tx, false);
     // Handshakes per source address (the port is free for an attacker to vary).
     let mut source_limit: SourceLimiter<IpAddr> = SourceLimiter::new(SOURCE_HANDSHAKES_PER_SECOND);
@@ -1078,12 +1227,15 @@ fn run(args: &[String]) -> R<u8> {
         seen: SeenTs {
             dir: a.dir.clone(),
             drone: a.dir.join(AUTOPILOT_KEY_FILE).exists(),
+            writer: writer.clone(),
             best: 0,
             saved: 0,
             last_save: Instant::now(),
             key: None,
             key_read: None,
         },
+        gate,
+        writer,
     };
 
     if a.initiate {
@@ -1144,6 +1296,11 @@ fn run(args: &[String]) -> R<u8> {
                 }
             }
         }
+        // What the writer finished: release (or drop) the handshakes that
+        // waited for it.
+        while let Ok(r) = reports.try_recv() {
+            t.on_report(r);
+        }
         let now = start.elapsed();
         let ev = t.link.poll_timers(now);
         t.apply(ev, None, now);
@@ -1184,6 +1341,20 @@ fn run(args: &[String]) -> R<u8> {
         t.flush_drop_summary(false);
     }
     t.flush_drop_summary(true);
+    // Let the writer finish what is queued (the drone's MAVLink time, say),
+    // for at most 2 s. Not after our own peer was removed: its timestamp
+    // file was deleted on purpose and must not be written again.
+    if exit_code != EXIT_PEER_REMOVED && t.writer.send(Job::Stop).is_ok() {
+        let until = Instant::now() + Duration::from_secs(2);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            match reports.recv_timeout(left) {
+                // No handshake goes out any more; the rest only updates state.
+                Ok(Report::Stamps { .. }) => {}
+                Ok(r) => t.on_report(r),
+                Err(_) => break,
+            }
+        }
+    }
     t.print_stats();
     Ok(exit_code)
 }
@@ -1268,6 +1439,272 @@ fn rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_tempdir(name: &str) -> PathBuf {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+        let p = std::env::temp_dir().join(format!("oasa-link-test-{name}-{hex}"));
+        std::fs::create_dir_all(&p).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        p
+    }
+
+    fn report(rx: &mpsc::Receiver<Report>) -> Report {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("no answer from the writer")
+    }
+
+    #[test]
+    fn the_writer_thread_saves_reports_back_and_flushes_on_stop() {
+        let dir = private_tempdir("writer");
+        let peer_pub = *Identity::generate().unwrap().public_key();
+        let (jobs, reports) = spawn_writer(dir.clone(), peer_pub);
+        let (mut stamps, mut gate) = StampGate::<u8>::new(StoredStamps::default());
+        let st = StoredStamps {
+            sent: Some(oasa_sec::link::Timestamp { secs: 9, nanos: 1 }),
+            seen: None,
+        };
+        stamps.save(&st).unwrap();
+        let (seq, what) = gate.take_write().unwrap();
+        jobs.send(Job::Stamps(seq, what)).unwrap();
+        assert_eq!(report(&reports), Report::Stamps { seq, ok: true });
+        assert_eq!(FileTimestampStore::new(&dir, &peer_pub).load().unwrap(), st);
+        // The drone's MAVLink time: merged, reported, and flushed by Stop.
+        jobs.send(Job::SeenTs(77)).unwrap();
+        jobs.send(Job::SeenTs(55)).unwrap();
+        jobs.send(Job::Stop).unwrap();
+        let mut got = Vec::new();
+        while let Ok(r) = reports.recv_timeout(Duration::from_secs(10)) {
+            got.push(r);
+        }
+        // The thread ended (its report sender is gone) after saving 77.
+        assert!(
+            got.contains(&Report::SeenTs { ts: 77, ok: true }),
+            "{got:?}"
+        );
+        assert_eq!(oasa_sec::rotation::read_seen_ts(&dir).unwrap(), 77);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_fails_is_reported() {
+        let base = private_tempdir("writer-fail");
+        // A "directory" that is a file: every write fails.
+        let dir = base.join("not-a-dir");
+        std::fs::write(&dir, b"x").unwrap();
+        let (jobs, reports) = spawn_writer(dir, [7u8; 32]);
+        jobs.send(Job::Stamps(1, StoredStamps::default())).unwrap();
+        assert_eq!(report(&reports), Report::Stamps { seq: 1, ok: false });
+        jobs.send(Job::SeenTs(5)).unwrap();
+        assert_eq!(report(&reports), Report::SeenTs { ts: 5, ok: false });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `Tunnel` as `run` builds it, on localhost sockets, whose writer is
+    /// the test itself (a disk that takes as long as the test likes). Returns
+    /// the tunnel, the socket that sees what it puts on the wire, the jobs
+    /// it hands the writer, and the peer's identity.
+    #[allow(clippy::type_complexity)]
+    fn test_tunnel(
+        dir: &std::path::Path,
+    ) -> (Tunnel, UdpSocket, mpsc::Receiver<Job>, Identity, [u8; 32]) {
+        let me = Identity::generate().unwrap();
+        let peer = Identity::generate().unwrap();
+        let on_disk = FileTimestampStore::new(dir, peer.public_key())
+            .load()
+            .unwrap();
+        let (stamps, gate) = StampGate::new(on_disk);
+        let link = Link::new(
+            &me,
+            *peer.public_key(),
+            Config::default(),
+            Box::new(OsEntropy),
+            Duration::from_secs(1_800_000_000),
+            Box::new(stamps),
+        )
+        .unwrap();
+        let wire = UdpSocket::bind("127.0.0.1:0").unwrap();
+        wire.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let (jobs, jobs_rx) = mpsc::channel();
+        let t = Tunnel {
+            link,
+            control: Control::new(
+                dir,
+                *me.public_key(),
+                *peer.public_key(),
+                Box::new(OsEntropy),
+            ),
+            enc: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            plain_out: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            plain_send: "127.0.0.1:9".parse().unwrap(),
+            remote: Some(wire.local_addr().unwrap()),
+            guard: None,
+            local_drops: BTreeMap::new(),
+            drop_log: DropLog::new(Instant::now()),
+            stale_run: 0,
+            hinted: false,
+            seen: SeenTs {
+                dir: dir.to_path_buf(),
+                drone: false,
+                writer: jobs.clone(),
+                best: 0,
+                saved: 0,
+                last_save: Instant::now(),
+                key: None,
+                key_read: None,
+            },
+            gate,
+            writer: jobs,
+        };
+        let me_pub = *me.public_key();
+        (t, wire, jobs_rx, peer, me_pub)
+    }
+
+    /// The next packet the tunnel put on the wire, if one comes within 300 ms.
+    fn on_wire(wire: &UdpSocket) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 2048];
+        wire.recv(&mut buf).ok().map(|n| buf[..n].to_vec())
+    }
+
+    fn stamps_job(rx: &mpsc::Receiver<Job>) -> (u64, StoredStamps) {
+        match rx.try_recv() {
+            Ok(Job::Stamps(seq, st)) => (seq, st),
+            Ok(_) => panic!("expected a timestamp write"),
+            Err(e) => panic!("the tunnel handed the writer nothing: {e}"),
+        }
+    }
+
+    #[test]
+    fn the_tunnel_holds_each_handshake_until_its_write_lands_and_never_holds_data() {
+        let dir = private_tempdir("tunnel-gate");
+        let (mut t, wire, jobs, peer, me_pub) = test_tunnel(&dir);
+        let mut peer_link = Link::new(
+            &peer,
+            me_pub,
+            Config::default(),
+            Box::new(OsEntropy),
+            Duration::from_secs(1_800_000_000),
+            Box::new(oasa_sec::link::MemoryTimestampStore::default()),
+        )
+        .unwrap();
+        let now = Duration::ZERO;
+
+        // Handshake 1 is made and its timestamp handed to the writer, but
+        // nothing reaches the wire until the write is reported durable.
+        let ev = t.link.start_handshake(now).unwrap();
+        t.apply(ev, None, now);
+        assert_eq!(on_wire(&wire), None, "handshake 1 left before its write");
+        let (seq, st) = stamps_job(&jobs);
+        assert!(st.sent.is_some());
+        assert_eq!(
+            FileTimestampStore::new(&dir, peer.public_key())
+                .load()
+                .unwrap(),
+            StoredStamps::default(),
+            "nothing written on the packet path"
+        );
+        // A data packet the link makes meanwhile goes at once.
+        let data = vec![0x31, 0, 1, 0, 0];
+        t.apply(
+            vec![Event::Send {
+                packet: data.clone(),
+                to: Dest::Remote,
+            }],
+            None,
+            now,
+        );
+        assert_eq!(on_wire(&wire), Some(data), "data waited for the disk");
+        // The write lands: now handshake 1 goes, unchanged.
+        t.on_report(Report::Stamps { seq, ok: true });
+        let hs1 = on_wire(&wire).expect("released handshake 1");
+        assert!(looks_like_handshake1(&hs1));
+        assert_eq!(on_wire(&wire), None, "sent once");
+
+        // The peer answers; the session's first packet (a keepalive) needs
+        // no write and goes at once.
+        let hs2 = peer_link
+            .handle_packet(now, &hs1)
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Send { packet, .. } => Some(packet),
+                _ => None,
+            })
+            .expect("handshake 2");
+        let from = wire.local_addr().unwrap();
+        let ev = t.link.handle_packet(now, &hs2);
+        t.apply(ev, Some(from), now);
+        let first = on_wire(&wire).expect("keepalive on the new session");
+        assert_eq!(first[0] >> 4, 3, "a data packet");
+        assert!(
+            jobs.try_recv().is_err(),
+            "no write for handshake 2 received"
+        );
+
+        // A rekey whose write fails: its handshake never leaves.
+        let later = Duration::from_secs(2);
+        let ev = t.link.start_handshake(later).unwrap();
+        t.apply(ev, None, later);
+        let (seq, _) = stamps_job(&jobs);
+        assert_eq!(on_wire(&wire), None);
+        t.on_report(Report::Stamps { seq, ok: false });
+        assert_eq!(on_wire(&wire), None, "a handshake left without its write");
+        assert_eq!(t.local_drops.get("stamp_not_saved"), Some(&1));
+        // Data still goes on the session that works.
+        let p = t.link.send(later, b"still here").unwrap();
+        t.apply(
+            vec![Event::Send {
+                packet: p.clone(),
+                to: Dest::Remote,
+            }],
+            None,
+            later,
+        );
+        assert_eq!(on_wire(&wire), Some(p));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_responders_handshake_2_waits_for_its_write_too() {
+        let dir = private_tempdir("tunnel-gate-hs2");
+        let (mut t, wire, jobs, peer, me_pub) = test_tunnel(&dir);
+        let mut peer_link = Link::new(
+            &peer,
+            me_pub,
+            Config::default(),
+            Box::new(OsEntropy),
+            Duration::from_secs(1_800_000_000),
+            Box::new(oasa_sec::link::MemoryTimestampStore::default()),
+        )
+        .unwrap();
+        let hs1 = peer_link
+            .start_handshake(Duration::ZERO)
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Send { packet, .. } => Some(packet),
+                _ => None,
+            })
+            .unwrap();
+        let from = wire.local_addr().unwrap();
+        let ev = t.link.handle_packet(Duration::ZERO, &hs1);
+        // Handshake 2 goes to the packet's source, so the tunnel must keep
+        // the address with the held packet.
+        t.remote = None;
+        t.apply(ev, Some(from), Duration::ZERO);
+        assert_eq!(on_wire(&wire), None, "handshake 2 left before its write");
+        let (seq, st) = stamps_job(&jobs);
+        assert!(st.seen.is_some());
+        t.on_report(Report::Stamps { seq, ok: true });
+        let hs2 = on_wire(&wire).expect("released handshake 2");
+        assert_eq!(hs2[0] >> 4, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn at(secs: u64, ms: u32) -> SystemTime {
         UNIX_EPOCH + Duration::new(secs, ms * 1_000_000)

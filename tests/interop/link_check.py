@@ -277,7 +277,8 @@ def check_lines(args):
     """check_lines FILE: every line is JSON with a UTC timestamp; nothing secret."""
     for e in lines(args[0]):
         assert e["ts"].endswith("Z") and len(e["ts"]) == 24, e
-        assert e["event"] in ("handshake_sent", "session_established", "rekey",
+        assert e["event"] in ("handshake_sent", "handshake_released", "handshake_dropped",
+                              "session_established", "rekey",
                               "drop", "drops_suppressed", "hint", "stats", "error",
                               "mavlink_guard", "warning", "peer_removed", "trust_reloaded",
                               "trust_migrated", "trust_unreadable", "removal_refused", "removal_entry", "not_admin_here",
