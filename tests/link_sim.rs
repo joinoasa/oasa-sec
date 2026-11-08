@@ -109,6 +109,8 @@ impl Channel {
 struct SideLog {
     /// Payloads the application handed to `send` and that were accepted.
     sent: HashMap<u32, Vec<u8>>,
+    /// When each of them was handed to `send`.
+    sent_at: HashMap<u32, Duration>,
     delivered: Vec<(Duration, Vec<u8>)>,
     established: Vec<(Duration, bool, bool)>, // time, initiator, rekey
     handshakes_sent: u32,
@@ -118,6 +120,10 @@ struct SideLog {
     replies_to_injected: u32,
     injected: u32,
 }
+
+/// Decides which packets an attacker on the path drops (destination,
+/// bytes, time): true drops it.
+type Filter = Box<dyn FnMut(Side, &[u8], Duration) -> bool>;
 
 /// Delivery time, tie-break sequence number, receiver, bytes.
 type Queued = (Duration, u64, Side, Vec<u8>);
@@ -132,6 +138,11 @@ struct Sim {
     seq: u64,
     /// Everything either side put on the wire, with its destination.
     wire: Vec<(Side, Vec<u8>)>,
+    /// When each packet in `wire` was sent.
+    wire_at: Vec<Duration>,
+    /// An attacker on the path: drops every packet for which this returns
+    /// true (destination, bytes, time).
+    filter: Option<Filter>,
     logs: HashMap<Side, SideLog>,
     next_id: u32,
     /// While true the channel drops everything.
@@ -223,6 +234,8 @@ impl Sim {
             queue: BinaryHeap::new(),
             seq: 0,
             wire: Vec::new(),
+            wire_at: Vec::new(),
+            filter: None,
             logs,
             next_id: 0,
             blackout: false,
@@ -316,6 +329,15 @@ impl Sim {
             bytes[1] ^= 0x5A; // not covered by any tag
         }
         self.wire.push((from.other(), bytes.clone()));
+        self.wire_at.push(self.now);
+        let now = self.now;
+        if self
+            .filter
+            .as_mut()
+            .is_some_and(|f| f(from.other(), &bytes, now))
+        {
+            return;
+        }
         if self.blackout || self.rng.chance(self.channel.loss) {
             return;
         }
@@ -415,6 +437,7 @@ impl Sim {
         match self.link(side).send(now, &payload) {
             Ok(pkt) => {
                 self.log(side).sent.insert(id, payload);
+                self.log(side).sent_at.insert(id, now);
                 self.transmit(side, pkt);
                 true
             }
@@ -574,6 +597,26 @@ fn rekeys(sim: &Sim, side: Side) -> usize {
         .iter()
         .filter(|(_, _, rekey)| *rekey)
         .count()
+}
+
+/// The longest one-way delay of any payload that `receiver` delivered: from
+/// the sender's `send` to the receiver's `Deliver`.
+fn worst_latency(sim: &Sim, receiver: Side) -> Duration {
+    let sent_at = &sim.logs[&receiver.other()].sent_at;
+    sim.logs[&receiver]
+        .delivered
+        .iter()
+        .map(|(t, p)| {
+            let id = u32::from_be_bytes(p[..4].try_into().unwrap());
+            *t - sent_at[&id]
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+/// The receiver index in a data packet's header (whose session it is on).
+fn data_index(p: &[u8]) -> Option<u16> {
+    (p.len() > 3 && p[0] >> 4 == 3).then(|| u16::from_be_bytes([p[1], p[2]]))
 }
 
 /// The longest stretch with no delivery between `from` and `to` (seconds).
@@ -1836,4 +1879,211 @@ fn a_removed_operator_is_never_sent_the_new_key() {
     for (_, w) in &p.sim.wire {
         assert!(!w.windows(32).any(|x| x == issued.key.as_bytes()));
     }
+}
+
+// ---- make-before-break at rekey ----------------------------------------------
+//
+// The lab's 100 messages a second each way over a 5 ms path, with a rekey
+// every few seconds. The link must never hold data back at a rekey: each side
+// keeps sending on the session it has until the new one is proven (the
+// initiator by handshake 2, the responder by the first packet on it), and
+// keeps reading the old one meanwhile. In virtual time every payload takes
+// exactly the channel delay, so any stall at all would show.
+
+/// Fast rekeys that `Config::validate` accepts: a rekey every 3 s, room for
+/// four 5 s retries before the reject time.
+fn fast_rekey() -> Config {
+    Config {
+        rekey_after: Duration::from_secs(3),
+        reject_after: Duration::from_secs(25),
+        ..Config::default()
+    }
+}
+
+#[test]
+fn rekey_every_three_seconds_adds_no_delay_and_loses_nothing() {
+    for len in [CounterLen::Short, CounterLen::Long] {
+        let cfg = Config {
+            counter_len: len,
+            ..fast_rekey()
+        };
+        let mut sim = Sim::new(31, cfg, Channel::clean());
+        sim.start();
+        // 1 ms ticks, one payload each way every 10 ms: 100 a second.
+        sim.run(Duration::from_secs(60), ms(1), ms(10), |_| {});
+        // Let what is in flight arrive, at the same 1 ms resolution.
+        for _ in 0..100 {
+            sim.step(ms(1));
+        }
+        sim.check_delivery_integrity();
+        sim.check_accounting();
+        for side in [Side::A, Side::B] {
+            assert!(rekeys(&sim, side) >= 18, "{side:?}: {}", rekeys(&sim, side));
+            // Every payload sent once a session existed arrived, and none of
+            // them waited longer than the 5 ms channel delay.
+            let st = sim.stats(side);
+            assert_eq!(st.delivered, sim.stats(side.other()).sent, "{side:?}");
+            assert_eq!(
+                worst_latency(&sim, side),
+                ms(5),
+                "{side:?} waited at a rekey"
+            );
+            assert_eq!(st.total_dropped(), 0, "{side:?}: {st:?}");
+        }
+    }
+}
+
+#[test]
+fn a_lost_rekey_handshake_does_not_stall_data() {
+    // Lose the first rekey's handshake 1 (then, in a second run, its
+    // handshake 2): the retry comes 5 s later, and until then both sides
+    // carry on, without a pause, on the session they have.
+    for (lost, header) in [("handshake 1", 0x11u8), ("handshake 2", 0x21)] {
+        let mut sim = Sim::new(32, fast_rekey(), Channel::clean());
+        let count = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let c = count.clone();
+        sim.filter = Some(Box::new(move |_, p, t| {
+            // The first session's handshake goes through; the next one is lost.
+            if p[0] == header && t > Duration::from_secs(1) && c.get() == 0 {
+                c.set(1);
+                return true;
+            }
+            false
+        }));
+        sim.start();
+        sim.run(Duration::from_secs(30), ms(1), ms(10), |_| {});
+        // Let what is in flight arrive, at the same 1 ms resolution.
+        for _ in 0..100 {
+            sim.step(ms(1));
+        }
+        assert_eq!(count.get(), 1, "{lost} was not lost");
+        sim.check_delivery_integrity();
+        sim.check_accounting();
+        // The lost one was retried: one handshake more than sessions made.
+        let made = sim.logs[&Side::A].established.len() as u32;
+        assert_eq!(sim.logs[&Side::A].handshakes_sent, made + 1, "{lost}");
+        for side in [Side::A, Side::B] {
+            assert!(rekeys(&sim, side) >= 5, "{lost}: {side:?}");
+            assert_eq!(sim.stats(side).delivered, sim.stats(side.other()).sent);
+            assert_eq!(worst_latency(&sim, side), ms(5), "{lost}: {side:?} waited");
+        }
+    }
+}
+
+#[test]
+fn old_key_packets_are_refused_once_the_session_is_retired() {
+    let mut sim = Sim::new(33, fast_rekey(), Channel::clean());
+    sim.start();
+    sim.run(ms(2000), ms(1), ms(10), |_| {});
+    // Data packets of the first session, both ways, recorded by an attacker.
+    let old: Vec<(Side, Vec<u8>)> = sim
+        .wire
+        .iter()
+        .filter(|(_, p)| data_index(p).is_some())
+        .cloned()
+        .collect();
+    let old_index = |to: Side| {
+        old.iter()
+            .find(|(t, _)| *t == to)
+            .and_then(|(_, p)| data_index(p))
+            .unwrap()
+    };
+    let (old_a, old_b) = (old_index(Side::A), old_index(Side::B));
+    // Through the rekey at 3 s.
+    sim.run(ms(1500), ms(1), ms(10), |_| {});
+    assert_eq!(rekeys(&sim, Side::A), 1);
+    assert_eq!(rekeys(&sim, Side::B), 1);
+    let delivered = |s: &Sim| {
+        (
+            s.logs[&Side::A].delivered.len(),
+            s.logs[&Side::B].delivered.len(),
+        )
+    };
+    // During the overlap the responder still reads the old session, but each
+    // packet only once: its replay window is its own, per key.
+    let before = delivered(&sim);
+    for (to, p) in &old {
+        let ev = sim.inject(*to, p);
+        assert!(!ev.iter().any(|e| matches!(e, Event::Deliver(_))), "{ev:?}");
+    }
+    assert_eq!(delivered(&sim), before);
+    // The initiator retired the old session at once (the responder's first
+    // packet on the new one confirmed it); the responder after the grace.
+    let to_a = old.iter().find(|(t, _)| *t == Side::A).unwrap().1.clone();
+    assert_eq!(
+        sim.inject(Side::A, &to_a),
+        vec![Event::Dropped(DropReason::UnknownIndex)]
+    );
+    let grace = Config::default().previous_grace;
+    sim.run(grace + ms(100), ms(1), ms(10), |_| {});
+    for (to, p) in &old {
+        let ev = sim.inject(*to, p);
+        assert_eq!(ev, vec![Event::Dropped(DropReason::UnknownIndex)], "{to:?}");
+    }
+    assert_eq!(sim.logs[&Side::A].replies_to_injected, 0);
+    assert_eq!(sim.logs[&Side::B].replies_to_injected, 0);
+    // And nobody sends on the old session any more.
+    let n = sim.wire.len();
+    sim.run(ms(500), ms(1), ms(10), |_| {});
+    assert!(
+        sim.wire[n..]
+            .iter()
+            .all(|(to, p)| data_index(p) != Some(if *to == Side::A { old_a } else { old_b }))
+    );
+    sim.check_delivery_integrity();
+}
+
+#[test]
+fn dropping_the_key_confirmation_keeps_the_old_key_only_until_its_reject_time() {
+    // An attacker lets handshakes through but drops every data packet the
+    // initiator sends after the first rekey, so the responder never sees the
+    // new session confirmed. The old key must not live on: no packet on it
+    // goes out, and none is accepted, after its reject time (the overlap cap).
+    let cfg = fast_rekey();
+    let mut sim = Sim::new(34, cfg.clone(), Channel::clean());
+    sim.filter = Some(Box::new(|to, p, t| {
+        to == Side::B && data_index(p).is_some() && t >= Duration::from_secs(3)
+    }));
+    sim.start();
+    sim.run(Duration::from_secs(60), ms(1), ms(10), |_| {});
+    let made = sim.logs[&Side::A].established[0].0;
+    let first_index = |to: Side| {
+        sim.wire
+            .iter()
+            .find(|(t, p)| *t == to && data_index(p).is_some())
+            .and_then(|(_, p)| data_index(p))
+            .unwrap()
+    };
+    let (old_a, old_b) = (first_index(Side::A), first_index(Side::B));
+    let on_old =
+        |to: &Side, p: &[u8]| data_index(p) == Some(if *to == Side::A { old_a } else { old_b });
+    let last_on_old = sim
+        .wire
+        .iter()
+        .zip(&sim.wire_at)
+        .filter(|((to, p), _)| on_old(to, p))
+        .map(|(_, t)| *t)
+        .max()
+        .unwrap();
+    assert!(
+        last_on_old < made + cfg.reject_after,
+        "the old key was used {:?} after it was made",
+        last_on_old - made
+    );
+    // The responder kept using it well past the first rekey (it had nothing
+    // confirmed that was newer), so the attack really held the overlap open.
+    assert!(last_on_old > made + Duration::from_secs(10));
+    // A packet made on it before the cap and replayed after it is refused.
+    let last_old_to_a = sim
+        .wire
+        .iter()
+        .rev()
+        .find(|(to, p)| *to == Side::A && on_old(to, p))
+        .unwrap()
+        .1
+        .clone();
+    let ev = sim.inject(Side::A, &last_old_to_a);
+    assert_eq!(ev, vec![Event::Dropped(DropReason::UnknownIndex)]);
+    assert_eq!(sim.logs[&Side::A].replies_to_injected, 0);
+    sim.check_delivery_integrity();
 }

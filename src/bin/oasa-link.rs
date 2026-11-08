@@ -20,7 +20,8 @@ use oasa_sec::control::{Action, Control, Note};
 use oasa_sec::identity::{Identity, fingerprint};
 use oasa_sec::link::{
     Config, CounterLen, Dest, DropReason, Event, FileTimestampStore, Link, MIN_MTU, OsEntropy,
-    RadioProfile, SendError, SourceLimiter, looks_like_handshake1,
+    Pass, RadioProfile, SendError, SourceLimiter, StampGate, StoredStamps, TimestampStore,
+    looks_like_handshake1,
 };
 use oasa_sec::mavguard::{Block, Guard, max_verified_timestamp};
 use oasa_sec::removal::{LOG_FILE, REMOVED_FILE};
@@ -604,6 +605,53 @@ impl DropLog {
 enum Msg {
     Encrypted(Vec<u8>, SocketAddr),
     Plain(Vec<u8>, SocketAddr),
+    /// The writer thread finished the handshake timestamp write `seq`.
+    Saved {
+        seq: u64,
+        ok: bool,
+    },
+}
+
+/// Work for the writer thread.
+enum Job {
+    /// Write the link's handshake timestamps (write number, values).
+    Stamps(u64, StoredStamps),
+    /// A drone's highest forwarded MAVLink signature time.
+    SeenTs(u64),
+}
+
+/// Start the thread that writes files durably (each write is two `fsync`s,
+/// tens of milliseconds on flash, sometimes over 100). The main loop never
+/// waits for it: the handshake timestamps go through a `StampGate`, which
+/// holds back only the handshake packet that needs them until the write
+/// reports back (`Msg::Saved`), while data keeps flowing on the current
+/// session. Jobs that pile up are merged: the newest timestamps cover the
+/// older ones, as both only go up.
+fn spawn_writer(dir: PathBuf, peer: [u8; 32], tx: mpsc::SyncSender<Msg>) -> mpsc::Sender<Job> {
+    let (jobs, rx) = mpsc::channel::<Job>();
+    std::thread::spawn(move || {
+        let mut store = FileTimestampStore::new(&dir, &peer);
+        while let Ok(first) = rx.recv() {
+            let mut stamps = None;
+            let mut seen: Option<u64> = None;
+            for job in std::iter::once(first).chain(rx.try_iter()) {
+                match job {
+                    Job::Stamps(seq, st) => stamps = Some((seq, st)),
+                    Job::SeenTs(t) => seen = Some(seen.map_or(t, |s| s.max(t))),
+                }
+            }
+            if let Some((seq, st)) = stamps {
+                let ok = store.save(&st).is_ok();
+                if tx.send(Msg::Saved { seq, ok }).is_err() {
+                    return;
+                }
+            }
+            if let Some(t) = seen {
+                let _ = write_seen_ts(&dir, t);
+            }
+        }
+    });
+    jobs
 }
 
 /// Read datagrams from `sock` forever and pass them on.
@@ -736,11 +784,18 @@ struct Tunnel {
     /// A drone saves the highest MAVLink signature time it forwards, as a
     /// floor for the next signing-key change (at most every 10 s).
     seen: SeenTs,
+    /// Handshake packets waiting until their timestamps are on disk, with
+    /// where they go. Data packets never wait (see `spawn_writer`).
+    gate: StampGate<SocketAddr>,
+    /// The thread that writes files with `fsync`, off the packet path.
+    writer: mpsc::Sender<Job>,
 }
 
 struct SeenTs {
     dir: PathBuf,
     drone: bool,
+    /// The file is written by the writer thread, never on the packet path.
+    writer: mpsc::Sender<Job>,
     best: u64,
     saved: u64,
     last_save: Instant,
@@ -771,8 +826,10 @@ impl SeenTs {
             ));
         }
         if self.best > self.saved && self.last_save.elapsed() >= Duration::from_secs(10) {
-            // A failed save only means a lower floor; the signer has its own clock.
-            if write_seen_ts(&self.dir, self.best).is_ok() {
+            // A failed save only means a lower floor; the signer has its own
+            // clock. Written on the writer thread: an `fsync` here would hold
+            // up every packet behind it.
+            if self.writer.send(Job::SeenTs(self.best)).is_ok() {
                 self.saved = self.best;
             }
             self.last_save = Instant::now();
@@ -837,11 +894,18 @@ impl Tunnel {
                         Dest::Remote => self.remote,
                         Dest::Source => source,
                     };
-                    match dest {
-                        Some(d) => {
-                            let _ = self.enc.send_to(&packet, d);
+                    let Some(d) = dest else {
+                        self.local_drop("no_remote");
+                        continue;
+                    };
+                    // A handshake waits for its timestamp to be on disk; data
+                    // never waits.
+                    match self.gate.pass(packet, d) {
+                        Pass::Send(p, d) => {
+                            let _ = self.enc.send_to(&p, d);
                         }
-                        None => self.local_drop("no_remote"),
+                        Pass::Held => {}
+                        Pass::HeldDroppedOldest(..) => self.local_drop("handshake_backlog"),
                     }
                 }
                 Event::Deliver(p) => {
@@ -906,6 +970,35 @@ impl Tunnel {
                 Event::Failure(what) => {
                     println!("{{\"ts\":\"{ts}\",\"event\":\"error\",\"what\":\"{what}\"}}")
                 }
+            }
+        }
+        self.flush_writes();
+    }
+
+    /// Hand what the link just saved to the writer thread.
+    fn flush_writes(&mut self) {
+        if let Some((seq, stamps)) = self.gate.take_write()
+            && self.writer.send(Job::Stamps(seq, stamps)).is_err()
+        {
+            // The writer is gone: nothing will be saved, so nothing waits.
+            self.stamps_saved(seq, false);
+        }
+    }
+
+    /// The writer finished write `seq`: send the handshakes it released, or
+    /// drop them if it failed (the link's retry makes a new handshake).
+    fn stamps_saved(&mut self, seq: u64, ok: bool) {
+        let r = self.gate.written(seq, ok);
+        for (p, d) in r.send {
+            let _ = self.enc.send_to(&p, d);
+        }
+        if !ok {
+            println!(
+                "{{\"ts\":\"{}\",\"event\":\"error\",\"what\":\"could not save the handshake timestamp\"}}",
+                rfc3339(SystemTime::now())
+            );
+            for _ in 0..r.dropped {
+                self.local_drop("stamp_not_saved");
             }
         }
     }
@@ -996,13 +1089,17 @@ fn run(args: &[String]) -> R<u8> {
         .map_err(|_| "the clock is before 1970")?;
     let config = config_from(&a)?;
     let control_retry = control_retry(&a, &config);
+    // The timestamps are read here, once, and from then on written by the
+    // writer thread; the gate holds each handshake until its write is done.
+    let on_disk = FileTimestampStore::new(&a.dir, &peer.public).load()?;
+    let (stamps, gate) = StampGate::new(on_disk);
     let link = Link::new(
         &me,
         peer.public,
         config,
         Box::new(OsEntropy),
         wall_base,
-        Box::new(FileTimestampStore::new(&a.dir, &peer.public)),
+        Box::new(stamps),
     )?;
     drop(me);
     let mut link = link;
@@ -1058,6 +1155,7 @@ fn run(args: &[String]) -> R<u8> {
 
     let (tx, rx) = mpsc::sync_channel::<Msg>(4096);
     spawn_reader(enc.try_clone()?, tx.clone(), true);
+    let writer = spawn_writer(a.dir.clone(), peer.public, tx.clone());
     spawn_reader(plain_in, tx, false);
     // Handshakes per source address (the port is free for an attacker to vary).
     let mut source_limit: SourceLimiter<IpAddr> = SourceLimiter::new(SOURCE_HANDSHAKES_PER_SECOND);
@@ -1078,12 +1176,15 @@ fn run(args: &[String]) -> R<u8> {
         seen: SeenTs {
             dir: a.dir.clone(),
             drone: a.dir.join(AUTOPILOT_KEY_FILE).exists(),
+            writer: writer.clone(),
             best: 0,
             saved: 0,
             last_save: Instant::now(),
             key: None,
             key_read: None,
         },
+        gate,
+        writer,
     };
 
     if a.initiate {
@@ -1142,6 +1243,7 @@ fn run(args: &[String]) -> R<u8> {
                         Err(e) => t.local_drop(e.as_str()),
                     }
                 }
+                Msg::Saved { seq, ok } => t.stamps_saved(seq, ok),
             }
         }
         let now = start.elapsed();
@@ -1268,6 +1370,116 @@ fn rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_tempdir(name: &str) -> PathBuf {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+        let p = std::env::temp_dir().join(format!("oasa-link-test-{name}-{hex}"));
+        std::fs::create_dir_all(&p).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        p
+    }
+
+    fn saved(rx: &mpsc::Receiver<Msg>) -> (u64, bool) {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Msg::Saved { seq, ok }) => (seq, ok),
+            Ok(_) => panic!("unexpected message"),
+            Err(e) => panic!("no answer from the writer: {e}"),
+        }
+    }
+
+    #[test]
+    fn handshake_waits_for_the_writer_thread_and_data_never_does() {
+        let dir = private_tempdir("writer");
+        let me = Identity::generate().unwrap();
+        let peer = Identity::generate().unwrap();
+        let peer_pub = *peer.public_key();
+        let on_disk = FileTimestampStore::new(&dir, &peer_pub).load().unwrap();
+        let (stamps, mut gate) = StampGate::<u8>::new(on_disk);
+        let mut link = Link::new(
+            &me,
+            peer_pub,
+            Config::default(),
+            Box::new(OsEntropy),
+            Duration::from_secs(1_800_000_000),
+            Box::new(stamps),
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::sync_channel::<Msg>(16);
+        let writer = spawn_writer(dir.clone(), peer_pub, tx);
+
+        // The link has made and "saved" handshake 1, but it is not on disk:
+        // the gate holds it.
+        let ev = link.start_handshake(Duration::ZERO).unwrap();
+        let hs1 = ev
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Send { packet, .. } => Some(packet),
+                _ => None,
+            })
+            .unwrap();
+        assert!(looks_like_handshake1(&hs1));
+        assert!(matches!(gate.pass(hs1.clone(), 1), Pass::Held));
+        assert_eq!(
+            FileTimestampStore::new(&dir, &peer_pub).load().unwrap(),
+            on_disk,
+            "nothing written on the packet path"
+        );
+        let (seq, st) = gate.take_write().unwrap();
+        assert!(st.sent.is_some());
+        writer.send(Job::Stamps(seq, st)).unwrap();
+        // Meanwhile a data packet (any packet with the data type) goes at once.
+        let data = vec![0x31, 0, 1, 0, 0];
+        assert!(matches!(gate.pass(data, 2), Pass::Send(_, 2)));
+        // The writer reports back; only then does handshake 1 go, unchanged,
+        // and the file holds the timestamp it carries.
+        assert_eq!(saved(&rx), (seq, true));
+        let r = gate.written(seq, true);
+        assert_eq!(r.send, vec![(hs1, 1)]);
+        assert_eq!(FileTimestampStore::new(&dir, &peer_pub).load().unwrap(), st);
+
+        // The writer also takes the drone's MAVLink time, off the packet path.
+        writer.send(Job::SeenTs(77)).unwrap();
+        writer.send(Job::SeenTs(55)).unwrap();
+        for _ in 0..100 {
+            if oasa_sec::rotation::read_seen_ts(&dir).unwrap_or(0) == 77 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(oasa_sec::rotation::read_seen_ts(&dir).unwrap(), 77);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_fails_is_reported_and_its_handshake_dropped() {
+        let base = private_tempdir("writer-fail");
+        // A "directory" that is a file: every write fails.
+        let dir = base.join("not-a-dir");
+        std::fs::write(&dir, b"x").unwrap();
+        let (tx, rx) = mpsc::sync_channel::<Msg>(16);
+        let writer = spawn_writer(dir, [7u8; 32], tx);
+        let (mut stamps, mut gate) = StampGate::<u8>::new(StoredStamps::default());
+        stamps
+            .save(&StoredStamps {
+                sent: Some(oasa_sec::link::Timestamp { secs: 9, nanos: 0 }),
+                seen: None,
+            })
+            .unwrap();
+        assert!(matches!(gate.pass(vec![0x11], 1), Pass::Held));
+        let (seq, st) = gate.take_write().unwrap();
+        writer.send(Job::Stamps(seq, st)).unwrap();
+        assert_eq!(saved(&rx), (seq, false));
+        let r = gate.written(seq, false);
+        assert!(r.send.is_empty());
+        assert_eq!(r.dropped, 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn at(secs: u64, ms: u32) -> SystemTime {
         UNIX_EPOCH + Duration::new(secs, ms * 1_000_000)

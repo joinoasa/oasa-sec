@@ -152,6 +152,12 @@ pub fn parse(buf: &[u8], mtu: usize) -> Result<Packet<'_>, DropReason> {
     }
 }
 
+/// Whether `buf` is a data packet (or keepalive) by its type. Anything else,
+/// including junk, counts as not data.
+pub(crate) fn is_data(buf: &[u8]) -> bool {
+    buf.first().is_some_and(|h| h >> 4 == TYPE_DATA)
+}
+
 fn header(kind: u8, long: bool) -> u8 {
     (kind << 4) | (u8::from(long) << 3) | VERSION
 }

@@ -46,7 +46,8 @@ pub use packet::{
 };
 pub use source::{SourceLimiter, looks_like_handshake1};
 pub use stamp::{
-    FileTimestampStore, MemoryTimestampStore, StoredStamps, Timestamp, TimestampStore,
+    DeferredStore, FileTimestampStore, MAX_HELD_HANDSHAKES, MemoryTimestampStore, Pass, Released,
+    StampGate, StoredStamps, Timestamp, TimestampStore,
 };
 #[cfg(test)]
 pub(crate) use timing::lora_airtime;
