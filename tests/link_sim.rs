@@ -2085,5 +2085,19 @@ fn dropping_the_key_confirmation_keeps_the_old_key_only_until_its_reject_time() 
     let ev = sim.inject(Side::A, &last_old_to_a);
     assert_eq!(ev, vec![Event::Dropped(DropReason::UnknownIndex)]);
     assert_eq!(sim.logs[&Side::A].replies_to_injected, 0);
+    // The other way too: the initiator's packets on the old session,
+    // recorded before the rekey, replayed into the responder after the cap.
+    let old_to_b: Vec<Vec<u8>> = sim
+        .wire
+        .iter()
+        .filter(|(to, p)| *to == Side::B && on_old(to, p))
+        .map(|(_, p)| p.clone())
+        .collect();
+    assert!(!old_to_b.is_empty());
+    for p in [old_to_b.first().unwrap(), old_to_b.last().unwrap()] {
+        let ev = sim.inject(Side::B, p);
+        assert_eq!(ev, vec![Event::Dropped(DropReason::UnknownIndex)]);
+    }
+    assert_eq!(sim.logs[&Side::B].replies_to_injected, 0);
     sim.check_delivery_integrity();
 }

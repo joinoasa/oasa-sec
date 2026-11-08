@@ -253,8 +253,8 @@ pub enum Pass<A> {
 pub struct Released<A> {
     /// May be sent now, in order.
     pub send: Vec<(Vec<u8>, A)>,
-    /// Dropped because the write failed.
-    pub dropped: usize,
+    /// Dropped because the write failed (never sent), in order.
+    pub dropped: Vec<(Vec<u8>, A)>,
 }
 
 impl<A> StampGate<A> {
@@ -312,7 +312,7 @@ impl<A> StampGate<A> {
     pub fn written(&mut self, seq: u64, ok: bool) -> Released<A> {
         let mut out = Released {
             send: Vec::new(),
-            dropped: 0,
+            dropped: Vec::new(),
         };
         let durable = {
             let mut s = self.shared.borrow_mut();
@@ -326,8 +326,8 @@ impl<A> StampGate<A> {
                 let (_, p, a) = self.held.pop_front().expect("peeked");
                 out.send.push((p, a));
             } else if !ok && *need <= seq {
-                self.held.pop_front();
-                out.dropped += 1;
+                let (_, p, a) = self.held.pop_front().expect("peeked");
+                out.dropped.push((p, a));
             } else {
                 break;
             }
@@ -445,7 +445,10 @@ mod tests {
     }
 
     fn released<A>(r: Released<A>) -> (Vec<A>, usize) {
-        (r.send.into_iter().map(|(_, a)| a).collect(), r.dropped)
+        (
+            r.send.into_iter().map(|(_, a)| a).collect(),
+            r.dropped.len(),
+        )
     }
 
     #[test]
