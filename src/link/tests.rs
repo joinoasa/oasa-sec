@@ -2600,3 +2600,124 @@ fn a_delayed_old_packet_does_not_keep_an_old_session_readable() {
     let ev = p.a.handle_packet(t3, &held_2);
     assert_eq!(drops(&ev), vec![DropReason::UnknownIndex]);
 }
+
+// F21 (soak) wrap audit: force the counters next to their limits.
+
+/// Sessions on both sides as if `n` packets had already gone from A to B.
+fn jump_a_to_b(p: &mut Pair, n: u64) {
+    p.a.current_session_mut().unwrap().jump_send_counter(n);
+    p.b.current_session_mut().unwrap().jump_recv_counter(n - 1);
+}
+
+#[test]
+fn counters_cross_the_wire_wraps_of_the_low_bytes() {
+    // The low 2 bytes wrap every 65,536 packets (65 s at 1000 packets/s) and
+    // the low 4 bytes every 2^32: the receiver rebuilds the full counter, so
+    // packets on either side of each wrap decrypt and nothing is a replay.
+    for (len, wrap) in [
+        (CounterLen::Short, 1u64 << 16),
+        (CounterLen::Short, 1u64 << 32),
+        (CounterLen::Long, 1u64 << 32),
+        (CounterLen::Short, 5 * (1u64 << 32) + (1 << 16)),
+    ] {
+        let cfg = Config {
+            counter_len: len,
+            keepalive: None,
+            rekey_after_packets: 1 << 59,
+            ..Config::default()
+        };
+        let (mut p, now) = established(cfg);
+        jump_a_to_b(&mut p, wrap - 3);
+        let mut held = Vec::new();
+        for i in 0..6u8 {
+            let pkt = p.a.send(now, &[i]).unwrap();
+            if i == 1 {
+                held.push(pkt); // delivered late, after the wrap
+                continue;
+            }
+            let ev = p.b.handle_packet(now, &pkt);
+            assert_eq!(delivered(&ev), vec![vec![i]], "{len:?} {wrap:#x} {i}");
+            if i == 2 {
+                // A replay just before the wrap is refused.
+                assert_eq!(
+                    drops(&p.b.handle_packet(now, &pkt)),
+                    vec![DropReason::Replay]
+                );
+            }
+        }
+        let ev = p.b.handle_packet(now, &held[0]);
+        assert_eq!(delivered(&ev), vec![vec![1u8]], "reordered across the wrap");
+        assert_eq!(
+            drops(&p.b.handle_packet(now, &held[0])),
+            vec![DropReason::Replay]
+        );
+    }
+}
+
+#[test]
+fn the_nonce_never_reaches_the_top_of_its_range() {
+    // Defaults: rekey at 2^32 packets, nothing past 2^60. The last counter a
+    // session ever uses is 2^60 - 1, far below u64::MAX (no nonce wrap), and
+    // the next send is refused instead of reusing a nonce.
+    let cfg = Config {
+        keepalive: None,
+        ..Config::default()
+    };
+    let (mut p, now) = established(cfg);
+    let limit = Config::default().reject_after_packets;
+    assert_eq!(limit, 1 << 60);
+    jump_a_to_b(&mut p, limit - 2);
+    for i in 0..2u8 {
+        let pkt = p.a.send(now, &[i]).unwrap();
+        assert_eq!(delivered(&p.b.handle_packet(now, &pkt)), vec![vec![i]]);
+    }
+    assert_eq!(p.a.send(now, b"x"), Err(SendError::NoSession));
+    assert_eq!(p.a.send(now, b"x"), Err(SendError::NoSession));
+}
+
+#[test]
+fn rekey_is_asked_at_two_to_the_32_packets() {
+    // 2^32 packets is 497 days at 100 packets/s, 49.7 days at 1000: the time
+    // limit (10 minutes) always comes first, but the packet limit holds too.
+    let cfg = Config {
+        keepalive: None,
+        ..Config::default()
+    };
+    let (mut p, now) = established(cfg);
+    jump_a_to_b(&mut p, (1 << 32) - 1);
+    assert!(sends(&p.a.poll_timers(now)).is_empty());
+    let pkt = p.a.send(now, b"last before").unwrap();
+    assert_eq!(delivered(&p.b.handle_packet(now, &pkt)).len(), 1);
+    assert_eq!(sends(&p.a.poll_timers(now)).len(), 1, "handshake due");
+    // The old session still works while the new one is made.
+    let pkt = p.a.send(now, b"still").unwrap();
+    assert_eq!(delivered(&p.b.handle_packet(now, &pkt)).len(), 1);
+}
+
+#[test]
+fn a_new_session_starts_its_counter_at_zero_under_new_keys() {
+    // Each rekey restarts the counter at 0, which is safe only because the
+    // keys are new: the same plaintext at the same counter gives a different
+    // packet, and an old-session packet does not decrypt on the new one.
+    let cfg = Config {
+        keepalive: None,
+        ..Config::default()
+    };
+    let (mut p, t0) = established(cfg);
+    let old = p.a.send(t0, b"same").unwrap();
+    let t1 = t0 + Duration::from_secs(1);
+    let hs1 = sends(&p.a.start_handshake(t1).unwrap()).remove(0);
+    let hs2 = sends(&p.b.handle_packet(t1, &hs1)).remove(0);
+    let first = sends(&p.a.handle_packet(t1, &hs2)).remove(0);
+    p.b.handle_packet(t1, &first);
+    // The first packet on the new session used counter 0 (header: type,
+    // index, then the low counter bytes).
+    assert_eq!(&first[3..5], &[0, 0]);
+    let new = p.a.send(t1, b"same").unwrap();
+    assert_eq!(&new[3..5], &[0, 1]);
+    assert_ne!(&old[5..], &new[5..], "new key, new ciphertext");
+    assert_eq!(
+        delivered(&p.b.handle_packet(t1, &new)),
+        vec![b"same".to_vec()]
+    );
+}

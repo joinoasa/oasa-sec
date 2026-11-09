@@ -246,6 +246,15 @@ impl Endpoint {
         self.peer(id).is_some_and(|p| p.current.is_some())
     }
 
+    /// Tests only: the session we send on to `id`.
+    #[cfg(test)]
+    pub(crate) fn current_session_mut(&mut self, id: PeerId) -> Option<&mut Session> {
+        self.peers
+            .get_mut(id.0)
+            .and_then(Option::as_mut)?
+            .current_mut()
+    }
+
     fn peer(&self, id: PeerId) -> Option<&PeerLink> {
         self.peers.get(id.0).and_then(Option::as_ref)
     }
@@ -537,6 +546,12 @@ fn backoff(cfg: &Config, attempt: u32) -> Duration {
 }
 
 impl PeerLink {
+    /// Tests only: the session we send on.
+    #[cfg(test)]
+    pub(crate) fn current_mut(&mut self) -> Option<&mut Session> {
+        self.current.as_mut()
+    }
+
     /// Is `i` the index of one of our two newest handshake attempts?
     fn has_inflight_index(&self, i: u16) -> bool {
         self.hs.as_ref().is_some_and(|h| h.local_index == i)
