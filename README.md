@@ -120,5 +120,6 @@ Generations (`mavlink-signing-gen`) are never reused. Details and what was check
 - [Training](docs/training-r-sec1.md): a 1 to 2 hour course on a laptop
 - [Training: roles, removal, key rotation](docs/training-r-sec2.md): a 1 hour course on a laptop (R-SEC2)
 - [Release record](docs/release-r-sec1.md): test results and security review status
+- [Phone link (draft spec)](docs/oasa-sec-v0-phone-link.md): how a phone pairs with and drives a pocket radio (T-MSG1); [design review notes](docs/security-review-t-msg1-phone-link.md)
 
 Licensed under [Apache-2.0](LICENSE).
