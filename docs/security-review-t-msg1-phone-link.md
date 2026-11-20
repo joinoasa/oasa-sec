@@ -1,5 +1,7 @@
 # Design review: T-MSG1 phone link
 
+> **Note (2026-11-19):** the spec's pairing section was rewritten on 2026-11-19 for a radio with no button (v0.2); the findings table below describes the first draft (v0.1). A new independent review will be appended.
+
 **Status:** v0.1, 2026-11-16 · **Kind:** internal design review, written by an AI agent (Claude) that did not write the spec; not an outside review, and no code exists yet · **Owner:** citruscybersec
 
 Review of the first draft of [oasa-sec-v0-phone-link.md](oasa-sec-v0-phone-link.md). It does not replace the person's security review the task card asks for.
