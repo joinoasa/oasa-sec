@@ -1,12 +1,21 @@
 # OASA-SEC v0: the phone link (draft)
 
-**Stage:** Idea → Draft (no code yet) · **Node:** T-MSG1 · **Version:** v0.4 draft, 2026-11-19 (written by an AI agent; v0.1, v0.2 and v0.3 each had one independent AI design review, see the [review notes](security-review-t-msg1-phone-link.md); v0.4's changes have not been reviewed, by an AI or a person)
+**Stage:** Idea → Draft (the radio's pairing state machine is in draft PR #41, not merged) · **Node:** T-MSG1 · **Version:** v0.5 draft, 2026-11-19 (written by an AI agent; v0.1, v0.2 and v0.3 each had one independent AI design review, see the [review notes](security-review-t-msg1-phone-link.md); v0.5 answers questions raised by the first pairing code and its code review; the changes in v0.4 and v0.5 have not been reviewed, by an AI or a person)
 
 How a phone and its pocket radio pair, and how the phone drives the radio afterwards, over Bluetooth Low Energy (BLE) or a USB cable. Builds on [pairing](oasa-sec-v0-pairing.md) and the [link](oasa-sec-v0-link.md).
 
 **No new crypto.** Pairing is R-SEC1's `Noise_IKpsk1`, with the radio's pairing key and the pre-shared secret taken from a printed label (or, to move to a new phone, from a one-time code the old phone shows). The session is the R-COM2 link, unchanged on the wire, keyed with a link key the radio makes at each pairing. What is new: who plays which role, the label, when the radio accepts pairing, and the messages carried inside the session.
 
-**Changes since v0.3** (answers the third review, R3; §11 has one line per finding):
+**Changes since v0.4** (answers the ten spec questions in draft PR #41 and its code review, C-1 to C-14; §11 has one line each):
+
+- **Torn reset or replace:** a reset marker at boot means finish the erase and end unpaired and empty; power lost before the marker lands means the operation never began; the light acknowledges a reset only once the marker is durable (§2.8).
+- **A store that fails without power loss fails closed:** no link session and no pairing while faulted; the trust state on flash is the link's only source; the pinhole still works and can be retried (§2.8).
+- **Rate limit simplified:** every USB window that closes without a completed pairing counts; the count and the last close are kept in flash (§2.3).
+- **Pairing starts only on the pairing channel** (the BLE pairing characteristic, the USB pairing port), never on a bare connection; a link connection is never an attempt (§2.4).
+- **Window edges defined:** the reset's 2 s needs USB present throughout; a boot on battery counts absence from the boot; a wake from storage mode counts as absent long enough (§2.3).
+- All-zero secrets refused in every code; `PAIR_OPEN` with the label secret refused; a failed random source stops pairing; two more denial-of-service limits in §7; suite case 12 reworded; new cases and a real-hardware check (§8).
+
+**Changes since v0.3** (answers the third review, R3):
 
 - **The middle of a BLE pairing, stated in full.** Someone who holds the radio's pairing private key and label secret and sits in the middle of the next BLE pairing becomes the radio's real paired phone. §2.9 and §6 now say what that gives, what it needs, its one sign, and that it is inherent to a fixed printed label on a radio with no display and no button. The app treats "radio seen but not answering" as "possibly not your radio" (§3). A second-hand or returned radio is paired by cable where a cable path exists, otherwise treated as not clean. A camera reading the light is open question 14, not adopted.
 - **Slots:** a proved attempt is never closed to make room for a connection that has proved nothing; one message 1 per connection (§2.4).
@@ -72,7 +81,7 @@ Text form: the prefix + uppercase base32 without padding: 7 + 111 = **118 charac
 
 **Why the full public key, not the fingerprint.** `IK` needs the initiator to know the responder's static key before message 1. A fingerprint (80 bits) would need the radio to send its key first, which is a different pattern, and would rest on a shorter value.
 
-The app refuses a code with the wrong prefix, an unknown version, the wrong length, non-zero padding bits in the last character, a bad checksum or a small-order public key, before it connects to anything. A misread fails there, with a 2⁻³² chance of a misread passing the checksum (on top of the QR's own error correction); a misread key or secret that did pass would only fail the handshake.
+The app refuses a code with the wrong prefix, an unknown version, the wrong length, non-zero padding bits in the last character, a bad checksum, a small-order public key or an all-zero secret, before it connects to anything. A misread fails there, with a 2⁻³² chance of a misread passing the checksum (on top of the QR's own error correction); a misread key or secret that did pass would only fail the handshake.
 
 **The label.** On the radio: the QR, the text form under it, and the radio's fingerprint (R-SEC1 §1, of the pairing key) as text. The QR is **version 7 (45 × 45 modules) at error correction level Q** (measured: 118 alphanumeric characters need version 5 at L or M, version 7 at Q, version 8 at H). Level Q leaves room for a scuffed label. Each module is at least **0.34 mm** (4 dots at 300 dpi), so the QR with its 4-module quiet zone is **18 × 18 mm**. The text form (four lines at about 1 mm character height) and the fingerprint need about 7 mm more. **The label needs 20 × 27 mm.** If the case gives only 20 × 20 mm, the QR and the fingerprint stay and the text form is left off, so a damaged QR cannot be typed (open question 1).
 
@@ -87,6 +96,7 @@ Requirements on manufacturing and on product firmware:
 - **Random.** The pairing key and the 32-byte secret are made on the radio at first start from the radio chip's hardware random source. The secret is not derived from, or stored next to a record of, the serial number, the Bluetooth address, the public key or anything else printed or broadcast.
 - **Out once.** The radio hands the label payload to the production jig over the factory interface once, for printing. The jig then **commits** the radio, which closes that output for good. The factory keeps no copy of the secret; its records hold the fingerprint only.
 - **A failed print** (a misprint, a label that does not scan back at the jig) is handled before commit: the unit is scrapped, or makes a new pairing key and a new secret and is printed again. There is no output path after commit. An end-of-line test proves the output is closed. `STATUS` reports whether the radio is committed; the app refuses an uncommitted product radio and warns on a development board (below).
+- **A failed random source stops pairing.** The radio checks that its hardware random source reports success each time it makes a key: the pairing key and secret at first start, and each attempt's link key. If it fails, the radio makes no key: at first start it cannot be committed; in a window the attempt gets no message 2 and is closed. The radio also refuses to start pairing with an all-zero label secret (a factory or firmware fault).
 - **Covered.** The label is not visible or scannable through the packaging.
 - **Kept on the radio.** The radio stores the psk itself. The label could carry a value whose hash is the psk, but the radio would then store the psk, which pairs just as well; so it stores the secret and protects it like the pairing key: wiped from working memory after each handshake, never in `STATUS`, logs, errors or any message (§4 has none for it).
 - **Not readable over the debug port** on product units: it is locked (§6).
@@ -98,15 +108,17 @@ Requirements on manufacturing and on product firmware:
 
 The radio accepts pairing messages only while a **pairing window** is open. A window lasts **2 minutes** and opens in exactly three ways:
 
-1. **USB power while unpaired** (a **USB window**). The radio has no paired phone, and USB power **appears and stays**: it has been absent for at least 10 s (or the radio was in storage mode, or is starting from no power) and then present for 2 s. Plugging in wakes the radio from storage mode, so a new radio opens its first window when it is first plugged in. Battery power alone never opens a window. A radio that has a paired phone opens no window on USB power.
+1. **USB power while unpaired** (a **USB window**). The radio has no paired phone, and USB power **appears and stays**: it has been absent for at least 10 s and then present for 2 s. Absence is counted from the last moment USB was present, or from boot if the radio booted on battery: a radio that boots on battery and is plugged in less than 10 s later opens no window on that plug. Two cases count as absent long enough: a wake from storage mode by USB power, and a boot with USB already present (a flat battery, a crash or a watchdog reset on the cable). A wake from storage mode is safe to count: only the factory and the radio's own low-battery rule put it in storage mode, and no message does, so nobody can toggle it in and out; and leaving storage mode needs the plug-in anyway. A boot on USB is bounded by the rate limit below, which survives the boot. Plugging in wakes the radio from storage mode, so a new radio opens its first window when it is first plugged in. Battery power alone never opens a window. A radio that has a paired phone opens no window on USB power.
 2. **`PAIR_OPEN` from the paired phone** (§4), inside a link session: a **replace window**, keyed with the one-time secret in that message (§2.7).
-3. **A pinhole reset with USB power present** (§2.8): a USB window, 2 s after the reset.
+3. **A pinhole reset with USB power present** (§2.8): a USB window, 2 s after the reset, if USB stays present for the whole 2 s. Any absence cancels it; then only the debounce of rule 1 opens a window.
 
 Nothing else opens a window: no unauthenticated message on BLE or USB, no other message from the phone.
 
-**USB edges.** A USB power edge during an open window changes nothing: not the 2 minutes, not the BLE rules of §2.5, not the record of message 1s seen (§2.4). **Rate limit:** after two USB windows in a row close with no pairing, no USB window opens until 30 minutes after the last one closed **and** a new debounced USB edge comes after that, or until a pinhole reset. A radio left on power opens no more windows by itself. So a cable that flickers, a power bank that pulses, or a charger that toggles power on purpose opens at most two windows, then one each half hour. The count is kept in memory and cleared by a completed pairing or a reset; the window a reset opens counts as the first of a new two.
+**USB edges.** A USB power edge during an open window changes nothing: not the 2 minutes, not the BLE rules of §2.5, not the record of message 1s seen (§2.4). **Rate limit:** after two USB windows in a row close with no pairing, no USB window opens until 30 minutes after the last one closed **and** a new debounced USB edge comes after that, or until a pinhole reset. A radio left on power opens no more windows by itself. So a cable that flickers, a power bank that pulses, or a charger that toggles power on purpose opens at most two windows, then one each half hour.
 
-A window that closes with no pairing counts toward the limit, unless an attempt in it proved the secret and was then ended by something other than its own 6 s timeout (pre-empted by USB, or its connection lost). So a window in which the owner's proved attempt was pending counts only if that attempt timed out by itself, and a stranger who cannot prove the secret cannot spend the owner's windows (they can still jam).
+**Every USB window that closes without a completed pairing counts**, however its attempts ended. A completed pairing or a pinhole reset clears the count; the window a reset opens counts as the first of a new two. (A stranger with no secret cannot spend the owner's window by pushing out a proved attempt: §2.4 never closes one for an unproved connection. They can still jam.)
+
+**The count survives a boot.** The count (0 to 2) and whether the 30 minutes are running are kept in flash, written when a USB window closes without a pairing and when a pairing or reset clears the count: at most one write per window, so at most about five an hour under a toggling source and none in normal use. The radio has no clock across power loss, so a boot that finds the limit reached starts the 30 minutes again from the boot. A reboot, a flat battery or a crash loop therefore never forgets the limit.
 
 A window closes at the **first completed pairing** (§2.4), at a pinhole reset, or after 2 minutes. Each window is one chance: once a pairing completes, no second phone can complete in that window.
 
@@ -129,9 +141,10 @@ Why message 3: the label secret never changes, so a recorded message 1 from an e
 **Attempts.** Up to the first completion, pairing follows R-SEC1 §2's "nobody can hold the port", with these changes: no exclusive hold; a bounded record of message 1s; a 2-minute window; completion at the phone's message 3 rather than at the drone's save; separate slot counts for BLE and USB; one message 1 per connection. In R-SEC1 the holder exists because the drone sends key material after message 2; here message 2 gives nothing away, so:
 
 - **Slots.** Pairing attempts on BLE and on USB are counted separately, up to `BLE_PAIRING_SLOTS` and `USB_PAIRING_SLOTS` (values fixed by the firmware card from the chip's real connection limits; §10). When a transport's slots are full, a new connection replaces the oldest attempt on it that has **not** proved the secret. **An attempt that has proved the secret is never closed to make room for one that has not:** if every slot holds a proved attempt, the new connection is refused (each proved attempt ends within 6 s). R-SEC1's `make_room` does the same.
-- **One message 1 per connection.** Message 1 must arrive within 3 s of connecting. On BLE, connecting is the connection being made; on USB, the radio accepting the TCP connection to its pairing port. A message 1 that fails (wrong secret, small-order key, bad size) closes the connection; a second message 1 on the same connection closes it too. Each attempt holds at most one Noise handshake state, one link private key and its message buffers: under 1 kB, and the number of attempts is capped at the slot count.
-- Every attempt whose message 1 proves the secret gets its own message 2. The first valid message 3 completes; every other attempt is then closed with no reply. An attempt that sends no message 3 within 6 s of its message 2 is closed.
-- The radio remembers the ephemeral key of the last 16 message 1s that proved the secret in this window and gives a repeat no reply. When the record is full the oldest entry is forgotten; a recording that comes back after that gets a message 2 and a slot for at most 6 s, and still cannot complete. The record is cleared when the window closes. It matters only against recordings (a label holder can make fresh message 1s at will); replaying forever would need 17 recorded pairings of this radio, and none of them completes.
+- **An attempt starts only on the pairing channel.** On BLE, when a connection first opens the pairing characteristic; on USB, when the radio accepts a TCP connection to its pairing port. A bare BLE connection, or a link connection, is never an attempt: it takes no pairing slot and gets no pairing timer. So in a replace window the old phone's link connection and session stay up until a completion.
+- **One message 1 per attempt.** Message 1 must arrive within 3 s of the attempt starting. A message 1 that fails (wrong secret, small-order key, bad size) closes the connection; a second message 1 on the same attempt closes it too. Each attempt holds at most one Noise handshake state, one link private key and its message buffers: under 1 kB, and the number of attempts is capped at the slot count.
+- Every attempt whose message 1 proves the secret and passes the key and hello checks gets its own message 2. Below, a **proving message 1** means one that does both. The first valid message 3 completes; every other attempt is then closed with no reply. An attempt that sends no message 3 within 6 s of its message 2 is closed.
+- The radio remembers the ephemeral key of the last 16 message 1s that proved the secret in this window (whether or not they then passed the key and hello checks) and gives a repeat no reply. When the record is full the oldest entry is forgotten; a recording that comes back after that gets a message 2 and a slot for at most 6 s, and still cannot complete. The record is cleared when the window closes. It matters only against recordings (a label holder can make fresh message 1s at will); replaying forever would need 17 recorded pairings of this radio, and none of them completes.
 - No lockout: failed attempts do not end the window.
 - The app retries with a new connection, as R-SEC1's ground station does, until it pairs or 2 minutes pass.
 
@@ -147,7 +160,7 @@ In a USB window the radio prefers a phone on the cable, by what it observes:
   - **20 s after the window opens, if a host has enumerated it but no proving message 1 has arrived on USB by then** (a laptop, a car port, a monitor's hub, a phone that cannot reach the pairing port, or a host that was unplugged).
 
   Once a proving message 1 has arrived on USB, BLE stays shut for the rest of the window.
-- **USB pre-empts BLE.** When a message 1 that proves the secret arrives on USB, at any time in the window, the radio closes every BLE attempt that has not completed, including any that has its message 2, and accepts no more pairing on BLE in that window.
+- **USB pre-empts BLE.** When a proving message 1 (§2.4: the secret, the key and the hello all pass) arrives on USB, at any time in the window, the radio closes every BLE attempt that has not completed, including any that has its message 2, and accepts no more pairing on BLE in that window.
 
 So: a phone that powers the radio, enumerates it and sends a proving message 1 on its pairing port within 20 s **cannot lose a USB window to BLE**. A cable phone that is slower ends the open BLE attempts with its message 1 and loses only to a BLE phone whose message 3 arrived first. A host that is not pairing gains nothing by keeping BLE shut, so after 20 s it does not. A replace window has no USB rules: its secret is fresh (§2.7).
 
@@ -168,7 +181,8 @@ One status light. It is for convenience only: **no security property depends on 
 | Unpaired, rate limited (§2.3: the next window needs 30 minutes and a replug, or the pin) | Two short blinks every 5 s while on USB power |
 | Unpaired, no window, not rate limited (unplug and plug in to open one) | One short blink every 5 s while on USB power; dark on battery |
 | Paired | Charging, battery and "something waiting" patterns as set in `SETTINGS` |
-| Pinhole reset accepted | On for 2 s, then the unpaired state |
+| Pinhole reset accepted (once the reset marker is durable, §2.8) | On for 2 s, then the unpaired state |
+| Faulted: a store write failed (§2.8) | Long on, short off, repeating |
 
 The light shows "completed" for any phone that completes, the owner's or a stranger's. That is why the app, not the light, says whether the radio is the owner's.
 
@@ -183,7 +197,7 @@ v0 allows **one paired phone**. Why:
 **Moving to a new phone (replace):**
 
 1. The old phone fetches and acknowledges every held packet (`FETCH`, `FETCH_ACK`). Packets that arrive after that and before the completion are held and then erased with the rest; the sender's phone retries (§5).
-2. It makes a fresh random 32-byte secret, kept in memory only and never on disk, and sends `PAIR_OPEN` with it. The radio refuses an all-zero secret (a cheap check against app bugs; the radio chooses nothing else about it, and a hostile app on the old phone is the owner already). The radio opens a replace window whose psk is that secret, and only that secret.
+2. It makes a fresh random 32-byte secret, kept in memory only and never on disk, and sends `PAIR_OPEN` with it. The radio refuses an all-zero secret and a secret equal to its label secret (compared in constant time); both are cheap checks against app bugs, since a replace window keyed with the label secret could be raced by every label holder. The radio chooses nothing else about it: a hostile app on the old phone is the owner already. The radio opens a replace window whose psk is that secret, and only that secret.
 3. The old phone shows the **replace code** (`OASAT1-`, §2.1: the radio's pairing key and the fresh secret) as a QR on its screen. The code is hidden until the user taps to show it, hidden again when the app goes to the background, and screenshots are blocked where the system allows; iPhone cannot block them, and screen sharing, casting, screen recording and accessibility services may still see it. The old phone keeps working during the window.
 4. The new phone scans it and pairs (§2.4). At completion the radio runs the replace sequence of §2.8: it erases everything a pinhole reset erases besides the pairing (held packets, wake filters, owner-set `SETTINGS`, saved timestamps), then in one atomic change takes the old phone out and puts the new phone in, with a new link key. The old phone's sessions end at once.
 5. When the window closes, with or without a completion, both phones and the radio wipe the replace secret. With no completion, nothing changes: the old phone stays paired with its state.
@@ -211,10 +225,16 @@ A reset that comes between closing a window and writing the new peer wins: the w
 
 1. Write a marker in flash saying which operation is running.
 2. Erase the owner state as above (for a replace: everything but the peer and the link key).
-3. Write the trust state in one atomic change: nothing (reset), or the old phone out and the new phone and link key in (replace).
+3. Write the trust state in one atomic change: empty (reset), or the old phone out and the new phone and link key in (replace).
 4. Clear the marker.
 
-At boot, a radio that finds a marker **finishes the erase** of step 2, keeps whatever peer the trust state holds, and clears the marker. So a reset torn by power loss ends unpaired and empty. A replace torn before step 3 ends with the old phone still paired but its filters and settings gone (the old phone sends them again at its next connect), and the new phone reports "not confirmed". A replace torn after step 3 ends complete. No order leaves a new phone with the old owner's state.
+For a reset, the light shows "reset accepted" (§2.6) only once the marker of step 1 is durable in flash.
+
+At boot, a radio that finds a marker **finishes the work**. A **reset** marker: finish the erase of step 2, write an empty trust state, clear the marker; the radio ends unpaired and empty, whatever step the power loss hit. A **replace** marker: finish the erase of step 2, keep whatever peer the trust state holds, clear the marker.
+
+**Power lost before the marker lands** means the reset or replace never began: the old phone and all its state remain, as if the pin had been let go before 5 s. The user repeats the reset (the light never acknowledged it); for a replace, the new phone reports "not confirmed" and the old phone still works. A replace torn before step 3 ends with the old phone still paired but its filters and settings gone (the old phone sends them again at its next connect), and the new phone reports "not confirmed". A replace torn after step 3 ends complete. No order leaves a new phone with the old owner's state.
+
+**A store write that fails without power loss** (worn flash, a driver error) **fails closed.** The trust state on flash is the link's only source of who is paired; the link never trusts a copy in memory that disagrees with it. While a write is failing the radio is **faulted**: it accepts no link session and no pairing attempt, and its light shows the fault. The pinhole reset keeps working while faulted and may be repeated: it starts the whole sequence again from step 1, which is safe to repeat. A boot finishes any marker as above. A radio whose flash cannot complete a reset stays faulted, which refuses everyone: it is retired.
 
 ### 2.9 What a known label gets, and threats during pairing
 
@@ -390,6 +410,10 @@ The last three rows are **requirements on the product**, and they are **not true
 - **No label, no pairing.** A radio whose label is lost or unreadable cannot be paired (open question 1).
 - **Handshakes on the air can be spotted** by anyone who knows the receiver's public key (`mac1`, link §2). That is the base link's property; the handshake filter uses it and adds nothing to it on the air.
 - **Timing.** The radio cannot read packets, but anyone watching the air or the phone link sees when packets flow and how large they are. Padding is not in v0, as on the link.
+- **Denial of pairing, like jamming.** These can stop a pairing in a window and are accepted as equivalent to jamming the channel; none of them pairs anyone:
+  - A hostile USB host with a recording of an earlier pairing's message 1 replays it on USB. It proves the secret and passes the checks, so it pre-empts BLE and keeps BLE shut for that window, though its attempt can never complete. It needs the radio on that host's cable.
+  - A flood of new connections that open the pairing channel can push out an attempt before its message 1 arrives, since only proved attempts are protected (§2.4). Once the owner's message 1 has arrived, the attempt cannot be pushed out. The owner's app retries; the flood costs the owner time, not the window, while it lasts.
+  - Jamming Bluetooth itself, and a stranger completing first (§2.9).
 - **One phone.** No second phone, no shared radio (§2.7, open question 4).
 - **`snow` does not wipe its state** (as R-SEC1 §6); on the radio, session keys sit in memory until power-off, and the pairing secret is in `snow`'s handshake state until it is dropped.
 
@@ -406,14 +430,14 @@ Suite `l1-phone-link` in oasa-lab (a later card), with a simulated radio, a simu
 5. A small-order phone key in a message 1 with the right secret: no reply, nothing saved, the window stays open.
 6. The race: a second phone with the label completes first. The window closes; the owner's phone is not saved, gets no link handshake and reports "not confirmed".
 7. No hold: several phones prove message 1 and each gets a message 2; the first valid message 3 completes and the others get no reply; a phone that never sends message 3 blocks nobody. A phone whose message 3 is dropped while the window is still open pairs again and does not report "not confirmed"; one whose message 3 is dropped and the window then closes on another phone's completion reports it.
-8. Slots and work: with every slot holding a proved attempt, a new connection with no secret is refused and never ends an attempt that has its message 2; on a full transport a new connection replaces only an unproved attempt; BLE and USB slots are counted separately; a second message 1 on one connection, or a failed one, closes it; a window spent that way does not count toward the rate limit.
+8. Slots and work: with every slot holding a proved attempt, a new connection with no secret is refused and never ends an attempt that has its message 2; on a full transport a new connection replaces only an unproved attempt; BLE and USB slots are counted separately; a second message 1 on one connection, or a failed one, closes it; a bare BLE connection or a link connection takes no pairing slot and is never closed by the pairing timers.
 9. Replays: a recorded message 1 played again in the same window gets no reply; one from an earlier window, or one forgotten from a full record, gets a message 2 and never completes. Nothing is saved.
 10. Window rules: no window on battery start, or on USB power when paired; a window on unpaired USB power only after 10 s absent and 2 s present; closed after 2 minutes; the first completion closes it; a pairing message outside a window gets no reply.
-11. USB edges: power toggled faster than the debounce opens nothing; an edge during a window restarts nothing (timer, BLE rules, record of message 1s); a pulsing power source opens two windows, then one each 30 minutes, each only on a new edge; a radio left on power opens no window by itself after the limit; a reset lifts the limit and its window counts as the first of a new two.
-12. USB first: with no host, BLE refused until 10 s; a host enumerated by then keeps BLE shut until 20 s, and for the whole window once a proving USB message 1 arrives; a host that enumerates and sends nothing, or is unplugged, lets BLE open at 20 s; a proving USB message 1 ends every BLE attempt that has not completed, including one that has its message 2; a BLE message 3 that arrived before it still completes; a USB and a BLE message 3 arriving together save exactly one phone.
+11. USB edges: power toggled faster than the debounce opens nothing; an edge during a window restarts nothing (timer, BLE rules, record of message 1s); a pulsing power source opens two windows, then one each 30 minutes, each only on a new edge; a radio left on power opens no window by itself after the limit; a reset lifts the limit and its window counts as the first of a new two; every window that closes without a pairing counts, however its attempts ended; the count survives a reboot, and a boot at the limit restarts the 30 minutes; a radio that boots on battery and is plugged in under 10 s later opens no window; a wake from storage mode by USB opens one after 2 s.
+12. USB first: with no host, BLE refused until 10 s; a host enumerated by then keeps BLE shut until 20 s, and for the whole window once a proving USB message 1 arrives; a host that enumerates and sends nothing, or is unplugged, lets BLE open at 20 s; a proving USB message 1 ends every BLE attempt that has not completed, including one that has its message 2, while a small-order or bad-hello message 1 on USB pre-empts nothing; a BLE message 3 that arrived before it still completes. Two completions racing: in a replace window (no USB rules), a USB and a BLE message 3 in either order save exactly one phone; in a USB window the BLE attempt is already gone when the USB message 1 proves.
 13. Replace: `PAIR_OPEN` opens a window keyed with its secret only; an all-zero secret is refused; the old phone works until a completion; at completion the new phone is saved and the old removed, which is refused at once, and held packets (including any that arrived after the old phone's `FETCH_ACK`), filters, owner settings and timestamps are gone; with no completion nothing changes and the secret is wiped; an old phone that dies during the window leaves the radio paired to it until a reset; `PAIR_OPEN` from anyone else, during a window, or any unauthenticated request for a window, is refused.
-14. Pinhole reset: erases the phone, the link key, every timestamp, the filters, the held packets and owner settings; keeps the pairing key and secret; ends a live session at once (the old phone is refused); closes a replace window; with USB present opens a USB window 2 s later; a reset between closing a window and writing the new peer leaves the radio unpaired.
-15. Power lost at each step of a first pairing, a replace and a reset (§2.8): at boot a marker makes the radio finish the erase; it comes back paired with the new phone, paired with the old phone with its filters and settings gone, or unpaired and empty, never with a new phone and the old owner's state; a new phone that was not saved reports "not confirmed".
+14. Pinhole reset: erases the phone, the link key, every timestamp, the filters, the held packets and owner settings; keeps the pairing key and secret; ends a live session at once (the old phone is refused); closes a replace window; with USB present for the whole 2 s opens a USB window then, and an unplug within those 2 s cancels it (a reset on battery followed by a plug within 2 s opens nothing until the debounce); a reset between closing a window and writing the new peer leaves the radio unpaired.
+15. Power lost at each step of a first pairing, a replace and a reset (§2.8): at boot a reset marker makes the radio finish the erase and end unpaired and empty, and a replace marker makes it finish the erase and keep the saved peer; power lost before the marker lands leaves the old phone and all its state; it comes back paired with the new phone, paired with the old phone (with or without its filters and settings), or unpaired and empty, never with a new phone and the old owner's state; a new phone that was not saved reports "not confirmed". Also power lost during the recovering boot itself.
 16. Link keys: the link uses the link key from message 2, not the pairing key; a link handshake to the pairing key is dropped; after a reset or a replace, handshakes to the old link key and recorded old handshakes from either side are dropped; a small-order link key in message 2 is refused by the phone; two pairings give two different link keys and two different phone radio-link keys; the link key of an attempt that times out, is closed, is pre-empted or whose window closes is never written to flash.
 17. A changed bit in any command: dropped.
 18. Idle, slow and flooding connections, as the simulation models them, do not keep the paired phone out, and do not keep a phone with the right code out of an open window.
@@ -427,6 +451,8 @@ Suite `l1-phone-link` in oasa-lab (a later card), with a simulated radio, a simu
 26. Captures of the phone link contain none of the test plaintext.
 27. With no phone connected the radio's transmissions are relays only.
 28. The simulated app refuses a radio whose `STATUS` says uncommitted, unless it is set up as a development board, and then warns.
+29. A flood of new pairing-channel connections between the owner's connect and its message 1: the owner's attempt may be pushed out before its message 1 (§7) and the app retries; once its message 1 has arrived it is never pushed out; when the flood stops the owner pairs in the same window if time is left, and nothing is saved for the flood.
+30. Faults: a store write error (not a power loss) at each step of a pairing, a replace and a reset leaves the radio faulted, refusing every link session and pairing attempt before and after a boot until a reset completes; the pinhole works while faulted and can be repeated; a failed random source gives no message 2 and saves nothing; a radio with an all-zero label secret does not pair. Codes and `PAIR_OPEN` with an all-zero secret, and `PAIR_OPEN` with the label secret, are refused.
 
 ### Checks that need real hardware
 
@@ -440,6 +466,7 @@ The simulation cannot show these; the firmware and app cards run them on real ra
 6. The label: the version 7 QR at 0.34 mm modules scans on a range of phone cameras, new and worn.
 7. Erase: dump the whole flash after a reset and after a replace (each also torn by power loss at every step) and find none of the old peer key, link key, timestamps, wake filters or settings.
 8. Work per attempt: handshake time on the radio's chip, and the owner's pairing time, under a flood of wrong message 1s on every slot for a whole window.
+9. Store faults on real flash: a write error injected at each step of a pairing, a replace and a reset (by the flash driver's test hooks, or a worn part): the radio refuses every link session and pairing until a reset completes, and the pinhole still works.
 
 ## 9. Open questions
 
@@ -475,14 +502,14 @@ Constants and reuse, for the code card:
 | Advertised hint during a window | first 4 bytes of the fingerprint hash (BLAKE2s-256(`"OASA-SEC v0 fingerprint"` ‖ pairing public key), R-SEC1 §1) |
 | Window | 120 s |
 | USB power debounce | absent 10 s, then present 2 s |
-| USB window rate limit | after 2 windows in a row with no pairing, 30 minutes from the last close and then a new debounced edge (or a reset) |
+| USB window rate limit | every window closed without a pairing counts; after 2, 30 minutes from the last close (or from a boot at the limit) and then a new debounced edge, or a reset; count kept in flash, at most one write per window |
 | BLE in a USB window | from 10 s after it opens if no host has enumerated; from 20 s if a host enumerated but no proving USB message 1 arrived |
 | Pairing slots | `BLE_PAIRING_SLOTS`, `USB_PAIRING_SLOTS`, counted separately; values fixed by the firmware card (real-hardware check 2); a proved attempt is never displaced |
 | Memory per attempt | one Noise handshake state, one link private key, message buffers: under 1 kB |
 | Attempt timers | message 1 within 3 s of connecting; message 3 within 6 s of message 2 |
 | Record of message 1 ephemerals | last 16 per window |
 | App confirmation | "not confirmed yet" at 20 s, "did not confirm" at 60 s of foreground trying |
-| Pinhole | held 5 s; a USB window 2 s after a reset with USB power present |
+| Pinhole | held 5 s; a USB window 2 s after a reset, if USB stays present throughout; acknowledged on the light once the marker is durable |
 | Unfinished link connection outside a window | closed after 5 s |
 
 - The label and replace code are not `PairingCode`, but share its rules: the secret is wiped on drop and never in `Debug`, and decoding uses `BASE32_NOPAD`, which refuses non-zero padding bits (`code.rs`).
@@ -550,7 +577,7 @@ The [review notes](security-review-t-msg1-phone-link.md) hold three reviews: the
 | ID | Finding | Change in v0.4 |
 |---|---|---|
 | R3-M1 | The middle of a BLE pairing was understated | What it needs, gives and lasts, its one sign, and that it is inherent (§2.9, §6); three over-claims qualified (changes list, §2.9 table, §6); "radio near but not answering" in the app (§3); second-hand radios by cable or treated as not clean (§2.9, §6). A camera reading the light is open question 14, not adopted |
-| R3-M2 | A connection with no secret could end a proved attempt | A proved attempt is never displaced; slots per transport as parameters; windows spent that way do not count toward the rate limit (§2.3, §2.4, §10); case 8 |
+| R3-M2 | A connection with no secret could end a proved attempt | A proved attempt is never displaced; slots per transport as parameters (§2.4, §10); case 8. The v0.4 rule sparing such windows from the rate limit was dropped in v0.5 (C-3): every window without a pairing counts (§2.3) |
 | R3-M3 | "Erase" undefined in flash | No readable copy after reset or replace: page erase or forced clean-up first (§2.8); real-hardware check 7 |
 | R3-L1 | Attempt link key lifetime | Memory only, wiped when the attempt ends; only the completing key is written (§2.4); case 16 |
 | R3-L2 | Reset and replace torn by power loss | Marker, erase, trust change, clear; at boot a marker finishes the erase (§2.8); case 15 |
@@ -563,3 +590,23 @@ The [review notes](security-review-t-msg1-phone-link.md) hold three reviews: the
 | R3-I2 | More changes from R-SEC1 than "one" | Listed (§2.4) |
 | R3-I3 | Message sizes | §10 |
 | R3-I4 | `mac1` key holders; R2-M5 departure | §3; the R2-M5 row above |
+
+**The first pairing code (draft PR #41): its ten spec questions and code review C-1 to C-14**
+
+| Item | Change in v0.5 |
+|---|---|
+| Q1, C-14 | A reset marker at boot ends unpaired and empty (§2.8) |
+| Q2, C-14 | Power lost before the marker lands: nothing began; the light acknowledges only a durable marker (§2.8) |
+| Q3 | Case 12 reworded to the races that can happen |
+| Q4, C-3 | No spared windows: every window without a pairing counts (§2.3) |
+| Q5 | A proving message 1 passes the secret, key and hello checks (§2.4, §2.5) |
+| Q6 | The reset's window needs USB for the whole 2 s (§2.3); case 14 |
+| Q7 | Absence counted from a boot on battery; storage wake counts as absent (§2.3); case 11 |
+| Q8, C-8 | Attempts start only on the pairing channel; link connections are never attempts (§2.4); case 8 |
+| Q9, C-6, C-7 | All-zero secrets refused in every code; `PAIR_OPEN` with the label secret refused (§2.1, §2.2, §2.7); case 30 |
+| Q10, C-1 | A failing store fails closed; the pinhole keeps working (§2.8); case 30, real-hardware check 9 |
+| C-2 | The rate limit is kept in flash and survives a boot (§2.3); case 11 |
+| C-4, C-5 | Accepted as denial of pairing, like jamming (§7); case 29 |
+| C-9 to C-12 | Code matters (tests, wiping temporaries, overflow, the app's constructor); no spec change |
+| C-13 | Storage mode is entered only by the factory or the radio's low-battery rule, never by a message (§2.3) |
+| Random source | A failed random source stops pairing (§2.2); case 30 |
