@@ -23,6 +23,7 @@ pub mod link;
 pub mod mavguard;
 mod mavlens;
 pub mod pairing;
+pub mod phone;
 pub mod removal;
 pub mod rotation;
 pub mod signer;
@@ -43,3 +44,8 @@ pub const PAIRING_NOISE: &str = "Noise_IKpsk1_25519_ChaChaPoly_BLAKE2s";
 /// Prologue mixed into every pairing handshake, so it can't be confused with
 /// any other protocol that happens to use the same Noise pattern.
 pub const PAIRING_PROLOGUE: &[u8] = b"OASA-SEC v0 pairing";
+
+/// Prologue of a phone pairing (spec `docs/oasa-sec-v0-phone-link.md`
+/// section 2.4), so a phone pairing and a drone pairing can never be
+/// mistaken for each other. Same pattern, [`PAIRING_NOISE`].
+pub const PHONE_PAIRING_PROLOGUE: &[u8] = b"OASA-SEC v0 phone pairing";
