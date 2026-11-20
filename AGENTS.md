@@ -31,6 +31,8 @@ Files in a device folder: `trusted-peers.v1` (roles), `removed` (append-only tom
 
 Signing-key rotation: `src/rotation.rs` holds the key files and generations (`mavlink-signing-gen` is the highest ever issued and is never lowered; save the number before the key). `src/signer.rs` is the state machine, sans-IO like the link: its autopilot link is the `Port` trait, with the clock, so tests run it against a simulated autopilot in virtual time (`src/signer/tests.rs`). Never delete a key that might be the autopilot's; the probe decides (only the autopilot's own frames count; an old-key answer must be a `COMMAND_ACK` that names the signer), and `rotation_stuck` keeps both. Rotation requests carry the generation, never a time. Timestamps from the wire count only if the signature verifies, capped at the clock plus 60 s. Signing keys never go in logs, `Debug` or errors, and buffers that carry one are `Zeroizing`.
 
+Phone pairing (T-MSG1, draft; first part only): `src/phone/` holds the radio label (`OASAR1-`) and replace code (`OASAT1-`), kept apart from the drone code; the three-message pairing for both roles; and the radio's pairing state machine (`Radio`), sans-IO like the link: time and events come in, actions go out through a sink, flash goes through the `RadioStore` trait, whose reset and replace writes follow the power-safe order. Spec: `docs/oasa-sec-v0-phone-link.md`. Tests in `src/phone/tests.rs` are named after the spec's section 8 cases (`case_NN_...`). The link session, the messages inside it, wake filters, the hold store and the transports are later parts.
+
 ## Pull requests
 
 - Branch, then open a pull request into `main`. CI must pass.
