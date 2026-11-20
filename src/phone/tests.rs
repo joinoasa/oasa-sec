@@ -1804,15 +1804,17 @@ fn debug_output_shows_no_secret() {
         data_encoding::HEXLOWER.encode(b.label.secret()),
         data_encoding::HEXLOWER.encode(done.radio_link_key.private_key()),
     ];
-    for text in &shown {
-        assert!(!text.contains(secret_b32));
+    // On failure, name which output leaked, never the output itself (it
+    // would print the secret).
+    for (i, text) in shown.iter().enumerate() {
+        assert!(!text.contains(secret_b32), "output {i} shows the label");
         for h in &hexes {
-            assert!(!text.contains(&h[..16]));
+            assert!(!text.contains(&h[..16]), "output {i} shows a secret");
         }
         // Debug of a byte array prints decimals: look for the first bytes.
         for k in [secret, saved.2, *b.label.secret()] {
             let dec = format!("{}, {}, {}, {}", k[0], k[1], k[2], k[3]);
-            assert!(!text.contains(&dec), "{text}");
+            assert!(!text.contains(&dec), "output {i} shows a secret");
         }
     }
 }
