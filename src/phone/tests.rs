@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use super::handshake::{radio_open_msg1, radio_write_msg2};
 use super::*;
 use crate::identity::Identity;
-use crate::link::OsEntropy;
+use crate::link::{Entropy, EntropyFailed};
 
 // ---- the simulated flash ----
 
@@ -30,9 +30,16 @@ struct Flash {
     written_links: Vec<[u8; 32]>,
     /// Writes and erases done so far.
     ops: usize,
+    /// The persisted rate-limit count.
+    rate_count: u8,
     /// Power is lost instead of doing operation number `n` (0-based).
     crash_at: Option<usize>,
     dead: bool,
+    /// Operation number `n` fails with a write error (the flash stays
+    /// powered and later operations work).
+    error_at: Option<usize>,
+    /// Every read fails (a broken flash).
+    reads_fail: bool,
 }
 
 #[derive(Clone)]
@@ -45,11 +52,16 @@ impl MemStore {
             f.dead = true;
             return Err(StoreFailed);
         }
+        if f.error_at == Some(f.ops) {
+            f.error_at = None;
+            return Err(StoreFailed);
+        }
         f.ops += 1;
         Ok(())
     }
     fn alive(&self) -> Result<(), StoreFailed> {
-        if self.0.borrow().dead {
+        let f = self.0.borrow();
+        if f.dead || f.reads_fail {
             Err(StoreFailed)
         } else {
             Ok(())
@@ -94,11 +106,37 @@ impl RadioStore for MemStore {
         }
         Ok(())
     }
+    fn rate_count(&mut self) -> Result<u8, StoreFailed> {
+        self.alive()?;
+        Ok(self.0.borrow().rate_count)
+    }
+    fn write_rate_count(&mut self, n: u8) -> Result<(), StoreFailed> {
+        self.step()?;
+        self.0.borrow_mut().rate_count = n;
+        Ok(())
+    }
+}
+
+/// The operating system's random source, unless the test says it has
+/// failed.
+#[derive(Clone, Default)]
+struct TestEntropy(Rc<std::cell::Cell<bool>>);
+
+impl Entropy for TestEntropy {
+    fn fill(&mut self, dst: &mut [u8]) {
+        self.try_fill(dst).expect("random source failed");
+    }
+    fn try_fill(&mut self, dst: &mut [u8]) -> Result<(), EntropyFailed> {
+        if self.0.get() {
+            return Err(EntropyFailed);
+        }
+        getrandom::fill(dst).map_err(|_| EntropyFailed)
+    }
 }
 
 // ---- the bench ----
 
-type R = Radio<MemStore, OsEntropy, 3, 2>;
+type R = Radio<MemStore, TestEntropy, 3, 2>;
 
 const RADIO_NAME: &str = "keel-1";
 
@@ -111,6 +149,7 @@ struct Bench {
     flash: Rc<RefCell<Flash>>,
     label: LabelCode,
     pairing_private: Zeroizing<[u8; 32]>,
+    entropy: TestEntropy,
 }
 
 impl Bench {
@@ -121,41 +160,54 @@ impl Bench {
         let pairing_private = Zeroizing::new(*id.private_key());
         let flash = Rc::new(RefCell::new(Flash::default()));
         let keys = RadioKeys::new(id, &label).unwrap();
+        let entropy = TestEntropy::default();
         let r = R::boot(
             keys,
             Name::new(RADIO_NAME).unwrap(),
             MemStore(flash.clone()),
-            OsEntropy,
+            entropy.clone(),
             s(0.0),
             usb,
-        )
-        .unwrap();
+            &mut |_| {},
+        );
         Self {
             r,
             flash,
             label,
             pairing_private,
+            entropy,
         }
     }
 
     /// Power comes back after a loss: the same flash, a new radio.
-    fn reboot(&mut self, t: f64, usb: bool) -> Result<(), StoreFailed> {
+    fn reboot(&mut self, t: f64, usb: bool) -> Vec<Action> {
         {
             let mut f = self.flash.borrow_mut();
             f.dead = false;
             f.crash_at = None;
         }
+        self.boot_again(t, usb)
+    }
+
+    /// A new radio on the same flash, as it is (a crash setting stays).
+    fn boot_again(&mut self, t: f64, usb: bool) -> Vec<Action> {
         let id = Identity::from_private_bytes(&self.pairing_private[..]).unwrap();
         let keys = RadioKeys::new(id, &self.label).unwrap();
+        let mut v = vec![];
         self.r = R::boot(
             keys,
             Name::new(RADIO_NAME).unwrap(),
             MemStore(self.flash.clone()),
-            OsEntropy,
+            self.entropy.clone(),
             s(t),
             usb,
-        )?;
-        Ok(())
+            &mut |a| v.push(a),
+        );
+        v
+    }
+
+    fn link_peer(&mut self) -> Option<[u8; 32]> {
+        self.r.link_peer(&mut |_| {}).map(|p| p.phone_public)
     }
 
     /// Started on USB power at 0 s: a USB window opens at 2 s, with no
@@ -197,17 +249,19 @@ impl Bench {
         self.r.usb_enumerated(s(t), &mut |a| v.push(a));
         v
     }
-    fn open(&mut self, t: f64, tr: Transport, conn: ConnId) -> Vec<Action> {
+    fn open(&mut self, t: f64, tr: Transport, conn: ChannelId) -> Vec<Action> {
         let mut v = vec![];
-        self.r.connection_opened(s(t), tr, conn, &mut |a| v.push(a));
+        self.r
+            .pairing_channel_opened(s(t), tr, conn, &mut |a| v.push(a));
         v
     }
-    fn lost(&mut self, t: f64, conn: ConnId) -> Vec<Action> {
+    fn lost(&mut self, t: f64, conn: ChannelId) -> Vec<Action> {
         let mut v = vec![];
-        self.r.connection_closed(s(t), conn, &mut |a| v.push(a));
+        self.r
+            .pairing_channel_closed(s(t), conn, &mut |a| v.push(a));
         v
     }
-    fn msg(&mut self, t: f64, conn: ConnId, m: &[u8]) -> Vec<Action> {
+    fn msg(&mut self, t: f64, conn: ChannelId, m: &[u8]) -> Vec<Action> {
         let mut v = vec![];
         self.r.message(s(t), conn, m, &mut |a| v.push(a));
         v
@@ -233,7 +287,7 @@ impl Bench {
         &mut self,
         t: f64,
         tr: Transport,
-        conn: ConnId,
+        conn: ChannelId,
         code: PairWith<'_>,
         name: &str,
     ) -> (PhonePairing, Vec<u8>) {
@@ -249,7 +303,7 @@ impl Bench {
         &mut self,
         t: f64,
         tr: Transport,
-        conn: ConnId,
+        conn: ChannelId,
         code: PairWith<'_>,
         name: &str,
     ) -> PhonePaired {
@@ -268,36 +322,36 @@ impl Bench {
 }
 
 fn phone(code: PairWith<'_>, name: &str) -> (PhonePairing, Vec<u8>) {
-    PhonePairing::start(code, name, &mut OsEntropy).unwrap()
+    PhonePairing::start(code, name, &mut TestEntropy::default()).unwrap()
 }
 
-fn msg2_for(v: &[Action], conn: ConnId) -> Option<Vec<u8>> {
+fn msg2_for(v: &[Action], conn: ChannelId) -> Option<Vec<u8>> {
     v.iter().find_map(|a| match a {
-        Action::Send { conn: c, msg2 } if *c == conn => Some(msg2.as_bytes().to_vec()),
+        Action::Send { channel: c, msg2 } if *c == conn => Some(msg2.as_bytes().to_vec()),
         _ => None,
     })
 }
 
-fn close_of(v: &[Action], conn: ConnId) -> Option<CloseReason> {
+fn close_of(v: &[Action], conn: ChannelId) -> Option<CloseReason> {
     v.iter().find_map(|a| match a {
-        Action::Close { conn: c, why } if *c == conn => Some(*why),
+        Action::Close { channel: c, why } if *c == conn => Some(*why),
         _ => None,
     })
 }
 
-fn no_reply(v: &[Action], conn: ConnId) -> bool {
+fn no_reply(v: &[Action], conn: ChannelId) -> bool {
     v.iter()
-        .any(|a| matches!(a, Action::NoReply { conn: c, .. } if *c == conn))
+        .any(|a| matches!(a, Action::NoReply { channel: c, .. } if *c == conn))
         && msg2_for(v, conn).is_none()
 }
 
-fn paired_in(v: &[Action]) -> Option<(ConnId, [u8; 32], bool)> {
+fn paired_in(v: &[Action]) -> Option<(ChannelId, [u8; 32], bool)> {
     v.iter().find_map(|a| match a {
         Action::Paired {
-            conn,
+            channel,
             phone_public,
             replaced,
-        } => Some((*conn, *phone_public, *replaced)),
+        } => Some((*channel, *phone_public, *replaced)),
         _ => None,
     })
 }
@@ -543,7 +597,7 @@ fn case_04_label_secret_in_a_replace_window_gets_no_reply() {
     r.unwrap();
     let label = b.label.clone();
     for (i, tr) in [Transport::Ble, Transport::Usb].into_iter().enumerate() {
-        let c = 10 + i as ConnId;
+        let c = 10 + i as ChannelId;
         b.open(11.0, tr, c);
         let (_, m1) = phone(PairWith::Label(&label), "x");
         let v = b.msg(11.0, c, &m1);
@@ -589,7 +643,7 @@ fn case_05_small_order_phone_key_with_the_right_secret_gets_no_reply() {
     let pk = *b.label.pairing_public();
     let secret = *b.label.secret();
     for (i, point) in small_order_points().into_iter().enumerate() {
-        let c = i as ConnId + 1;
+        let c = i as ChannelId + 1;
         let m1 = small_order_msg1(&pk, &secret, point);
         b.open(3.0, Transport::Usb, c);
         let v = b.msg(3.0, c, &m1);
@@ -774,75 +828,101 @@ fn case_08_a_second_message_1_or_a_failed_one_closes_the_connection() {
 }
 
 #[test]
-fn case_08_a_window_whose_proved_attempt_was_ended_by_something_else_does_not_count() {
-    // Two windows in which the owner's proved attempt lost its connection:
-    // neither counts, so a third window still opens on the next edge.
+fn case_08_every_usb_window_that_closes_without_a_pairing_counts() {
+    // Review C-2/C-3: no window is spared, however its proved attempts
+    // ended (lost, pre-empted by USB, timed out). Two such windows, then
+    // the limit.
+    for how in ["lost", "preempted", "timeout"] {
+        let mut b = Bench::boot(false);
+        let label = b.label.clone();
+        let mut t = 10.0;
+        for round in 0..2 {
+            b.usb(t, true);
+            assert!(opened(&b.poll(t + 2.0), WindowKind::Usb), "{how} {round}");
+            let c = 100 + 2 * round;
+            match how {
+                "lost" => {
+                    let (_p, _) =
+                        b.reach_msg2(t + 3.0, Transport::Usb, c, PairWith::Label(&label), "o");
+                    b.lost(t + 4.0, c);
+                }
+                "preempted" => {
+                    let (_p, _) =
+                        b.reach_msg2(t + 13.0, Transport::Ble, c, PairWith::Label(&label), "o");
+                    let (_u, _) = b.reach_msg2(
+                        t + 14.0,
+                        Transport::Usb,
+                        c + 1,
+                        PairWith::Label(&label),
+                        "u",
+                    );
+                }
+                _ => {
+                    let (_p, _) =
+                        b.reach_msg2(t + 3.0, Transport::Usb, c, PairWith::Label(&label), "o");
+                    assert_eq!(
+                        close_of(&b.poll(t + 9.5), c),
+                        Some(CloseReason::Msg3Timeout)
+                    );
+                }
+            }
+            assert!(expired(&b.poll(t + 122.0)));
+            assert_eq!(b.flash.borrow().rate_count, round as u8 + 1, "{how}");
+            b.usb(t + 125.0, false);
+            t += 140.0;
+        }
+        assert!(b.r.status(s(t)).rate_limited, "{how}");
+        b.usb(t, true);
+        assert!(!opened(&b.poll(t + 3.0), WindowKind::Usb), "{how}");
+    }
+}
+
+#[test]
+fn case_11_the_rate_limit_survives_a_reboot() {
+    // Review C-2: the count is kept in the store, so a reboot (a flat
+    // battery on a pulsing source, a watchdog) does not forget it.
     let mut b = Bench::boot(false);
+    for on_at in [10.0, 150.0] {
+        b.usb(on_at, true);
+        assert!(opened(&b.poll(on_at + 2.0), WindowKind::Usb));
+        assert!(expired(&b.poll(on_at + 122.0)));
+        b.usb(on_at + 130.0, false);
+    }
+    assert_eq!(b.flash.borrow().rate_count, 2);
+    // A boot on USB power: no window (the 30 minutes count from the boot).
+    b.reboot(0.0, true);
+    assert!(b.r.status(s(1.0)).rate_limited);
+    assert!(b.poll(5.0).is_empty());
+    // Still none before 30 minutes from the boot, even on a new edge.
+    b.usb(100.0, false);
+    b.usb(200.0, true);
+    assert!(b.poll(205.0).is_empty());
+    // A new edge after the 30 minutes: a window.
+    b.usb(1800.0, false);
+    b.usb(1811.0, true);
+    assert!(opened(&b.poll(1813.0), WindowKind::Usb));
+    // A completed pairing clears it in the store.
     let label = b.label.clone();
-    let mut t = 10.0;
-    for round in 0..3 {
-        b.usb(t, true);
-        let v = b.poll(t + 2.0);
-        assert!(opened(&v, WindowKind::Usb), "round {round}");
-        let c = 100 + round;
-        let (_p, _) = b.reach_msg2(t + 3.0, Transport::Usb, c, PairWith::Label(&label), "o");
-        b.lost(t + 4.0, c);
-        assert!(expired(&b.poll(t + 122.0)));
-        assert!(!b.r.status(s(t + 123.0)).rate_limited);
-        b.usb(t + 125.0, false);
-        t += 140.0;
-    }
-    // Two windows whose proved BLE attempt was pre-empted by USB (and the
-    // USB attempt then timed out by itself): neither counts.
+    b.pair(1814.0, Transport::Usb, 1, PairWith::Label(&label), "owner");
+    assert_eq!(b.flash.borrow().rate_count, 0);
+    b.reboot(0.0, false);
+    assert!(!b.r.status(s(0.0)).rate_limited);
+}
+
+#[test]
+fn case_11_a_count_below_the_limit_survives_a_reboot_too() {
     let mut b = Bench::boot(false);
-    let label = b.label.clone();
-    let mut t = 10.0;
-    for round in 0..3 {
-        b.usb(t, true);
-        assert!(opened(&b.poll(t + 2.0), WindowKind::Usb), "round {round}");
-        let c = 300 + 2 * round;
-        let (_pb, _) = b.reach_msg2(t + 13.0, Transport::Ble, c, PairWith::Label(&label), "o");
-        let (_pu, _) = b.reach_msg2(
-            t + 14.0,
-            Transport::Usb,
-            c + 1,
-            PairWith::Label(&label),
-            "u",
-        );
-        assert_eq!(
-            close_of(&b.poll(t + 20.5), c + 1),
-            Some(CloseReason::Msg3Timeout)
-        );
-        assert!(expired(&b.poll(t + 122.0)));
-        assert!(!b.r.status(s(t + 123.0)).rate_limited, "round {round}");
-        b.usb(t + 125.0, false);
-        t += 140.0;
-    }
-    // A window whose proved attempt timed out on its own does count.
-    let mut b = Bench::boot(false);
-    let mut t = 10.0;
-    for round in 0..2 {
-        b.usb(t, true);
-        assert!(opened(&b.poll(t + 2.0), WindowKind::Usb), "round {round}");
-        let c = 200 + round;
-        let (_p, _) = b.reach_msg2(
-            t + 3.0,
-            Transport::Usb,
-            c,
-            PairWith::Label(&label_of(&b)),
-            "o",
-        );
-        assert_eq!(
-            close_of(&b.poll(t + 9.5), c),
-            Some(CloseReason::Msg3Timeout)
-        );
-        assert!(expired(&b.poll(t + 122.0)));
-        b.usb(t + 125.0, false);
-        t += 140.0;
-    }
-    assert!(b.r.status(s(t)).rate_limited);
-    b.usb(t, true);
-    assert!(!opened(&b.poll(t + 3.0), WindowKind::Usb));
+    b.usb(10.0, true);
+    assert!(opened(&b.poll(12.0), WindowKind::Usb));
+    assert!(expired(&b.poll(132.0)));
+    // Reboot on USB: one window (the second of two)...
+    b.reboot(0.0, true);
+    assert!(opened(&b.poll(2.0), WindowKind::Usb));
+    assert!(expired(&b.poll(122.0)));
+    // ...and then the limit, across another reboot.
+    b.reboot(0.0, true);
+    assert!(b.poll(5.0).is_empty());
+    assert!(b.r.status(s(5.0)).rate_limited);
 }
 
 #[test]
@@ -901,7 +981,7 @@ fn case_09_a_message_1_forgotten_from_a_full_record_gets_message_2_and_never_com
     b.lost(3.1, 1);
     // 15 more proving message 1s: the record (16) still holds the first.
     let mut t = 4.0;
-    let send_fresh = |b: &mut Bench, c: ConnId, t: f64| {
+    let send_fresh = |b: &mut Bench, c: ChannelId, t: f64| {
         b.open(t, Transport::Usb, c);
         let (_, m) = phone(PairWith::Label(&label), "x");
         assert!(msg2_for(&b.msg(t, c, &m), c).is_some());
@@ -1170,7 +1250,7 @@ fn case_12_a_proving_usb_message_1_shuts_ble_for_the_whole_window() {
     b.lost(6.0, 1);
     for t in [22.0, 60.0, 121.0] {
         assert!(!b.r.status(s(t)).ble_open, "{t}");
-        let c = t as ConnId;
+        let c = t as ChannelId;
         assert!(b.open(t, Transport::Ble, c).is_empty());
         let (_, m1) = phone(PairWith::Label(&label), "ble");
         assert!(no_reply(&b.msg(t, c, &m1), c));
@@ -1264,7 +1344,7 @@ fn case_13_pair_open_opens_a_window_keyed_with_its_secret_only() {
     assert!(b.r.status(s(10.0)).ble_open);
     // The old phone stays paired during the window, and nothing of its
     // state has been touched yet.
-    assert_eq!(b.r.paired_phone(), Some(&old_pub));
+    assert_eq!(b.link_peer(), Some(old_pub));
     assert!(!has(&v, |a| matches!(a, Action::EndAllSessions)));
     assert_eq!(b.flash.borrow().owner_state, Some(old_pub));
     let rc = ReplaceCode::from_secret(*b.label.pairing_public(), &secret).unwrap();
@@ -1298,7 +1378,7 @@ fn case_13_pair_open_opens_a_window_keyed_with_its_secret_only() {
         b.pair_open(13.0, &old_pub, &random_secret()).0,
         Err(PairOpenRefused::NotThePairedPhone)
     );
-    assert_eq!(b.r.paired_phone(), Some(&new_pub));
+    assert_eq!(b.link_peer(), Some(new_pub));
 }
 
 #[test]
@@ -1326,7 +1406,7 @@ fn case_13_with_no_completion_nothing_changes_and_the_secret_is_gone() {
     assert_eq!(f.trust.as_ref().map(|t| t.0), Some(old_pub));
     assert_eq!(f.owner_state, Some(old_pub));
     drop(f);
-    assert_eq!(b.r.paired_phone(), Some(&old_pub));
+    assert_eq!(b.link_peer(), Some(old_pub));
     // The radio's copy of the secret is gone with the window: the code
     // finds no window, and a new window with another secret refuses it.
     b.open(131.0, Transport::Ble, 2);
@@ -1384,7 +1464,7 @@ fn case_14_a_pinhole_reset_erases_the_owner_and_keeps_the_label() {
     assert!(f.owner_state.is_none());
     assert!(f.marker.is_none());
     drop(f);
-    assert!(b.r.paired_phone().is_none());
+    assert!(b.link_peer().is_none());
     // The old phone is refused at once.
     assert_eq!(
         b.pair_open(11.0, &old_pub, &random_secret()).0,
@@ -1457,7 +1537,7 @@ fn case_14_a_reset_after_closing_a_window_and_writing_the_peer_leaves_it_unpaire
     let v = b.msg(3.1, 1, &done.msg3);
     assert!(has(&v, |a| matches!(a, Action::StoreFailed)));
     assert!(paired_in(&v).is_none());
-    b.reboot(5.0, false).unwrap();
+    b.reboot(5.0, false);
     assert!(b.trust_phone().is_none());
 }
 
@@ -1479,7 +1559,7 @@ fn case_15_power_lost_at_each_step_of_a_first_pairing() {
         let done = p.finish(&m2).unwrap();
         b.crash_after(k);
         let v = b.msg(3.1, 1, &done.msg3);
-        b.reboot(10.0, false).unwrap();
+        b.reboot(10.0, false);
         assert_invariant(&b);
         if k == 0 {
             assert!(has(&v, |a| matches!(a, Action::StoreFailed)));
@@ -1511,7 +1591,7 @@ fn case_15_power_lost_at_each_step_of_a_replace() {
             k < 4,
             "k={k}"
         );
-        b.reboot(20.0, false).unwrap();
+        b.reboot(20.0, false);
         assert_invariant(&b);
         let f = b.flash.borrow();
         let phone = f.trust.as_ref().map(|t| t.0);
@@ -1533,7 +1613,7 @@ fn case_15_power_lost_at_each_step_of_a_replace() {
             }
         }
         drop(f);
-        assert_eq!(b.r.paired_phone(), phone.as_ref());
+        assert_eq!(b.link_peer(), phone);
     }
 }
 
@@ -1545,7 +1625,7 @@ fn case_15_power_lost_at_each_step_of_a_reset() {
         let old_pub = *old.radio_link_key.public_key();
         b.crash_after(k);
         b.reset(10.0);
-        b.reboot(20.0, false).unwrap();
+        b.reboot(20.0, false);
         assert_invariant(&b);
         let f = b.flash.borrow();
         if k == 0 {
@@ -1571,19 +1651,15 @@ fn case_15_power_lost_during_the_boot_that_finishes_an_erase() {
                 let mut f = b.flash.borrow_mut();
                 f.crash_at = Some(f.ops + k);
             }
-            let id = Identity::from_private_bytes(&b.pairing_private[..]).unwrap();
-            let keys = RadioKeys::new(id, &b.label).unwrap();
-            let first = R::boot(
-                keys,
-                Name::new(RADIO_NAME).unwrap(),
-                MemStore(b.flash.clone()),
-                OsEntropy,
-                s(30.0),
-                false,
-            );
-            let finished = first.is_ok();
+            let v = b.boot_again(30.0, false);
+            let finished = !b.r.status(s(30.0)).faulted;
+            assert_eq!(has(&v, |a| matches!(a, Action::StoreFailed)), !finished);
+            if !finished {
+                // Fail closed: no link peer from a faulted boot.
+                assert!(b.link_peer().is_none());
+            }
             // The next boot finishes it.
-            b.reboot(40.0, false).unwrap();
+            b.reboot(40.0, false);
             assert_invariant(&b);
             let f = b.flash.borrow();
             assert!(f.owner_state.is_none(), "{marker:?} k={k} ok={finished}");
@@ -1827,4 +1903,450 @@ fn next_wakeup_names_the_earliest_timer() {
     assert_eq!(b.r.next_wakeup(), Some(s(122.0)));
     b.open(3.0, Transport::Usb, 1);
     assert_eq!(b.r.next_wakeup(), Some(s(6.0)));
+}
+
+// ---- review findings (docs/security-review-t-msg1-phone-pairing-code.md) ----
+
+/// Run `f` on a radio, with a write error (not a power loss) at store
+/// operation `k` from now; return the actions.
+fn with_write_error(
+    b: &mut Bench,
+    k: usize,
+    f: impl FnOnce(&mut Bench) -> Vec<Action>,
+) -> Vec<Action> {
+    {
+        let mut fl = b.flash.borrow_mut();
+        fl.error_at = Some(fl.ops + k);
+    }
+    let v = f(b);
+    b.flash.borrow_mut().error_at = None;
+    v
+}
+
+/// A faulted radio refuses every link session and every pairing.
+fn assert_fails_closed(b: &mut Bench, t: f64) {
+    assert!(b.r.status(s(t)).faulted);
+    assert!(!b.r.status(s(t)).paired);
+    assert!(b.link_peer().is_none(), "no link session while faulted");
+    let label = b.label.clone();
+    b.open(t, Transport::Usb, 900);
+    let (_, m1) = phone(PairWith::Label(&label), "x");
+    let v = b.msg(t, 900, &m1);
+    assert!(has(&v, |a| matches!(
+        a,
+        Action::NoReply {
+            why: NoReplyReason::Faulted,
+            ..
+        }
+    )));
+    assert!(b.r.next_wakeup().is_none());
+}
+
+#[test]
+fn c1_a_write_error_at_each_step_of_a_reset_fails_closed_and_the_pin_retries() {
+    // Reset writes: marker, erase, trust (none), clear marker.
+    for k in 0..4 {
+        let (mut b, old) = Bench::paired();
+        let old_pub = *old.radio_link_key.public_key();
+        let v = with_write_error(&mut b, k, |b| b.reset(10.0));
+        assert!(has(&v, |a| matches!(a, Action::StoreFailed)), "k={k}");
+        assert!(has(&v, |a| matches!(a, Action::EndAllSessions)));
+        assert!(!has(&v, |a| matches!(a, Action::ResetDone)));
+        // The flash may still hold the old phone (k < 3); the link gets
+        // nothing either way.
+        assert_fails_closed(&mut b, 11.0);
+        // The pinhole keeps working: a retry finishes the reset.
+        let v = b.reset(12.0);
+        assert!(has(&v, |a| matches!(a, Action::ResetDone)), "k={k}");
+        assert!(!b.r.status(s(12.0)).faulted);
+        assert!(b.link_peer().is_none());
+        assert!(b.trust_phone().is_none());
+        assert!(b.flash.borrow().owner_state.is_none());
+        // On USB power, its window opens 2 s later.
+        assert!(opened(&b.poll(14.0), WindowKind::Usb));
+        // The old phone is refused.
+        assert_eq!(
+            b.pair_open(15.0, &old_pub, &random_secret()).0,
+            Err(PairOpenRefused::NotThePairedPhone)
+        );
+    }
+}
+
+#[test]
+fn c1_a_write_error_during_a_reset_then_a_boot_without_the_pin() {
+    // If the owner does not retry, the boot follows the flash: before the
+    // marker landed nothing began (the old phone stays, spec question 2);
+    // after it, the boot finishes the reset.
+    for k in 0..4 {
+        let (mut b, old) = Bench::paired();
+        let old_pub = *old.radio_link_key.public_key();
+        with_write_error(&mut b, k, |b| b.reset(10.0));
+        b.reboot(0.0, false);
+        assert_invariant(&b);
+        if k == 0 {
+            assert_eq!(b.link_peer(), Some(old_pub));
+        } else {
+            assert!(b.link_peer().is_none(), "k={k}");
+            assert!(b.flash.borrow().owner_state.is_none());
+        }
+    }
+}
+
+#[test]
+fn c1_a_write_error_at_each_step_of_a_replace_fails_closed() {
+    // Replace writes: marker, erase, trust, clear marker.
+    for k in 0..4 {
+        let (mut b, old) = Bench::paired();
+        let old_pub = *old.radio_link_key.public_key();
+        let secret = random_secret();
+        b.pair_open(10.0, &old_pub, &secret).0.unwrap();
+        let rc = ReplaceCode::from_secret(*b.label.pairing_public(), &secret).unwrap();
+        let (p, m2) = b.reach_msg2(11.0, Transport::Ble, 1, PairWith::Replace(&rc), "new");
+        let new = p.finish(&m2).unwrap();
+        let v = with_write_error(&mut b, k, |b| b.msg(11.5, 1, &new.msg3));
+        assert!(has(&v, |a| matches!(a, Action::StoreFailed)), "k={k}");
+        assert!(paired_in(&v).is_none());
+        // Neither the old phone (perhaps still in flash) nor the new one
+        // gets a link session.
+        assert_fails_closed(&mut b, 12.0);
+        assert_eq!(
+            b.pair_open(12.5, &old_pub, &random_secret()).0,
+            Err(PairOpenRefused::Faulted)
+        );
+        // The pin clears it: unpaired and empty.
+        assert!(has(&b.reset(13.0), |a| matches!(a, Action::ResetDone)));
+        assert!(b.link_peer().is_none());
+        assert!(b.trust_phone().is_none());
+        assert!(b.flash.borrow().owner_state.is_none());
+        assert_invariant(&b);
+    }
+}
+
+#[test]
+fn c1_a_write_error_in_a_first_pairing_fails_closed() {
+    // A first pairing writes the trust state, then clears a non-zero count.
+    for k in 0..2 {
+        let mut b = Bench::boot(false);
+        // One window closed with no pairing, so the count is 1 and the
+        // pairing has a second write to make.
+        b.usb(10.0, true);
+        assert!(opened(&b.poll(12.0), WindowKind::Usb));
+        assert!(expired(&b.poll(132.0)));
+        b.usb(140.0, false);
+        b.usb(150.0, true);
+        assert!(opened(&b.poll(152.0), WindowKind::Usb));
+        let label = b.label.clone();
+        let (p, m2) = b.reach_msg2(153.0, Transport::Usb, 1, PairWith::Label(&label), "o");
+        let done = p.finish(&m2).unwrap();
+        let v = with_write_error(&mut b, k, |b| b.msg(153.5, 1, &done.msg3));
+        assert!(has(&v, |a| matches!(a, Action::StoreFailed)), "k={k}");
+        assert!(paired_in(&v).is_none());
+        assert_fails_closed(&mut b, 154.0);
+        assert!(has(&b.reset(155.0), |a| matches!(a, Action::ResetDone)));
+        assert!(b.trust_phone().is_none());
+        assert_eq!(b.flash.borrow().rate_count, 0);
+        assert!(opened(&b.poll(157.0), WindowKind::Usb));
+    }
+}
+
+#[test]
+fn c1_a_failed_reset_retry_stays_faulted_and_a_read_error_faults_too() {
+    let (mut b, _) = Bench::paired();
+    with_write_error(&mut b, 0, |b| b.reset(10.0));
+    let v = with_write_error(&mut b, 1, |b| b.reset(11.0));
+    assert!(has(&v, |a| matches!(a, Action::StoreFailed)));
+    assert_fails_closed(&mut b, 12.0);
+    assert!(has(&b.reset(13.0), |a| matches!(a, Action::ResetDone)));
+
+    // A trust read that fails when the link asks: fail closed.
+    let (mut b, _) = Bench::paired();
+    b.flash.borrow_mut().reads_fail = true;
+    let mut v = vec![];
+    assert!(b.r.link_peer(&mut |a| v.push(a)).is_none());
+    assert!(has(&v, |a| matches!(a, Action::StoreFailed)));
+    b.flash.borrow_mut().reads_fail = false;
+    assert!(b.link_peer().is_none(), "still faulted");
+    // A boot whose reads fail starts faulted.
+    b.flash.borrow_mut().reads_fail = true;
+    let v = b.boot_again(0.0, true);
+    assert!(has(&v, |a| matches!(a, Action::StoreFailed)));
+    b.flash.borrow_mut().reads_fail = false;
+    assert_fails_closed(&mut b, 3.0);
+}
+
+#[test]
+fn c4_a_usb_host_replaying_a_recorded_message_1_shuts_ble_for_that_window_only() {
+    let mut b = Bench::window();
+    let label = b.label.clone();
+    // Recorded over BLE in the first window.
+    b.open(13.0, Transport::Ble, 1);
+    let (_p, rec) = phone(PairWith::Label(&label), "owner");
+    assert!(msg2_for(&b.msg(13.0, 1, &rec), 1).is_some());
+    assert!(expired(&b.poll(122.0)));
+    // A second window: a hostile USB host replays it at once.
+    b.usb(125.0, false);
+    b.usb(140.0, true);
+    assert!(opened(&b.poll(142.0), WindowKind::Usb));
+    b.open(143.0, Transport::Usb, 2);
+    assert!(msg2_for(&b.msg(143.0, 2, &rec), 2).is_some());
+    for t in [152.0, 162.0, 200.0, 261.0] {
+        assert!(!b.r.status(s(t)).ble_open, "{t}");
+    }
+    assert!(expired(&b.poll(262.0)));
+    // The next window (a reset on USB) has its normal BLE rule.
+    b.reset(270.0);
+    assert!(opened(&b.poll(272.0), WindowKind::Usb));
+    assert!(!b.r.status(s(281.9)).ble_open);
+    assert!(b.r.status(s(282.0)).ble_open);
+    b.pair(282.0, Transport::Ble, 3, PairWith::Label(&label), "owner");
+}
+
+#[test]
+fn c5_a_flood_between_connect_and_message_1_is_bounded_and_the_owner_retries() {
+    let mut b = Bench::window();
+    let label = b.label.clone();
+    // The owner opens a USB pairing channel; a flood follows before its
+    // message 1 is sent.
+    b.open(3.0, Transport::Usb, 1);
+    let mut displaced = 0;
+    let mut c = 100;
+    for i in 0..20 {
+        let v = b.open(3.0 + 0.01 * i as f64, Transport::Usb, c);
+        displaced += v
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Close {
+                        why: CloseReason::Displaced,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(v.len() <= 1, "one channel in, at most one out");
+        c += 1;
+    }
+    // Bounded: at most 2 live attempts (the slots), so 19 of the 21 went.
+    assert_eq!(displaced, 19);
+    // The owner's message 1 on its displaced channel gets nothing...
+    let (_, m1) = phone(PairWith::Label(&label), "owner");
+    assert!(no_reply(&b.msg(3.3, 1, &m1), 1));
+    // ...and its retry, message 1 at once on a new channel, proves the
+    // secret before the next flood channel; the flood then cannot end it.
+    b.open(3.4, Transport::Usb, 2);
+    let (p, m1) = phone(PairWith::Label(&label), "owner");
+    let m2 = msg2_for(&b.msg(3.4, 2, &m1), 2).unwrap();
+    for i in 0..20 {
+        let v = b.open(3.5 + 0.01 * i as f64, Transport::Usb, c);
+        assert!(close_of(&v, 2).is_none());
+        c += 1;
+    }
+    let done = p.finish(&m2).unwrap();
+    assert!(paired_in(&b.msg(4.0, 2, &done.msg3)).is_some());
+}
+
+#[test]
+fn c6_radio_keys_refuse_an_all_zero_label_secret() {
+    let id = Identity::generate().unwrap();
+    let zero = LabelCode::with_secret(*id.public_key(), [0u8; 32]);
+    assert!(RadioKeys::new(id, &zero).is_err());
+}
+
+#[test]
+fn c7_pair_open_with_the_label_secret_is_refused() {
+    let (mut b, old) = Bench::paired();
+    let label_secret = *b.label.secret();
+    let (r, v) = b.pair_open(10.0, old.radio_link_key.public_key(), &label_secret);
+    assert_eq!(r, Err(PairOpenRefused::LabelSecret));
+    assert!(v.is_empty());
+    assert!(b.r.status(s(10.0)).window.is_none());
+    // One bit off is a different secret, and accepted.
+    let mut near = label_secret;
+    near[31] ^= 1;
+    b.pair_open(11.0, old.radio_link_key.public_key(), &near)
+        .0
+        .unwrap();
+}
+
+#[test]
+fn c8_pairing_channels_in_a_replace_window_never_touch_the_old_phones_link() {
+    let (mut b, old) = Bench::paired();
+    let old_pub = *old.radio_link_key.public_key();
+    b.pair_open(10.0, &old_pub, &random_secret()).0.unwrap();
+    // A flood of pairing channels, idle, displaced and timing out: the old
+    // phone's link (not a pairing channel, never seen here) stays.
+    for c in 0..30 {
+        let v = b.open(10.0 + 0.1 * c as f64, Transport::Ble, 500 + c);
+        assert!(!has(&v, |a| matches!(a, Action::EndAllSessions)));
+    }
+    b.poll(20.0);
+    assert_eq!(b.link_peer(), Some(old_pub));
+    assert!(b.r.status(s(20.0)).paired);
+}
+
+#[test]
+fn c9_message_3_must_be_exactly_the_confirm_byte() {
+    for payload in [&[0x04u8][..], &[0x03, 0x00][..], &[][..]] {
+        let mut b = Bench::window();
+        let label = b.label.clone();
+        let (p, m2) = b.reach_msg2(3.0, Transport::Usb, 1, PairWith::Label(&label), "o");
+        let bad = p.finish_with_payload(&m2, payload).unwrap();
+        let v = b.msg(3.5, 1, &bad.msg3);
+        assert_eq!(close_of(&v, 1), Some(CloseReason::BadMsg3), "{payload:?}");
+        assert!(paired_in(&v).is_none());
+        assert!(b.trust_phone().is_none());
+    }
+}
+
+#[test]
+fn c9_the_phone_requires_the_link_key_tag() {
+    let radio = Identity::generate().unwrap();
+    let label = LabelCode::new(*radio.public_key()).unwrap();
+    let link = *Identity::generate().unwrap().public_key();
+    for tag in [0x05u8, 0x07, 0x00] {
+        let (p, m1) = phone(PairWith::Label(&label), "phone");
+        let mut o = radio_open_msg1(&radio, label.secret(), &m1).unwrap();
+        let mut payload = vec![0x01, 2, b'r', b'1', tag];
+        payload.extend_from_slice(&link);
+        let mut buf = [0u8; 200];
+        let n = o.hs.write_message(&payload, &mut buf).unwrap();
+        assert!(p.finish(&buf[..n]).is_err(), "tag {tag:#x}");
+    }
+}
+
+/// A message 1 from a real initiator with any hello payload.
+fn msg1_with_payload(label: &LabelCode, payload: &[u8]) -> Vec<u8> {
+    let me = Identity::generate().unwrap();
+    let mut hs = snow::Builder::new(crate::PAIRING_NOISE.parse().unwrap())
+        .local_private_key(me.private_key())
+        .unwrap()
+        .remote_public_key(label.pairing_public())
+        .unwrap()
+        .psk(1, label.secret())
+        .unwrap()
+        .prologue(crate::PHONE_PAIRING_PROLOGUE)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let mut out = vec![0u8; 400];
+    let n = hs.write_message(payload, &mut out).unwrap();
+    out.truncate(n);
+    out
+}
+
+#[test]
+fn c9_message_1_size_limits_are_checked_before_decrypting() {
+    let mut b = Bench::window();
+    let label = b.label.clone();
+    // Too long (a 40-byte hello) and too short (no hello): each would
+    // decrypt, so only the size check gives Msg1Failed.
+    let mut long = vec![0x01, 40];
+    long.extend_from_slice(&[b'a'; 40]);
+    let too_long = msg1_with_payload(&label, &long);
+    assert!(too_long.len() > MAX_MSG1);
+    let too_short = msg1_with_payload(&label, &[]);
+    assert!(too_short.len() < MIN_MSG1);
+    for (c, m) in [(1, too_long), (2, too_short)] {
+        b.open(3.0, Transport::Usb, c);
+        let v = b.msg(3.0, c, &m);
+        assert_eq!(close_of(&v, c), Some(CloseReason::Msg1Failed));
+        assert!(msg2_for(&v, c).is_none());
+    }
+}
+
+#[test]
+fn c9_a_reset_on_battery_opens_no_window_of_its_own() {
+    // Plugged in 1 s after a reset on battery: the window comes from the
+    // debounce (2 s after the plug), not from the reset (2 s after it).
+    let (mut b, _) = Bench::paired();
+    b.usb(5.0, false);
+    b.reset(20.0);
+    b.usb(21.0, true);
+    assert!(b.poll(22.5).is_empty());
+    assert!(opened(&b.poll(23.0), WindowKind::Usb));
+}
+
+#[test]
+fn c11_time_going_backwards_or_near_the_end_never_panics() {
+    let mut b = Bench::window(); // opened at 2 s
+    let label = b.label.clone();
+    // An earlier time is no progress: nothing re-opens, nothing expires.
+    assert!(b.poll(1.0).is_empty());
+    assert!(b.usb(0.5, false).is_empty());
+    assert!(b.r.status(s(0.0)).window.is_some());
+    b.open(1.0, Transport::Usb, 1);
+    let (_, m1) = phone(PairWith::Label(&label), "o");
+    assert!(msg2_for(&b.msg(0.0, 1, &m1), 1).is_some());
+    // Message 3's 6 s run from the latest time seen (2 s), not from 0.
+    assert!(close_of(&b.poll(7.9), 1).is_none());
+    assert_eq!(close_of(&b.poll(8.0), 1), Some(CloseReason::Msg3Timeout));
+    // Times at the end of the range saturate.
+    let mut v = vec![];
+    b.r.poll(Duration::MAX, &mut |a| v.push(a));
+    assert!(expired(&v));
+    b.r.usb_power(Duration::MAX, true, &mut |_| {});
+    b.r.pinhole_reset(Duration::MAX, &mut |_| {});
+    b.r.poll(Duration::MAX, &mut |_| {});
+    let _ = b.r.next_wakeup();
+    let _ = b.r.status(Duration::MAX);
+}
+
+#[test]
+fn c13_waking_from_storage_by_usb_counts_as_absent_long_enough() {
+    let mut b = Bench::boot(true);
+    assert!(opened(&b.poll(2.0), WindowKind::Usb));
+    assert!(expired(&b.poll(122.0)));
+    // In storage mode a short unplug and plug opens a window.
+    b.r.enter_storage(s(130.0), &mut |_| {});
+    b.usb(130.0, false);
+    b.usb(131.0, true);
+    assert!(opened(&b.poll(133.0), WindowKind::Usb));
+    // Without storage mode the same short gap opens nothing.
+    assert!(expired(&b.poll(253.0)));
+    b.usb(260.0, false);
+    b.usb(261.0, true);
+    assert!(b.poll(270.0).is_empty());
+}
+
+#[test]
+fn c13_a_battery_boot_counts_usb_absence_from_the_boot() {
+    let mut b = Bench::boot(false);
+    b.usb(5.0, true); // 5 s after the boot: not an edge
+    assert!(b.poll(20.0).is_empty());
+    b.usb(20.0, false);
+    b.usb(30.0, true); // 10 s absent
+    assert!(b.poll(31.9).is_empty());
+    assert!(opened(&b.poll(32.0), WindowKind::Usb));
+}
+
+#[test]
+fn a_failed_random_source_pairs_nobody() {
+    let mut b = Bench::window();
+    let label = b.label.clone();
+    b.entropy.0.set(true);
+    b.open(3.0, Transport::Usb, 1);
+    let (_, m1) = phone(PairWith::Label(&label), "o");
+    let v = b.msg(3.0, 1, &m1);
+    assert_eq!(close_of(&v, 1), Some(CloseReason::EntropyFailed));
+    assert!(msg2_for(&v, 1).is_none());
+    // The phone side refuses to start too.
+    let failed = TestEntropy::default();
+    failed.0.set(true);
+    assert!(PhonePairing::start(PairWith::Label(&label), "o", &mut failed.clone()).is_err());
+    // Once the source works again, pairing does.
+    b.entropy.0.set(false);
+    b.pair(4.0, Transport::Usb, 2, PairWith::Label(&label), "o");
+}
+
+#[test]
+fn c12_the_pair_open_body_from_a_replace_code_opens_its_window() {
+    let (mut b, old) = Bench::paired();
+    let rc = ReplaceCode::new(*b.label.pairing_public()).unwrap();
+    let body = rc.pair_open_body();
+    b.pair_open(10.0, old.radio_link_key.public_key(), body.secret())
+        .0
+        .unwrap();
+    let new = b.pair(11.0, Transport::Ble, 1, PairWith::Replace(&rc), "new");
+    assert_eq!(b.link_peer(), Some(*new.radio_link_key.public_key()));
 }

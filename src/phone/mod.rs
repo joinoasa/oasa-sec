@@ -42,12 +42,12 @@ use std::fmt;
 use crate::pairing::{MAX_NAME, check_name};
 use crate::{Error, Result};
 
-pub use code::{LabelCode, ReplaceCode};
+pub use code::{LabelCode, PairOpenBody, ReplaceCode};
 pub use handshake::{
     MAX_MSG1, MAX_MSG2, MIN_MSG1, MIN_MSG2, MSG3_LEN, PairWith, PhonePaired, PhonePairing,
 };
 pub use radio::{
-    Action, CloseReason, ConnId, Marker, Msg2, NoReplyReason, PairOpenRefused, Radio, RadioKeys,
+    Action, ChannelId, CloseReason, Marker, Msg2, NoReplyReason, PairOpenRefused, Radio, RadioKeys,
     RadioStore, SavedPhone, Status, StoreFailed, Transport, WindowKind,
 };
 
@@ -79,6 +79,9 @@ pub const RESET_WINDOW_DELAY: Duration = Duration::from_secs(2);
 /// The radio remembers the ephemeral keys of this many proving message 1s
 /// per window.
 pub const SEEN_RECORD: usize = 16;
+
+/// Type byte of `PAIR_OPEN` inside the link session (spec section 4).
+pub const MSG_PAIR_OPEN: u8 = 0x0B;
 
 /// Payload tag of the radio's link public key in message 2. R-SEC1 uses
 /// `0x01` to `0x05`; `0x06` does not collide.
@@ -129,7 +132,17 @@ impl fmt::Display for Name {
 /// True if all 32 bytes are zero, looking at every byte whatever their
 /// values (no early exit on the first non-zero byte).
 pub(crate) fn all_zero(secret: &[u8; 32]) -> bool {
-    secret.iter().fold(0u8, |acc, b| acc | b) == 0
+    std::hint::black_box(secret.iter().fold(0u8, |acc, b| acc | b)) == 0
+}
+
+/// True if `a` and `b` are equal, looking at every byte whatever their
+/// values: the time taken does not depend on where they differ. (Written as
+/// the repo's `all_zero` is, with no new dependency; a compiler may still
+/// change the code it makes, which only a check of the firmware's own
+/// machine code can rule out.)
+pub(crate) fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 /// Parse a hello `[0x01, len, name]` into a [`Name`].

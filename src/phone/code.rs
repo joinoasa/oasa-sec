@@ -24,24 +24,22 @@ struct Kind {
     /// The full prefix, e.g. `OASAR1-`. Its digit is [`VERSION`].
     prefix: &'static str,
     checksum_label: &'static [u8],
-    /// Refuse an all-zero secret when reading.
-    refuse_zero_secret: bool,
+    /// The refusal for a wrong prefix.
+    wrong_prefix: &'static str,
 }
 
 const LABEL: Kind = Kind {
     stem: "OASAR",
     prefix: "OASAR1-",
     checksum_label: b"OASA-SEC v0 label checksum",
-    refuse_zero_secret: false,
+    wrong_prefix: "must start with OASAR1-",
 };
 
 const REPLACE: Kind = Kind {
     stem: "OASAT",
     prefix: "OASAT1-",
     checksum_label: b"OASA-SEC v0 replace checksum",
-    // The radio refuses an all-zero `PAIR_OPEN` secret (spec section 2.7),
-    // so a replace code holding one can never pair: refuse it on reading.
-    refuse_zero_secret: true,
+    wrong_prefix: "must start with OASAT1-",
 };
 
 /// The fields both kinds share. The secret is wiped when dropped.
@@ -53,19 +51,19 @@ struct Fields {
 }
 
 impl Fields {
-    fn random(pairing_public: [u8; 32], kind: &Kind) -> Result<Self> {
+    /// A random secret, made in place (no copy of it left elsewhere). An
+    /// all-zero secret is refused for every kind: the radio refuses a label
+    /// with one and a `PAIR_OPEN` with one, so it could never pair.
+    fn random(pairing_public: [u8; 32]) -> Result<Self> {
         crate::identity::check_peer_public(&pairing_public)?;
-        let mut secret = [0u8; 32];
-        loop {
-            getrandom::fill(&mut secret).map_err(|e| Error::Io(std::io::Error::other(e)))?;
-            if !(kind.refuse_zero_secret && super::all_zero(&secret)) {
-                break;
-            }
-        }
-        Ok(Self {
+        let mut f = Self {
             pairing_public,
-            secret,
-        })
+            secret: [0u8; 32],
+        };
+        while super::all_zero(&f.secret) {
+            getrandom::fill(&mut f.secret).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        }
+        Ok(f)
     }
 
     fn encode(&self, kind: &Kind) -> String {
@@ -75,11 +73,13 @@ impl Fields {
         body[33..65].copy_from_slice(&self.secret);
         let sum = checksum(kind, &body[..BODY_LEN]);
         body[BODY_LEN..].copy_from_slice(&sum);
-        format!(
-            "{}{}",
-            kind.prefix,
-            data_encoding::BASE32_NOPAD.encode(&body[..])
-        )
+        // Written straight into one buffer of the final size, so no
+        // temporary copy of the secret's text is left unwiped.
+        let enc = &data_encoding::BASE32_NOPAD;
+        let mut text = String::with_capacity(kind.prefix.len() + enc.encode_len(body.len()));
+        text.push_str(kind.prefix);
+        enc.encode_append(&body[..], &mut text);
+        text
     }
 
     fn decode(text: &str, kind: &Kind) -> Result<Self> {
@@ -118,7 +118,7 @@ impl Fields {
             secret: [0u8; 32],
         };
         f.secret.copy_from_slice(&body[33..65]);
-        if kind.refuse_zero_secret && super::all_zero(&f.secret) {
+        if super::all_zero(&f.secret) {
             return Err(Error::BadCode("the secret is all zero"));
         }
         Ok(f)
@@ -143,11 +143,7 @@ fn prefix_rest<'a>(text: &'a str, kind: &Kind) -> Result<&'a str> {
     if same_stem && digit_then_dash {
         return Err(Error::BadCode("unsupported version"));
     }
-    Err(Error::BadCode(if kind.refuse_zero_secret {
-        "must start with OASAT1-"
-    } else {
-        "must start with OASAR1-"
-    }))
+    Err(Error::BadCode(kind.wrong_prefix))
 }
 
 fn checksum(kind: &Kind, body: &[u8]) -> [u8; CHECKSUM_LEN] {
@@ -177,10 +173,10 @@ macro_rules! code_impl {
         impl $t {
             #[doc = concat!("A new ", $what, " for the radio with this pairing public key, with a fresh random secret from the operating system.")]
             pub fn new(pairing_public: [u8; 32]) -> Result<Self> {
-                Fields::random(pairing_public, &$kind).map(Self)
+                Fields::random(pairing_public).map(Self)
             }
 
-            #[doc = concat!("Read a ", $what, " from text. Lowercase, spaces and dashes after the prefix are accepted. Refused: a wrong prefix, an unknown version, the wrong length, invalid base32 (including non-zero padding bits in the last character), a bad checksum, or a small-order key.")]
+            #[doc = concat!("Read a ", $what, " from text. Lowercase, spaces and dashes after the prefix are accepted. Refused: a wrong prefix, an unknown version, the wrong length, invalid base32 (including non-zero padding bits in the last character), a bad checksum, or a small-order key or an all-zero secret.")]
             pub fn decode(text: &str) -> Result<Self> {
                 Fields::decode(text, &$kind).map(Self)
             }
@@ -228,16 +224,51 @@ code_impl!(ReplaceCode, REPLACE, "replace code");
 
 impl ReplaceCode {
     /// A replace code for this secret (the one the old phone sends in
-    /// `PAIR_OPEN`). An all-zero secret is refused.
+    /// `PAIR_OPEN`). An all-zero secret is refused. Prefer
+    /// [`ReplaceCode::new`] and [`ReplaceCode::pair_open_body`], which make
+    /// the secret here.
     pub fn from_secret(pairing_public: [u8; 32], secret: &[u8; 32]) -> Result<Self> {
         crate::identity::check_peer_public(&pairing_public)?;
         if super::all_zero(secret) {
             return Err(Error::BadCode("the secret is all zero"));
         }
-        Ok(Self(Fields {
+        let mut f = Fields {
             pairing_public,
-            secret: *secret,
-        }))
+            secret: [0u8; 32],
+        };
+        f.secret.copy_from_slice(secret);
+        Ok(Self(f))
+    }
+
+    /// The `PAIR_OPEN` body the old phone sends for this code:
+    /// `[0x0B][secret: 32]` (spec sections 4 and 10).
+    pub fn pair_open_body(&self) -> PairOpenBody {
+        let mut b = Zeroizing::new([0u8; 33]);
+        b[0] = super::MSG_PAIR_OPEN;
+        b[1..].copy_from_slice(&self.0.secret);
+        PairOpenBody(b)
+    }
+}
+
+/// A `PAIR_OPEN` body, `[0x0B][secret: 32]`. It holds the replace secret:
+/// wiped when dropped and never shown by `Debug`.
+pub struct PairOpenBody(Zeroizing<[u8; 33]>);
+
+impl PairOpenBody {
+    /// The bytes to seal into the link session.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0[..]
+    }
+
+    /// The secret, as the radio's [`super::Radio::pair_open`] takes it.
+    pub fn secret(&self) -> &[u8; 32] {
+        self.0[1..].try_into().expect("32 bytes")
+    }
+}
+
+impl std::fmt::Debug for PairOpenBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PairOpenBody(..)")
     }
 }
 
@@ -537,14 +568,27 @@ mod tests {
     }
 
     #[test]
-    fn replace_code_with_an_all_zero_secret_is_refused() {
+    fn a_code_with_an_all_zero_secret_is_refused() {
         let k = key();
         assert!(ReplaceCode::from_secret(k, &[0u8; 32]).is_err());
         let r = ReplaceCode::with_secret(k, [0u8; 32]).encode();
         refused(ReplaceCode::decode(&r), "all zero");
-        // A label is not refused for it (the spec lists no such refusal).
+        // Nor a label (review C-6).
         let l = LabelCode::with_secret(k, [0u8; 32]).encode();
-        assert!(LabelCode::decode(&l).is_ok());
+        refused(LabelCode::decode(&l), "all zero");
+    }
+
+    #[test]
+    fn the_pair_open_body_carries_the_codes_secret_and_hides_it() {
+        let r = ReplaceCode::new(key()).unwrap();
+        let b = r.pair_open_body();
+        assert_eq!(b.as_bytes().len(), 33);
+        assert_eq!(b.as_bytes()[0], 0x0B);
+        assert_eq!(b.secret(), r.secret());
+        let back = ReplaceCode::from_secret(*r.pairing_public(), b.secret()).unwrap();
+        assert_eq!(back.encode(), r.encode());
+        let shown = format!("{b:?}");
+        assert_eq!(shown, "PairOpenBody(..)");
     }
 
     #[test]

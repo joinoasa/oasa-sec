@@ -151,7 +151,17 @@ impl PhonePairing {
     /// Read message 2 and make message 3. Refuses a message of the wrong
     /// size, one that fails to decrypt, a bad hello, a missing or extra link
     /// key field, and a small-order link key.
-    pub fn finish(mut self, msg2: &[u8]) -> Result<PhonePaired> {
+    pub fn finish(self, msg2: &[u8]) -> Result<PhonePaired> {
+        self.finish_with(msg2, &[MSG_CONFIRM])
+    }
+
+    /// Tests only: message 3 with another payload than the confirm byte.
+    #[cfg(test)]
+    pub(crate) fn finish_with_payload(self, msg2: &[u8], payload: &[u8]) -> Result<PhonePaired> {
+        self.finish_with(msg2, payload)
+    }
+
+    fn finish_with(mut self, msg2: &[u8], confirm: &[u8]) -> Result<PhonePaired> {
         if !(MIN_MSG2..=MAX_MSG2).contains(&msg2.len()) {
             return Err(Error::Protocol("message 2 has the wrong size"));
         }
@@ -169,8 +179,8 @@ impl PhonePairing {
         let radio_link_public: [u8; 32] = link[1..].try_into().expect("32 bytes");
         check_peer_public(&radio_link_public)?;
         let mut t: TransportState = self.hs.into_transport_mode()?;
-        let mut msg3 = vec![0u8; MSG3_LEN];
-        let len = t.write_message(&[MSG_CONFIRM], &mut msg3)?;
+        let mut msg3 = vec![0u8; confirm.len() + TAG];
+        let len = t.write_message(confirm, &mut msg3)?;
         msg3.truncate(len);
         Ok(PhonePaired {
             radio_pairing_public: self.radio_pairing_public,
@@ -184,9 +194,12 @@ impl PhonePairing {
 
 /// A new X25519 key pair from `entropy`, the same clamped X25519 as
 /// [`Identity::generate`] (any 32 bytes are a valid private key).
+/// A failed random source makes nothing.
 pub(crate) fn new_key(entropy: &mut dyn Entropy) -> Result<Identity> {
     let mut private = Zeroizing::new([0u8; 32]);
-    entropy.fill(&mut private[..]);
+    entropy
+        .try_fill(&mut private[..])
+        .map_err(|_| Error::Io(std::io::Error::other("random source failed")))?;
     Identity::from_private_bytes(&private[..])
 }
 

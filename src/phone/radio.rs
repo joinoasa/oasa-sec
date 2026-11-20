@@ -2,10 +2,22 @@
 //! (spec sections 2.3 to 2.8).
 //!
 //! Every input carries the time `now`, a monotonic [`Duration`] since any
-//! fixed start that never goes backwards. The machine reads no clock, opens
-//! no socket, starts no thread and prints nothing. What it does goes out
+//! fixed start of this boot. The machine reads no clock, opens no socket,
+//! starts no thread and prints nothing. A `now` earlier than one already
+//! seen is taken as no progress (the last time seen is used); arithmetic on
+//! times saturates, so no input can make it panic. What it does goes out
 //! through a sink (`FnMut(Action)`), and what it keeps goes into a
 //! [`RadioStore`] the firmware implements.
+//!
+//! **The link layer takes its peer only from [`Radio::link_peer`]**, which
+//! reads the store's trust state and gives nothing while the store is
+//! faulted. When it gives nothing, every link session must end and none may
+//! start.
+//!
+//! **Pairing channels, not connections.** A pairing attempt starts only when
+//! a *pairing channel* opens: the pairing characteristic on BLE, a TCP
+//! connection to the pairing port on USB. A link connection is never an
+//! attempt and is never seen here.
 //!
 //! **Allocation.** The machine itself keeps fixed arrays: one per transport
 //! for attempts (`BLE` and `USB` slots, const parameters), 16 entries for the
@@ -15,10 +27,11 @@
 //! build would need `alloc` for `snow`, or a different Noise library, which
 //! is a crypto dependency change and needs owner approval (AGENTS.md).
 //!
-//! **Randomness.** Link keys come from the [`Entropy`] passed in. `snow`
-//! draws each Noise ephemeral key from its own resolver (the operating
-//! system), exactly as the link does; so the machine is deterministic in
-//! everything but those ephemeral keys.
+//! **Randomness.** Link keys come from the [`Entropy`] passed in, through
+//! [`Entropy::try_fill`]; if it fails, the attempt ends with no reply and
+//! nothing is made. `snow` draws each Noise ephemeral key from its own
+//! resolver (the operating system), exactly as the link does; so the machine
+//! is deterministic in everything but those ephemeral keys.
 
 use std::time::Duration;
 
@@ -31,14 +44,16 @@ use super::handshake::{
 use super::{
     BLE_AFTER_HOST, BLE_AFTER_NO_HOST, LabelCode, MSG1_WITHIN, MSG3_WITHIN, Name, RATE_LIMIT_WAIT,
     RATE_LIMIT_WINDOWS, RESET_WINDOW_DELAY, SEEN_RECORD, USB_ABSENT, USB_PRESENT, WINDOW, all_zero,
+    ct_eq,
 };
 use crate::identity::Identity;
 use crate::link::Entropy;
 use crate::{Error, Result};
 
-/// A transport connection, named by the transport layer. It must be unique
-/// among open connections.
-pub type ConnId = u32;
+/// A pairing channel, named by the transport layer: the pairing
+/// characteristic of one BLE connection, or one TCP connection to the
+/// pairing port on USB. It must be unique among open pairing channels.
+pub type ChannelId = u32;
 
 /// The two transports (spec section 2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,13 +77,13 @@ pub enum WindowKind {
 /// reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
-    /// A new connection needed the slot and this attempt had not proved the
-    /// secret.
+    /// A new pairing channel needed the slot and this attempt had not
+    /// proved the secret.
     Displaced,
-    /// Every slot on the transport holds a proved attempt: the new
-    /// connection is refused.
+    /// Every slot on the transport holds a proved attempt: the new pairing
+    /// channel is refused.
     SlotsFull,
-    /// No message 1 within 3 s of connecting.
+    /// No message 1 within 3 s of the pairing channel opening.
     Msg1Timeout,
     /// No message 3 within 6 s of message 2.
     Msg3Timeout,
@@ -80,6 +95,8 @@ pub enum CloseReason {
     /// Message 1 proved the secret, but its hello or the phone's key is bad
     /// (for example a small-order key).
     Msg1Refused,
+    /// The random source failed: no link key can be made, so no message 2.
+    EntropyFailed,
     /// A message after message 2 that is not a valid message 3 (including a
     /// second message 1).
     BadMsg3,
@@ -91,17 +108,18 @@ pub enum CloseReason {
     WindowClosed,
     /// Pinhole reset.
     Reset,
-    /// The store failed; the radio stops until it boots again.
+    /// The store failed.
     StoreFailed,
 }
 
 /// Why a pairing message got no reply and made no attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoReplyReason {
-    /// The connection is not a pairing attempt: no window was open when it
-    /// connected, BLE was not open yet, or its attempt already ended.
+    /// The pairing channel is not an attempt: no window was open when it
+    /// opened, BLE was not open yet, or its attempt already ended.
     NotAnAttempt,
-    /// The radio's store failed; it ignores everything until it boots.
+    /// The radio's store failed; it pairs with nobody until a pinhole reset
+    /// succeeds or it boots cleanly.
     Faulted,
 }
 
@@ -127,27 +145,31 @@ impl std::fmt::Debug for Msg2 {
 /// What the radio does, handed to the sink in order.
 #[derive(Debug, Clone)]
 pub enum Action {
-    /// Send message 2 on this connection.
-    Send { conn: ConnId, msg2: Msg2 },
-    /// End the pairing attempt on this connection, with no reply. On USB
-    /// that is closing the TCP connection to the pairing port. On BLE the
-    /// firmware ends the attempt, and closes the connection unless it has
-    /// completed a link handshake (that is the link layer's, spec section 3).
-    Close { conn: ConnId, why: CloseReason },
+    /// Send message 2 on this pairing channel.
+    Send { channel: ChannelId, msg2: Msg2 },
+    /// End the pairing attempt on this pairing channel, with no reply (on
+    /// USB, close the TCP connection to the pairing port; on BLE, stop
+    /// answering on the pairing characteristic).
+    Close {
+        channel: ChannelId,
+        why: CloseReason,
+    },
     /// A pairing message got no reply and was counted as a drop.
-    NoReply { conn: ConnId, why: NoReplyReason },
+    NoReply {
+        channel: ChannelId,
+        why: NoReplyReason,
+    },
     /// A window opened.
     WindowOpened { kind: WindowKind },
     /// A window closed with no pairing (2 minutes passed).
     WindowExpired { kind: WindowKind },
-    /// A phone completed and is saved as the radio's one peer. Its link
-    /// session may start on `conn`.
+    /// A phone completed and is saved as the radio's one peer.
     Paired {
-        conn: ConnId,
+        channel: ChannelId,
         phone_public: [u8; 32],
         replaced: bool,
     },
-    /// End every link session at once (reset, replace).
+    /// End every link session at once (reset, replace, a store fault).
     EndAllSessions,
     /// Wipe every held packet in memory (reset, replace).
     WipeHeldPackets,
@@ -155,8 +177,10 @@ pub enum Action {
     NewBluetoothAddress,
     /// The pinhole reset is done (in memory and in the store).
     ResetDone,
-    /// A store write failed. The radio has stopped: it ignores every input
-    /// until it boots again, and the boot finishes the work (section 2.8).
+    /// A store read or write failed. The radio fails closed: no link
+    /// session ([`Radio::link_peer`] gives nothing), no pairing, no window,
+    /// until a pinhole reset succeeds (it can be retried) or a boot reads
+    /// the store cleanly.
     StoreFailed,
 }
 
@@ -185,22 +209,25 @@ impl std::fmt::Debug for SavedPhone {
     }
 }
 
-/// A store operation failed (for example the power went).
+/// A store operation failed (a write error, or the power went).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreFailed;
 
 /// The radio's flash, as the pairing logic sees it. The firmware implements
-/// it; tests implement it with one that can lose power at any step.
+/// it; tests implement it with one that can fail or lose power at any step.
 ///
 /// Requirements on an implementation (spec section 2.8):
 ///
 /// - [`write_trust`](Self::write_trust) is **one atomic change**: after a
-///   power loss the store holds either the old trust state or the new one.
-/// - "Erase" means **gone from flash**: after [`erase_owner_state`]
-///   (Self::erase_owner_state) and `write_trust`, no readable copy of the
-///   erased items remains anywhere (page erase, or forced clean-up of a
-///   log-structured store), before the call returns.
+///   power loss or a write error the store holds either the old trust state
+///   or the new one, and [`trust`](Self::trust) reads that back.
+/// - "Erase" means **gone from flash**: after
+///   [`erase_owner_state`](Self::erase_owner_state) and `write_trust`, no
+///   readable copy of the erased items remains anywhere (page erase, or
+///   forced clean-up of a log-structured store), before the call returns.
 /// - The marker survives power loss once `set_marker` returns.
+/// - Every operation can be repeated: the reset sequence is retried as a
+///   whole after a failure.
 /// - The pairing key and the pairing secret are never touched by any of
 ///   these.
 pub trait RadioStore {
@@ -217,6 +244,12 @@ pub trait RadioStore {
     fn trust(&mut self) -> std::result::Result<Option<SavedPhone>, StoreFailed>;
     /// Replace the trust state in one atomic change; `None` erases it.
     fn write_trust(&mut self, t: Option<&SavedPhone>) -> std::result::Result<(), StoreFailed>;
+    /// USB windows in a row that closed with no pairing (the rate limit,
+    /// spec section 2.3); 0 if never written.
+    fn rate_count(&mut self) -> std::result::Result<u8, StoreFailed>;
+    /// Written only when a USB window closes with no pairing, and when the
+    /// count clears (a completed pairing or a reset) from a non-zero value.
+    fn write_rate_count(&mut self, n: u8) -> std::result::Result<(), StoreFailed>;
 }
 
 /// The radio's own keys: the pairing key and the label secret. Both are
@@ -229,14 +262,19 @@ pub struct RadioKeys {
 
 impl RadioKeys {
     /// The radio's pairing key and the label made for it. Refuses a label
-    /// for a different key.
+    /// for a different key, and a label whose secret is all zero.
     pub fn new(pairing: Identity, label: &LabelCode) -> Result<Self> {
         if label.pairing_public() != pairing.public_key() {
             return Err(Error::Protocol("the label was made for a different radio"));
         }
+        if all_zero(label.secret()) {
+            return Err(Error::BadCode("the secret is all zero"));
+        }
+        let mut label_secret = Zeroizing::new([0u8; 32]);
+        label_secret.copy_from_slice(label.secret());
         Ok(Self {
             pairing,
-            label_secret: Zeroizing::new(*label.secret()),
+            label_secret,
         })
     }
 
@@ -256,14 +294,16 @@ impl std::fmt::Debug for RadioKeys {
 /// What the radio shows (the light and `STATUS` are built from this).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Status {
+    /// A phone is paired and the store is sound.
     pub paired: bool,
     pub window: Option<WindowKind>,
-    /// In a window: whether a new BLE connection becomes a pairing attempt.
+    /// In a window: whether a new BLE pairing channel becomes an attempt.
     pub ble_open: bool,
     /// Unpaired, no window, and the next USB window needs 30 minutes and a
     /// new USB edge (or a reset).
     pub rate_limited: bool,
-    /// A store write failed and the radio waits for a boot.
+    /// A store read or write failed: the radio fails closed until a pinhole
+    /// reset succeeds or a boot reads the store cleanly.
     pub faulted: bool,
 }
 
@@ -276,9 +316,6 @@ struct Window {
     host_by_10s: bool,
     /// A proving message 1 arrived on USB: BLE is shut for the window.
     usb_proved: bool,
-    /// An attempt proved the secret and then ended by something other than
-    /// its own 6 s timeout: the window does not count toward the rate limit.
-    spared: bool,
 }
 
 impl Window {
@@ -288,8 +325,9 @@ impl Window {
             WindowKind::Replace => true,
             WindowKind::Usb => {
                 !self.usb_proved
-                    && (now >= self.opened + BLE_AFTER_HOST
-                        || (now >= self.opened + BLE_AFTER_NO_HOST && !self.host_by_10s))
+                    && (now >= self.opened.saturating_add(BLE_AFTER_HOST)
+                        || (now >= self.opened.saturating_add(BLE_AFTER_NO_HOST)
+                            && !self.host_by_10s))
             }
         }
     }
@@ -312,7 +350,7 @@ enum Stage {
 }
 
 struct Attempt {
-    conn: ConnId,
+    channel: ChannelId,
     opened: Duration,
     stage: Stage,
 }
@@ -323,7 +361,7 @@ impl Attempt {
     }
     fn due(&self) -> Duration {
         match &self.stage {
-            Stage::AwaitMsg1 => self.opened + MSG1_WITHIN,
+            Stage::AwaitMsg1 => self.opened.saturating_add(MSG1_WITHIN),
             Stage::AwaitMsg3 { due, .. } => *due,
         }
     }
@@ -361,10 +399,10 @@ impl Seen {
 /// USB power as the debounce sees it.
 struct Usb {
     present: bool,
-    /// When `present` last changed.
+    /// When `present` last changed (or the boot, the start of absence).
     since: Duration,
     /// The current presence followed an absence of at least 10 s (or a
-    /// start from no power, or storage mode) and has not fired yet.
+    /// start from no power on USB, or storage mode) and has not fired yet.
     armed: bool,
     /// The radio was put in storage mode: the next presence is armed.
     storage: bool,
@@ -373,8 +411,11 @@ struct Usb {
 }
 
 struct Rate {
-    /// USB windows in a row that closed with no pairing and counted.
+    /// USB windows in a row that closed with no pairing (kept in the store).
     failed: u8,
+    /// When the last of them closed, on this boot's clock. After a boot with
+    /// a count at the limit this is the boot time: never earlier than the
+    /// real close, so the wait is never shorter.
     last_close: Option<Duration>,
 }
 
@@ -385,7 +426,8 @@ pub struct Radio<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> 
     name: Name,
     store: S,
     entropy: E,
-    /// The paired phone's radio-link public key (the trust state's).
+    /// The paired phone's radio-link public key, as last read from or
+    /// written to the store. Meaningless while `faulted`.
     paired: Option<[u8; 32]>,
     usb: Usb,
     window: Option<Window>,
@@ -395,7 +437,10 @@ pub struct Radio<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> 
     rate: Rate,
     /// A reset on USB power opens a USB window at this time.
     reset_window_at: Option<Duration>,
+    /// A store operation failed: fail closed.
     faulted: bool,
+    /// The latest `now` seen; an earlier one is taken as this.
+    clock: Duration,
 }
 
 impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, BLE, USB> {
@@ -403,34 +448,33 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
     /// first finishes the erase it names (spec section 2.8): after a reset
     /// marker the radio is unpaired and empty; after a replace marker the
     /// owner state is erased and whatever peer the trust state holds stays.
-    /// `usb_present`: USB power at start (a start from no power counts as
-    /// USB having been absent).
+    /// The rate limit's count is read back from the store.
+    ///
+    /// `usb_present`: USB power at start. A start from no power on USB counts
+    /// as USB having been absent; a start on battery counts USB as absent
+    /// from `now`, so a plug-in follows the normal 10 s and 2 s rule.
+    ///
+    /// If the store fails here, the radio starts **faulted** (fail closed);
+    /// a pinhole reset retries.
     pub fn boot(
         keys: RadioKeys,
         name: Name,
-        mut store: S,
+        store: S,
         entropy: E,
         now: Duration,
         usb_present: bool,
-    ) -> std::result::Result<Self, StoreFailed> {
+        out: &mut impl FnMut(Action),
+    ) -> Self {
         assert!(
             BLE > 0 && USB > 0,
             "each transport needs at least one pairing slot"
         );
-        if let Some(m) = store.marker()? {
-            store.erase_owner_state()?;
-            if m == Marker::Reset {
-                store.write_trust(None)?;
-            }
-            store.clear_marker()?;
-        }
-        let paired = store.trust()?.map(|t| t.phone_public);
-        Ok(Self {
+        let mut r = Self {
             keys,
             name,
             store,
             entropy,
-            paired,
+            paired: None,
             usb: Usb {
                 present: usb_present,
                 since: now,
@@ -448,44 +492,81 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
             },
             reset_window_at: None,
             faulted: false,
-        })
+            clock: now,
+        };
+        let loaded = (|| {
+            if let Some(m) = r.store.marker()? {
+                r.store.erase_owner_state()?;
+                if m == Marker::Reset {
+                    r.store.write_trust(None)?;
+                }
+                r.store.clear_marker()?;
+            }
+            let paired = r.store.trust()?.map(|t| t.phone_public);
+            let failed = r.store.rate_count()?;
+            Ok::<_, StoreFailed>((paired, failed))
+        })();
+        match loaded {
+            Ok((paired, failed)) => {
+                r.paired = paired;
+                r.rate.failed = failed;
+                if failed >= RATE_LIMIT_WINDOWS {
+                    r.rate.last_close = Some(now);
+                }
+            }
+            Err(StoreFailed) => r.fault(out),
+        }
+        r
     }
 
-    /// The store, for tests and for the firmware's link layer to read the
-    /// trust state.
-    pub fn store(&self) -> &S {
-        &self.store
+    /// The only peer the link layer may use: the store's trust state (the
+    /// phone's radio-link public key and the radio's link key), read now.
+    /// `None` while unpaired **or while the store is faulted**; then every
+    /// link session must end and none may start. A failed read faults the
+    /// radio.
+    pub fn link_peer(&mut self, out: &mut impl FnMut(Action)) -> Option<SavedPhone> {
+        if self.faulted {
+            return None;
+        }
+        match self.store.trust() {
+            Ok(t) => t,
+            Err(StoreFailed) => {
+                self.fault(out);
+                None
+            }
+        }
     }
 
     pub fn status(&self, now: Duration) -> Status {
+        let now = now.max(self.clock);
         Status {
-            paired: self.paired.is_some(),
+            paired: !self.faulted && self.paired.is_some(),
             window: self.window.as_ref().map(|w| w.kind),
             ble_open: self.window.as_ref().is_some_and(|w| w.ble_open(now)),
-            rate_limited: self.paired.is_none()
+            rate_limited: !self.faulted
+                && self.paired.is_none()
                 && self.window.is_none()
                 && self.rate.failed >= RATE_LIMIT_WINDOWS,
             faulted: self.faulted,
         }
     }
 
-    /// The paired phone's radio-link public key, if any.
-    pub fn paired_phone(&self) -> Option<&[u8; 32]> {
-        self.paired.as_ref()
-    }
-
     /// When [`poll`](Self::poll) next has something to do, if ever.
     pub fn next_wakeup(&self) -> Option<Duration> {
+        if self.faulted {
+            return None;
+        }
         self.next_due().map(|(t, _)| t)
     }
 
     /// Run the timers due by `now`. Every other input does this first.
     pub fn poll(&mut self, now: Duration, out: &mut impl FnMut(Action)) {
+        let now = self.tick(now);
         if self.faulted {
             return;
         }
         while let Some((t, what)) = self.next_due() {
-            if t > now {
+            if t > now || self.faulted {
                 break;
             }
             match what {
@@ -516,14 +597,16 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         }
     }
 
-    /// USB power appeared (`true`) or went (`false`).
+    /// USB power appeared (`true`) or went (`false`). Tracked even while
+    /// faulted, so the debounce is right once the fault clears.
     pub fn usb_power(&mut self, now: Duration, present: bool, out: &mut impl FnMut(Action)) {
         self.poll(now, out);
-        if self.faulted || present == self.usb.present {
+        let now = self.clock;
+        if present == self.usb.present {
             return;
         }
         if present {
-            self.usb.armed = self.usb.storage || now >= self.usb.since + USB_ABSENT;
+            self.usb.armed = self.usb.storage || now >= self.usb.since.saturating_add(USB_ABSENT);
         } else {
             self.usb.armed = false;
             self.usb.enumerated = false;
@@ -535,7 +618,11 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
     }
 
     /// The radio is going into storage mode: the next USB power wakes it and
-    /// counts as appearing (spec section 2.3).
+    /// counts as appearing, with no 10 s absence (spec section 2.3).
+    ///
+    /// **Call this only on a local, physical action** (the firmware's own
+    /// low-battery shutdown, or a factory step), never on a message: anything
+    /// that can enter storage mode can open the next window with one plug.
     pub fn enter_storage(&mut self, now: Duration, out: &mut impl FnMut(Action)) {
         self.poll(now, out);
         self.usb.storage = true;
@@ -544,32 +631,34 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
     /// A USB host configured the radio (the USB "set configuration" step).
     pub fn usb_enumerated(&mut self, now: Duration, out: &mut impl FnMut(Action)) {
         self.poll(now, out);
-        if self.faulted || !self.usb.present {
+        let now = self.clock;
+        if !self.usb.present {
             return;
         }
         self.usb.enumerated = true;
         if let Some(w) = self.window.as_mut()
             && w.kind == WindowKind::Usb
-            && now <= w.opened + BLE_AFTER_NO_HOST
+            && now <= w.opened.saturating_add(BLE_AFTER_NO_HOST)
         {
             w.host_by_10s = true;
         }
     }
 
-    /// A connection was made: on BLE the connection itself, on USB the
-    /// radio accepting a TCP connection to its pairing port. In an open
-    /// window where the transport is open for pairing, it becomes an
+    /// A pairing channel opened: the pairing characteristic on BLE, or the
+    /// radio accepting a TCP connection to its pairing port on USB. In an
+    /// open window where the transport is open for pairing, it becomes an
     /// attempt (spec section 2.4); otherwise it is not one, and any pairing
-    /// message on it gets no reply.
-    pub fn connection_opened(
+    /// message on it gets no reply. Link connections are never passed here.
+    pub fn pairing_channel_opened(
         &mut self,
         now: Duration,
         transport: Transport,
-        conn: ConnId,
+        channel: ChannelId,
         out: &mut impl FnMut(Action),
     ) {
         self.poll(now, out);
-        if self.faulted || self.find(conn).is_some() {
+        let now = self.clock;
+        if self.faulted || self.find(channel).is_some() {
             return;
         }
         let Some(w) = self.window.as_ref() else {
@@ -579,7 +668,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
             return;
         }
         let new = Attempt {
-            conn,
+            channel,
             opened: now,
             stage: Stage::AwaitMsg1,
         };
@@ -603,40 +692,46 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
                 self.slots_mut(transport)[i] = Some(new);
             }
             None => out(Action::Close {
-                conn,
+                channel,
                 why: CloseReason::SlotsFull,
             }),
         }
     }
 
-    /// The transport lost or closed the connection.
-    pub fn connection_closed(&mut self, now: Duration, conn: ConnId, out: &mut impl FnMut(Action)) {
+    /// The transport lost or closed the pairing channel.
+    pub fn pairing_channel_closed(
+        &mut self,
+        now: Duration,
+        channel: ChannelId,
+        out: &mut impl FnMut(Action),
+    ) {
         self.poll(now, out);
-        if let Some((t, i)) = self.find(conn) {
-            let a = self.slots_mut(t)[i].take().expect("found");
-            self.spare_if_proved(&a);
+        if let Some((t, i)) = self.find(channel) {
+            // Dropping it wipes its link key.
+            self.slots_mut(t)[i] = None;
         }
     }
 
-    /// One pairing message arrived on a connection (already deframed).
+    /// One pairing message arrived on a pairing channel (already deframed).
     pub fn message(
         &mut self,
         now: Duration,
-        conn: ConnId,
+        channel: ChannelId,
         msg: &[u8],
         out: &mut impl FnMut(Action),
     ) {
         self.poll(now, out);
+        let now = self.clock;
         if self.faulted {
             out(Action::NoReply {
-                conn,
+                channel,
                 why: NoReplyReason::Faulted,
             });
             return;
         }
-        let Some((transport, i)) = self.find(conn) else {
+        let Some((transport, i)) = self.find(channel) else {
             out(Action::NoReply {
-                conn,
+                channel,
                 why: NoReplyReason::NotAnAttempt,
             });
             return;
@@ -660,6 +755,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         out: &mut impl FnMut(Action),
     ) -> std::result::Result<(), PairOpenRefused> {
         self.poll(now, out);
+        let now = self.clock;
         if self.faulted {
             return Err(PairOpenRefused::Faulted);
         }
@@ -672,42 +768,63 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         if all_zero(secret) {
             return Err(PairOpenRefused::ZeroSecret);
         }
+        // Replace windows never take the label secret (spec section 2.9).
+        if ct_eq(secret, &self.keys.label_secret) {
+            return Err(PairOpenRefused::LabelSecret);
+        }
         self.open_window(now, WindowKind::Replace, Some(secret), out);
         Ok(())
     }
 
-    /// The pinhole was held for 5 s (spec section 2.8).
+    /// The pinhole was held for 5 s (spec section 2.8). Works while
+    /// faulted: it retries the whole sequence, and on success the fault
+    /// clears and the radio is unpaired and empty.
     pub fn pinhole_reset(&mut self, now: Duration, out: &mut impl FnMut(Action)) {
         self.poll(now, out);
-        if self.faulted {
-            return;
-        }
+        let now = self.clock;
         // In memory first: no window, no attempt, no record, no limit.
         self.close_window(CloseReason::Reset, out);
-        self.rate = Rate {
-            failed: 0,
-            last_close: None,
-        };
         self.paired = None;
         out(Action::EndAllSessions);
         out(Action::WipeHeldPackets);
         out(Action::NewBluetoothAddress);
-        // Then flash, in the power-safe order.
+        // Then flash, in the power-safe order, and the cleared count.
         let r = (|| {
             self.store.set_marker(Marker::Reset)?;
             self.store.erase_owner_state()?;
             self.store.write_trust(None)?;
-            self.store.clear_marker()
+            self.store.clear_marker()?;
+            if self.rate.failed != 0 || self.faulted {
+                self.store.write_rate_count(0)?;
+            }
+            Ok::<_, StoreFailed>(())
         })();
         if r.is_err() {
             self.fault(out);
             return;
         }
-        self.reset_window_at = self.usb.present.then_some(now + RESET_WINDOW_DELAY);
+        self.faulted = false;
+        self.rate = Rate {
+            failed: 0,
+            last_close: None,
+        };
+        // Any edge armed while faulted is spent; the reset's own rule
+        // decides the next window.
+        self.usb.armed = false;
+        self.reset_window_at = self
+            .usb
+            .present
+            .then_some(now.saturating_add(RESET_WINDOW_DELAY));
         out(Action::ResetDone);
     }
 
     // ---- inside ----
+
+    /// Take `now`, never earlier than the latest seen.
+    fn tick(&mut self, now: Duration) -> Duration {
+        self.clock = self.clock.max(now);
+        self.clock
+    }
 
     fn on_usb_edge(&mut self, t: Duration, out: &mut impl FnMut(Action)) {
         // An edge during a window changes nothing; a paired radio opens no
@@ -719,7 +836,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
             let waited = self
                 .rate
                 .last_close
-                .is_none_or(|c| t >= c + RATE_LIMIT_WAIT);
+                .is_none_or(|c| t >= c.saturating_add(RATE_LIMIT_WAIT));
             if !waited {
                 return; // this edge is spent; the next must come after the wait
             }
@@ -734,9 +851,10 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         secret: Option<&[u8; 32]>,
         out: &mut impl FnMut(Action),
     ) {
-        let psk = Zeroizing::new(match secret {
-            Some(s) => *s,
-            None => *self.keys.label_secret,
+        let mut psk = Zeroizing::new([0u8; 32]);
+        psk.copy_from_slice(match secret {
+            Some(s) => &s[..],
+            None => &self.keys.label_secret[..],
         });
         self.seen.clear();
         self.window = Some(Window {
@@ -745,7 +863,6 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
             psk,
             host_by_10s: kind == WindowKind::Usb && self.usb.enumerated,
             usb_proved: false,
-            spared: false,
         });
         out(Action::WindowOpened { kind });
     }
@@ -768,15 +885,17 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         let Some(w) = self.close_window(CloseReason::WindowClosed, out) else {
             return;
         };
+        out(Action::WindowExpired { kind: w.kind });
+        // Every USB window that closes with no completed pairing counts.
         if w.kind == WindowKind::Usb {
-            if !w.spared {
-                self.rate.failed = self.rate.failed.saturating_add(1);
+            let failed = self.rate.failed.saturating_add(1);
+            if self.store.write_rate_count(failed).is_err() {
+                self.fault(out);
+                return;
             }
-            // The wait runs from the last USB window that closed with no
-            // pairing, counted or not.
+            self.rate.failed = failed;
             self.rate.last_close = Some(t);
         }
-        out(Action::WindowExpired { kind: w.kind });
     }
 
     fn on_msg1(
@@ -806,7 +925,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         let usb_window = w.kind == WindowKind::Usb;
         let link_key = match new_key(&mut self.entropy) {
             Ok(k) => k,
-            Err(_) => return self.end_attempt(transport, i, CloseReason::Msg1Refused, out),
+            Err(_) => return self.end_attempt(transport, i, CloseReason::EntropyFailed, out),
         };
         let mut msg2 = Msg2 {
             buf: [0u8; MAX_MSG2],
@@ -830,14 +949,14 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         }
         let a = self.slots_mut(transport)[i].as_mut().expect("found");
         a.stage = Stage::AwaitMsg3 {
-            due: now + MSG3_WITHIN,
+            due: now.saturating_add(MSG3_WITHIN),
             transport: t,
             link_key,
             phone_public,
             phone_name,
         };
-        let conn = a.conn;
-        out(Action::Send { conn, msg2 });
+        let channel = a.channel;
+        out(Action::Send { channel, msg2 });
     }
 
     fn on_msg3(
@@ -869,43 +988,52 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         let w = self
             .close_window(CloseReason::OtherCompleted, out)
             .expect("attempts exist only in a window");
-        self.rate = Rate {
-            failed: 0,
-            last_close: None,
-        };
+        let mut link_private = Zeroizing::new([0u8; 32]);
+        link_private.copy_from_slice(link_key.private_key());
+        drop(link_key);
         let saved = SavedPhone {
             phone_public,
             name: phone_name,
-            link_private: Zeroizing::new(*link_key.private_key()),
+            link_private,
         };
-        drop(link_key);
         let replaced = w.kind == WindowKind::Replace;
         // A USB window opens only while unpaired, so a peer exists here only
         // in a replace window. Should one ever exist otherwise, the same
         // power-safe order still runs, so no state of it reaches the new phone.
-        let r = if replaced || self.paired.is_some() {
+        let swap = replaced || self.paired.is_some();
+        if swap {
             // The old phone's sessions end now; nothing of its state may
             // reach the new phone.
             self.paired = None;
             out(Action::EndAllSessions);
             out(Action::WipeHeldPackets);
             out(Action::NewBluetoothAddress);
-            (|| {
+        }
+        let r = (|| {
+            if swap {
                 self.store.set_marker(Marker::Replace)?;
                 self.store.erase_owner_state()?;
                 self.store.write_trust(Some(&saved))?;
-                self.store.clear_marker()
-            })()
-        } else {
-            self.store.write_trust(Some(&saved))
-        };
+                self.store.clear_marker()?;
+            } else {
+                self.store.write_trust(Some(&saved))?;
+            }
+            if self.rate.failed != 0 {
+                self.store.write_rate_count(0)?;
+            }
+            Ok::<_, StoreFailed>(())
+        })();
         if r.is_err() {
             self.fault(out);
             return;
         }
+        self.rate = Rate {
+            failed: 0,
+            last_close: None,
+        };
         self.paired = Some(phone_public);
         out(Action::Paired {
-            conn: a.conn,
+            channel: a.channel,
             phone_public,
             replaced,
         });
@@ -922,34 +1050,29 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         let Some(a) = self.slots_mut(transport)[i].take() else {
             return;
         };
-        if why != CloseReason::Msg3Timeout {
-            self.spare_if_proved(&a);
-        }
-        out(Action::Close { conn: a.conn, why });
+        out(Action::Close {
+            channel: a.channel,
+            why,
+        });
         // Dropping `a` wipes its link key (`Identity` zeroizes on drop).
     }
 
-    fn spare_if_proved(&mut self, a: &Attempt) {
-        if a.proved()
-            && let Some(w) = self.window.as_mut()
-        {
-            w.spared = true;
-        }
-    }
-
+    /// Fail closed: no window, no attempt, no link session.
     fn fault(&mut self, out: &mut impl FnMut(Action)) {
         self.close_window(CloseReason::StoreFailed, out);
         self.reset_window_at = None;
+        self.paired = None;
         self.faulted = true;
+        out(Action::EndAllSessions);
         out(Action::StoreFailed);
     }
 
-    fn find(&self, conn: ConnId) -> Option<(Transport, usize)> {
+    fn find(&self, channel: ChannelId) -> Option<(Transport, usize)> {
         for t in [Transport::Ble, Transport::Usb] {
             if let Some(i) = self
                 .slots(t)
                 .iter()
-                .position(|a| a.as_ref().is_some_and(|a| a.conn == conn))
+                .position(|a| a.as_ref().is_some_and(|a| a.channel == channel))
             {
                 return Some((t, i));
             }
@@ -981,7 +1104,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
             }
         };
         if self.usb.present && self.usb.armed {
-            consider(self.usb.since + USB_PRESENT, Due::UsbEdge);
+            consider(self.usb.since.saturating_add(USB_PRESENT), Due::UsbEdge);
         }
         if let Some(t) = self.reset_window_at {
             consider(t, Due::ResetWindow);
@@ -994,7 +1117,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
             }
         }
         if let Some(w) = &self.window {
-            consider(w.opened + WINDOW, Due::WindowEnd);
+            consider(w.opened.saturating_add(WINDOW), Due::WindowEnd);
         }
         best
     }
@@ -1017,7 +1140,9 @@ pub enum PairOpenRefused {
     WindowOpen,
     /// The secret is all zero.
     ZeroSecret,
-    /// The radio's store failed; it waits for a boot.
+    /// The secret is the label secret: replace windows never take it.
+    LabelSecret,
+    /// The radio's store failed; it fails closed.
     Faulted,
 }
 

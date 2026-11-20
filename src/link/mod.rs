@@ -221,7 +221,19 @@ impl<F: FnMut() -> Duration> WallClock for F {
 /// affected by this. Tests pass a seeded generator here.
 pub trait Entropy {
     fn fill(&mut self, dst: &mut [u8]);
+
+    /// Like [`fill`](Self::fill), but reports a failed source instead of
+    /// panicking. Phone pairing uses this and refuses to pair when it fails.
+    /// The default calls `fill`, for sources that cannot fail.
+    fn try_fill(&mut self, dst: &mut [u8]) -> std::result::Result<(), EntropyFailed> {
+        self.fill(dst);
+        Ok(())
+    }
 }
+
+/// The random source failed: nothing random may be made from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntropyFailed;
 
 /// The operating system's random source. If it fails, this panics: carrying
 /// on with weak randomness would be worse.
@@ -231,6 +243,10 @@ pub struct OsEntropy;
 impl Entropy for OsEntropy {
     fn fill(&mut self, dst: &mut [u8]) {
         getrandom::fill(dst).expect("operating system random source failed");
+    }
+
+    fn try_fill(&mut self, dst: &mut [u8]) -> std::result::Result<(), EntropyFailed> {
+        getrandom::fill(dst).map_err(|_| EntropyFailed)
     }
 }
 
