@@ -175,6 +175,10 @@ pub enum Action {
     WipeHeldPackets,
     /// Pick a new Bluetooth address (reset, replace; spec section 7).
     NewBluetoothAddress,
+    /// The reset's marker is durable in flash: from here the reset will
+    /// finish, if need be at the next boot. The light shows "reset
+    /// accepted" only on this (spec section 2.6, 2.8).
+    ResetAccepted,
     /// The pinhole reset is done (in memory and in the store).
     ResetDone,
     /// A store read or write failed. The radio fails closed: no link
@@ -247,8 +251,10 @@ pub trait RadioStore {
     /// USB windows in a row that closed with no pairing (the rate limit,
     /// spec section 2.3); 0 if never written.
     fn rate_count(&mut self) -> std::result::Result<u8, StoreFailed>;
-    /// Written only when a USB window closes with no pairing, and when the
-    /// count clears (a completed pairing or a reset) from a non-zero value.
+    /// Written when a USB window closes with no pairing, when the count
+    /// clears (a completed pairing or a reset) from a non-zero value, and
+    /// once at each boot with the value just read (a check that writes work,
+    /// so a flash that fails every write starts faulted). The value is 0 to 2.
     fn write_rate_count(&mut self, n: u8) -> std::result::Result<(), StoreFailed>;
 }
 
@@ -454,8 +460,9 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
     /// as USB having been absent; a start on battery counts USB as absent
     /// from `now`, so a plug-in follows the normal 10 s and 2 s rule.
     ///
-    /// If the store fails here, the radio starts **faulted** (fail closed);
-    /// a pinhole reset retries.
+    /// The boot writes once (the rate count, unchanged) to check that writes
+    /// work. If the store fails here, the radio starts **faulted** (fail
+    /// closed); a pinhole reset retries.
     pub fn boot(
         keys: RadioKeys,
         name: Name,
@@ -503,7 +510,9 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
                 r.store.clear_marker()?;
             }
             let paired = r.store.trust()?.map(|t| t.phone_public);
-            let failed = r.store.rate_count()?;
+            let failed = r.store.rate_count()?.min(RATE_LIMIT_WINDOWS);
+            // A flash that cannot write must not come back trusted.
+            r.store.write_rate_count(failed)?;
             Ok::<_, StoreFailed>((paired, failed))
         })();
         match loaded {
@@ -791,6 +800,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         // Then flash, in the power-safe order, and the cleared count.
         let r = (|| {
             self.store.set_marker(Marker::Reset)?;
+            out(Action::ResetAccepted);
             self.store.erase_owner_state()?;
             self.store.write_trust(None)?;
             self.store.clear_marker()?;
@@ -888,7 +898,7 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         out(Action::WindowExpired { kind: w.kind });
         // Every USB window that closes with no completed pairing counts.
         if w.kind == WindowKind::Usb {
-            let failed = self.rate.failed.saturating_add(1);
+            let failed = self.rate.failed.saturating_add(1).min(RATE_LIMIT_WINDOWS);
             if self.store.write_rate_count(failed).is_err() {
                 self.fault(out);
                 return;

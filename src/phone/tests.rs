@@ -40,6 +40,8 @@ struct Flash {
     error_at: Option<usize>,
     /// Every read fails (a broken flash).
     reads_fail: bool,
+    /// Every write fails (a worn flash), until cleared.
+    writes_fail: bool,
 }
 
 #[derive(Clone)]
@@ -50,6 +52,9 @@ impl MemStore {
         let mut f = self.0.borrow_mut();
         if f.dead || f.crash_at == Some(f.ops) {
             f.dead = true;
+            return Err(StoreFailed);
+        }
+        if f.writes_fail {
             return Err(StoreFailed);
         }
         if f.error_at == Some(f.ops) {
@@ -1943,7 +1948,7 @@ fn assert_fails_closed(b: &mut Bench, t: f64) {
 }
 
 #[test]
-fn c1_a_write_error_at_each_step_of_a_reset_fails_closed_and_the_pin_retries() {
+fn case_30_c1_a_write_error_at_each_step_of_a_reset_fails_closed_and_the_pin_retries() {
     // Reset writes: marker, erase, trust (none), clear marker.
     for k in 0..4 {
         let (mut b, old) = Bench::paired();
@@ -1952,6 +1957,12 @@ fn c1_a_write_error_at_each_step_of_a_reset_fails_closed_and_the_pin_retries() {
         assert!(has(&v, |a| matches!(a, Action::StoreFailed)), "k={k}");
         assert!(has(&v, |a| matches!(a, Action::EndAllSessions)));
         assert!(!has(&v, |a| matches!(a, Action::ResetDone)));
+        // The light acknowledges only a durable marker.
+        assert_eq!(
+            has(&v, |a| matches!(a, Action::ResetAccepted)),
+            k > 0,
+            "k={k}"
+        );
         // The flash may still hold the old phone (k < 3); the link gets
         // nothing either way.
         assert_fails_closed(&mut b, 11.0);
@@ -1973,7 +1984,7 @@ fn c1_a_write_error_at_each_step_of_a_reset_fails_closed_and_the_pin_retries() {
 }
 
 #[test]
-fn c1_a_write_error_during_a_reset_then_a_boot_without_the_pin() {
+fn case_30_c1_a_write_error_during_a_reset_then_a_boot_without_the_pin() {
     // If the owner does not retry, the boot follows the flash: before the
     // marker landed nothing began (the old phone stays, spec question 2);
     // after it, the boot finishes the reset.
@@ -1993,7 +2004,7 @@ fn c1_a_write_error_during_a_reset_then_a_boot_without_the_pin() {
 }
 
 #[test]
-fn c1_a_write_error_at_each_step_of_a_replace_fails_closed() {
+fn case_30_c1_a_write_error_at_each_step_of_a_replace_fails_closed() {
     // Replace writes: marker, erase, trust, clear marker.
     for k in 0..4 {
         let (mut b, old) = Bench::paired();
@@ -2023,7 +2034,7 @@ fn c1_a_write_error_at_each_step_of_a_replace_fails_closed() {
 }
 
 #[test]
-fn c1_a_write_error_in_a_first_pairing_fails_closed() {
+fn case_30_c1_a_write_error_in_a_first_pairing_fails_closed() {
     // A first pairing writes the trust state, then clears a non-zero count.
     for k in 0..2 {
         let mut b = Bench::boot(false);
@@ -2050,7 +2061,7 @@ fn c1_a_write_error_in_a_first_pairing_fails_closed() {
 }
 
 #[test]
-fn c1_a_failed_reset_retry_stays_faulted_and_a_read_error_faults_too() {
+fn case_30_c1_a_failed_reset_retry_stays_faulted_and_a_read_error_faults_too() {
     let (mut b, _) = Bench::paired();
     with_write_error(&mut b, 0, |b| b.reset(10.0));
     let v = with_write_error(&mut b, 1, |b| b.reset(11.0));
@@ -2075,7 +2086,7 @@ fn c1_a_failed_reset_retry_stays_faulted_and_a_read_error_faults_too() {
 }
 
 #[test]
-fn c4_a_usb_host_replaying_a_recorded_message_1_shuts_ble_for_that_window_only() {
+fn case_12_c4_a_usb_host_replaying_a_recorded_message_1_shuts_ble_for_that_window_only() {
     let mut b = Bench::window();
     let label = b.label.clone();
     // Recorded over BLE in the first window.
@@ -2102,7 +2113,7 @@ fn c4_a_usb_host_replaying_a_recorded_message_1_shuts_ble_for_that_window_only()
 }
 
 #[test]
-fn c5_a_flood_between_connect_and_message_1_is_bounded_and_the_owner_retries() {
+fn case_29_c5_a_flood_between_connect_and_message_1_is_bounded_and_the_owner_retries() {
     let mut b = Bench::window();
     let label = b.label.clone();
     // The owner opens a USB pairing channel; a flood follows before its
@@ -2147,14 +2158,14 @@ fn c5_a_flood_between_connect_and_message_1_is_bounded_and_the_owner_retries() {
 }
 
 #[test]
-fn c6_radio_keys_refuse_an_all_zero_label_secret() {
+fn case_30_c6_radio_keys_refuse_an_all_zero_label_secret() {
     let id = Identity::generate().unwrap();
     let zero = LabelCode::with_secret(*id.public_key(), [0u8; 32]);
     assert!(RadioKeys::new(id, &zero).is_err());
 }
 
 #[test]
-fn c7_pair_open_with_the_label_secret_is_refused() {
+fn case_30_c7_pair_open_with_the_label_secret_is_refused() {
     let (mut b, old) = Bench::paired();
     let label_secret = *b.label.secret();
     let (r, v) = b.pair_open(10.0, old.radio_link_key.public_key(), &label_secret);
@@ -2170,7 +2181,7 @@ fn c7_pair_open_with_the_label_secret_is_refused() {
 }
 
 #[test]
-fn c8_pairing_channels_in_a_replace_window_never_touch_the_old_phones_link() {
+fn case_08_c8_pairing_channels_in_a_replace_window_never_touch_the_old_phones_link() {
     let (mut b, old) = Bench::paired();
     let old_pub = *old.radio_link_key.public_key();
     b.pair_open(10.0, &old_pub, &random_secret()).0.unwrap();
@@ -2256,7 +2267,7 @@ fn c9_message_1_size_limits_are_checked_before_decrypting() {
 }
 
 #[test]
-fn c9_a_reset_on_battery_opens_no_window_of_its_own() {
+fn case_14_c9_a_reset_on_battery_opens_no_window_of_its_own() {
     // Plugged in 1 s after a reset on battery: the window comes from the
     // debounce (2 s after the plug), not from the reset (2 s after it).
     let (mut b, _) = Bench::paired();
@@ -2293,7 +2304,7 @@ fn c11_time_going_backwards_or_near_the_end_never_panics() {
 }
 
 #[test]
-fn c13_waking_from_storage_by_usb_counts_as_absent_long_enough() {
+fn case_11_c13_waking_from_storage_by_usb_counts_as_absent_long_enough() {
     let mut b = Bench::boot(true);
     assert!(opened(&b.poll(2.0), WindowKind::Usb));
     assert!(expired(&b.poll(122.0)));
@@ -2310,7 +2321,7 @@ fn c13_waking_from_storage_by_usb_counts_as_absent_long_enough() {
 }
 
 #[test]
-fn c13_a_battery_boot_counts_usb_absence_from_the_boot() {
+fn case_11_c13_a_battery_boot_counts_usb_absence_from_the_boot() {
     let mut b = Bench::boot(false);
     b.usb(5.0, true); // 5 s after the boot: not an edge
     assert!(b.poll(20.0).is_empty());
@@ -2321,7 +2332,7 @@ fn c13_a_battery_boot_counts_usb_absence_from_the_boot() {
 }
 
 #[test]
-fn a_failed_random_source_pairs_nobody() {
+fn case_30_a_failed_random_source_pairs_nobody() {
     let mut b = Bench::window();
     let label = b.label.clone();
     b.entropy.0.set(true);
@@ -2349,4 +2360,66 @@ fn c12_the_pair_open_body_from_a_replace_code_opens_its_window() {
         .unwrap();
     let new = b.pair(11.0, Transport::Ble, 1, PairWith::Replace(&rc), "new");
     assert_eq!(b.link_peer(), Some(*new.radio_link_key.public_key()));
+}
+
+#[test]
+fn case_30_a_flash_that_fails_every_write_stays_faulted_across_a_boot() {
+    let (mut b, old) = Bench::paired();
+    let old_pub = *old.radio_link_key.public_key();
+    b.flash.borrow_mut().writes_fail = true;
+    let v = b.reset(10.0);
+    assert!(has(&v, |a| matches!(a, Action::StoreFailed)));
+    assert!(!has(&v, |a| matches!(a, Action::ResetAccepted)));
+    assert_fails_closed(&mut b, 11.0);
+    // The flash still holds the old phone, but a boot that cannot write
+    // starts faulted: the old phone gets nothing.
+    assert_eq!(b.trust_phone(), Some(old_pub));
+    let v = b.reboot(0.0, true);
+    assert!(has(&v, |a| matches!(a, Action::StoreFailed)));
+    assert_fails_closed(&mut b, 3.0);
+    // The pin is retried, and fails again while the flash is broken.
+    assert!(!has(&b.reset(4.0), |a| matches!(a, Action::ResetDone)));
+    assert_fails_closed(&mut b, 5.0);
+    // Once writes work, the pin finishes the reset.
+    b.flash.borrow_mut().writes_fail = false;
+    assert!(has(&b.reset(6.0), |a| matches!(a, Action::ResetDone)));
+    assert!(b.link_peer().is_none());
+    assert!(b.trust_phone().is_none());
+    assert!(opened(&b.poll(8.0), WindowKind::Usb));
+}
+
+#[test]
+fn case_11_the_stored_count_stops_at_two() {
+    let mut b = Bench::boot(false);
+    let mut t = 10.0;
+    for _ in 0..4 {
+        b.usb(t, true);
+        b.poll(t + 2.0);
+        b.poll(t + 122.0);
+        b.usb(t + 125.0, false);
+        t += 2000.0;
+    }
+    assert_eq!(b.flash.borrow().rate_count, 2);
+}
+
+#[test]
+fn case_12_a_small_order_or_bad_hello_message_1_on_usb_pre_empts_nothing() {
+    let mut b = Bench::window();
+    let label = b.label.clone();
+    let (p, m2) = b.reach_msg2(13.0, Transport::Ble, 1, PairWith::Label(&label), "ble");
+    // A small-order phone key, then a bad hello, each proving the secret.
+    let small = small_order_msg1(label.pairing_public(), label.secret(), [0u8; 32]);
+    b.open(14.0, Transport::Usb, 10);
+    let v = b.msg(14.0, 10, &small);
+    assert_eq!(close_of(&v, 10), Some(CloseReason::Msg1Refused));
+    assert!(close_of(&v, 1).is_none());
+    let bad_hello = msg1_with_payload(&label, &[0x01, 9, b'a', b'b', b'c']);
+    b.open(14.5, Transport::Usb, 11);
+    let v = b.msg(14.5, 11, &bad_hello);
+    assert_eq!(close_of(&v, 11), Some(CloseReason::Msg1Refused));
+    assert!(close_of(&v, 1).is_none());
+    // BLE is still open and the BLE phone completes.
+    assert!(b.r.status(s(15.0)).ble_open);
+    let done = p.finish(&m2).unwrap();
+    assert!(paired_in(&b.msg(15.0, 1, &done.msg3)).is_some());
 }
