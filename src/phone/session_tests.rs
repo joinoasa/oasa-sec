@@ -442,7 +442,7 @@ impl Phone {
 
 // ---- the bench ----
 
-const RADIO_NAME: &str = "keel-1";
+const RADIO_NAME: &str = "radio-1";
 
 struct Bench {
     n: N,
