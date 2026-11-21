@@ -231,6 +231,11 @@ impl BodyFormat for TestFormat {
         out.extend_from_slice(&h.0.to_be_bytes());
         out.extend_from_slice(&sig.0.to_be_bytes());
         out.extend_from_slice(p);
+        // A format that breaks its own declared overhead for one packet
+        // (fill byte 0xBB), so a RECEIVED fails to send: tests only.
+        if p.len() > 5 && p[5] == 0xBB {
+            out.extend(std::iter::repeat_n(0u8, MTU));
+        }
     }
 }
 
@@ -2199,4 +2204,51 @@ fn s4_a_random_source_that_fails_at_boot_means_nothing_is_held() {
     b.air(11.0, &data_pkt(7, 1, 60));
     assert_eq!(b.n.held(), 0, "held with hold numbers that may repeat");
     assert_eq!(b.n.stats().not_held, 1);
+}
+
+#[test]
+fn s2_a_packet_fetch_cannot_send_is_skipped_and_the_rest_still_go() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(
+        5.0,
+        &mut p,
+        &filters_msg(&[Filter::Index(7), Filter::Index(8)]),
+    );
+    b.close(6.0, 10);
+    b.air(7.0, &data_pkt(7, 0xBB, 60));
+    b.air(7.1, &data_pkt(8, 2, 60));
+    b.air(7.2, &data_pkt(8, 3, 60));
+    let mut p = p.reconnected(11);
+    b.connect(10.0, &mut p);
+    b.say(11.0, &mut p, &[MSG_FETCH]);
+    assert_eq!(
+        p.received().len(),
+        2,
+        "one unsendable packet stopped the FETCH"
+    );
+    assert_eq!(b.n.stats().fetch_skipped, 1);
+    assert_eq!(b.n.held(), 3, "a packet that was not handed over was lost");
+}
+
+#[test]
+fn fetch_hands_packets_over_oldest_first_even_after_a_slot_is_reused() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(5.0, &mut p, &filters_msg(&[Filter::Index(7)]));
+    b.close(5.5, 10);
+    for (k, tag) in [1u8, 2, 3].iter().enumerate() {
+        b.air(6.0 + k as f64, &data_pkt(7, *tag, 60));
+    }
+    let mut p = p.reconnected(11);
+    b.connect(10.0, &mut p);
+    b.say(11.0, &mut p, &[MSG_FETCH]);
+    let first = p.received()[0].0;
+    b.say(12.0, &mut p, &ack_msg(&[first]));
+    // The freed slot takes the newest packet.
+    b.air(13.0, &data_pkt(7, 4, 60));
+    b.close(14.0, 11);
+    let mut p = p.reconnected(12);
+    b.connect(15.0, &mut p);
+    b.say(16.0, &mut p, &[MSG_FETCH]);
+    let tags: Vec<u8> = p.received().iter().map(|r| r.1[5]).collect();
+    assert_eq!(tags, vec![2, 3, 4], "not oldest first");
 }
