@@ -546,6 +546,17 @@ impl<S: RadioStore, E: Entropy, const BLE: usize, const USB: usize> Radio<S, E, 
         }
     }
 
+    /// A write to the rest of the radio's flash state failed: the session's
+    /// handshake timestamps or the wake filters (`super::RadioNode`). The
+    /// radio fails closed exactly as for a failure of its own writes (spec
+    /// section 2.8); the pinhole reset still works.
+    pub fn store_failed(&mut self, now: Duration, out: &mut impl FnMut(Action)) {
+        self.poll(now, out);
+        if !self.faulted {
+            self.fault(out);
+        }
+    }
+
     pub fn status(&self, now: Duration) -> Status {
         let now = now.max(self.clock);
         Status {

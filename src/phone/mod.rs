@@ -1,5 +1,6 @@
-//! Phone pairing for a pocket radio (tech tree node T-MSG1), first part.
-//! Spec: `docs/oasa-sec-v0-phone-link.md` (v0.4 draft, sections 2 and 10).
+//! The phone link for a pocket radio (tech tree node T-MSG1): pairing, and
+//! the session after it.
+//! Spec: `docs/oasa-sec-v0-phone-link.md` (v0.5 draft, sections 2 to 5 and 10).
 //!
 //! A phone pairs with a radio that has no button and no screen. The radio
 //! carries a printed **label** ([`LabelCode`], `OASAR1-`): its pairing public
@@ -23,17 +24,29 @@
 //!   the rate limit, completion, replace, reset, and the power-safe order of
 //!   writes to its [`RadioStore`].
 //!
-//! Not here (later parts): the link session with the phone, the messages
-//! inside it, wake filters, the hold store, the BLE and USB transports and
-//! their framing, firmware and the app.
+//! - [`RadioNode`]: the radio's whole phone side. It wraps [`Radio`] and
+//!   adds the link session with the phone (the R-COM2 link, unchanged, with
+//!   the link key from pairing), its connections and framing ([`frame`]), the
+//!   messages inside it ([`msg`]), and the wake filters and hold store
+//!   ([`hold`]). [`phone_link`] is the phone's side of the session.
+//!
+//! Not here: firmware (transmit limits, settings, updates, relaying, the
+//! real BLE and USB stacks), the app, and the bodies of the messages, which
+//! the spec has not defined yet ([`msg::BodyFormat`]).
 //!
 //! **No new cryptography:** the same `snow` pattern and primitives as R-SEC1
 //! pairing, the same X25519 key generation, and `check_peer_public` on every
 //! peer key that enters.
 
 mod code;
+pub mod frame;
 mod handshake;
+pub mod hold;
+pub mod msg;
 mod radio;
+mod session;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests;
 
@@ -49,6 +62,11 @@ pub use handshake::{
 pub use radio::{
     Action, ChannelId, CloseReason, Marker, Msg2, NoReplyReason, PairOpenRefused, Radio, RadioKeys,
     RadioStore, SavedPhone, Status, StoreFailed, Transport, WindowKind,
+};
+pub use session::{
+    ConnId, LINK_CONNECT_WITHIN, LinkCloseReason, NodeAction, NodeStats, PhoneSendError,
+    PhoneStateStore, REJECT_AFTER, REKEY_AFTER, REKEY_AFTER_PACKETS, RadioNode, link_config,
+    phone_link,
 };
 
 use std::time::Duration;

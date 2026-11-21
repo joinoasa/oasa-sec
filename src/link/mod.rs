@@ -44,6 +44,7 @@ pub use packet::{
     CounterLen, HANDSHAKE1_LEN, HANDSHAKE2_LEN, Packet, TAG_LEN, VERSION, data_overhead,
     keepalive_len, parse,
 };
+pub(crate) use packet::{mac1_key, mac1_ok};
 pub use source::{SourceLimiter, looks_like_handshake1};
 pub use stamp::{
     DeferredStore, FileTimestampStore, MAX_HELD_HANDSHAKES, MemoryTimestampStore, Pass, Released,
