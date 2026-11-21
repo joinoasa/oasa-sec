@@ -39,7 +39,7 @@
 //! the packets handed to the firmware. The hold store, the filters and the
 //! deframers are fixed arrays.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -52,10 +52,14 @@ use super::msg::{
     BodyFormat, FromPhone, MAX_ACK, MSG_HELD, MSG_RECEIVED, firmware_may_send, parse_from_phone,
 };
 use super::radio::{
-    Action, ChannelId, Radio, RadioKeys, RadioStore, Status, StoreFailed, Transport,
+    Action, ChannelId, Marker, Radio, RadioKeys, RadioStore, SavedPhone, Status, StoreFailed,
+    Transport,
 };
 use crate::identity::Identity;
-use crate::link::{Config, Dest, Entropy, Event, Link, Stats, StoredStamps, TimestampStore};
+use crate::link::{
+    Config, Dest, Entropy, EntropyFailed, Event, Link, Stats, StoredStamps, TimestampStore,
+    data_overhead,
+};
 use crate::{Error, Result};
 
 /// The link's rekey time on the phone link (spec section 3).
@@ -87,6 +91,17 @@ pub fn link_config(mtu: usize) -> Config {
 /// this phone's radio-link key from the pairing and the phone link's
 /// settings. The first completed handshake is the pairing's confirmation
 /// (spec section 2.4).
+///
+/// `max_future`: the phone has a clock, so it can refuse a radio handshake
+/// whose timestamp is far ahead of it (the link's `max_future`). The radio's
+/// own timestamps count up from zero after each boot, far below any phone
+/// clock, so turning it on costs the owner nothing and refuses a far-future
+/// timestamp pushed by someone holding the radio's link key (spec section 6).
+/// Recommended: `Some` (for example a day). Section 3 requires it off only
+/// on the radio.
+// SPEC-GAP: section 3 turns `max_future` off "on the radio" and says
+// nothing about the phone; this offers it on the phone, off by default in
+// `link_config`, and leaves the value to the app.
 pub fn phone_link(
     radio_link_key: &Identity,
     radio_link_public: [u8; 32],
@@ -94,11 +109,15 @@ pub fn phone_link(
     entropy: Box<dyn Entropy>,
     wall_base: Duration,
     store: Box<dyn TimestampStore>,
+    max_future: Option<Duration>,
 ) -> Result<Link> {
     Link::new(
         radio_link_key,
         radio_link_public,
-        link_config(mtu),
+        Config {
+            max_future,
+            ..link_config(mtu)
+        },
         entropy,
         wall_base,
         store,
@@ -143,6 +162,85 @@ impl<S: PhoneStateStore> TimestampStore for Stamps<S> {
             self.failed.set(true);
             Error::Link("the radio's store failed")
         })
+    }
+}
+
+/// One store, or one random source, used by the pairing machine and by
+/// the session through handles to the **same value** (review S-3). The node
+/// makes it from the value it is given and never copies that value: every
+/// random byte comes from one stream (the link key, then session indexes,
+/// never a repeat), and every write goes to one flash (an erase is seen by
+/// every user). Only the node can make one.
+pub struct Shared<T>(Rc<RefCell<T>>);
+
+impl<T> Shared<T> {
+    fn new(t: T) -> Self {
+        Self(Rc::new(RefCell::new(t)))
+    }
+
+    fn handle(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Shared(..)")
+    }
+}
+
+impl<T: Entropy> Entropy for Shared<T> {
+    fn fill(&mut self, dst: &mut [u8]) {
+        self.0.borrow_mut().fill(dst);
+    }
+    fn try_fill(&mut self, dst: &mut [u8]) -> std::result::Result<(), EntropyFailed> {
+        self.0.borrow_mut().try_fill(dst)
+    }
+}
+
+impl<T: RadioStore> RadioStore for Shared<T> {
+    fn marker(&mut self) -> std::result::Result<Option<Marker>, StoreFailed> {
+        self.0.borrow_mut().marker()
+    }
+    fn set_marker(&mut self, m: Marker) -> std::result::Result<(), StoreFailed> {
+        self.0.borrow_mut().set_marker(m)
+    }
+    fn clear_marker(&mut self) -> std::result::Result<(), StoreFailed> {
+        self.0.borrow_mut().clear_marker()
+    }
+    fn erase_owner_state(&mut self) -> std::result::Result<(), StoreFailed> {
+        self.0.borrow_mut().erase_owner_state()
+    }
+    fn trust(&mut self) -> std::result::Result<Option<SavedPhone>, StoreFailed> {
+        self.0.borrow_mut().trust()
+    }
+    fn write_trust(&mut self, t: Option<&SavedPhone>) -> std::result::Result<(), StoreFailed> {
+        self.0.borrow_mut().write_trust(t)
+    }
+    fn rate_count(&mut self) -> std::result::Result<u8, StoreFailed> {
+        self.0.borrow_mut().rate_count()
+    }
+    fn write_rate_count(&mut self, n: u8) -> std::result::Result<(), StoreFailed> {
+        self.0.borrow_mut().write_rate_count(n)
+    }
+}
+
+impl<T: PhoneStateStore> PhoneStateStore for Shared<T> {
+    fn stamps(&mut self, phone: &[u8; 32]) -> std::result::Result<StoredStamps, StoreFailed> {
+        self.0.borrow_mut().stamps(phone)
+    }
+    fn write_stamps(
+        &mut self,
+        phone: &[u8; 32],
+        stamps: &StoredStamps,
+    ) -> std::result::Result<(), StoreFailed> {
+        self.0.borrow_mut().write_stamps(phone, stamps)
+    }
+    fn filters(&mut self) -> std::result::Result<Filters, StoreFailed> {
+        self.0.borrow_mut().filters()
+    }
+    fn write_filters(&mut self, filters: &Filters) -> std::result::Result<(), StoreFailed> {
+        self.0.borrow_mut().write_filters(filters)
     }
 }
 
@@ -237,6 +335,11 @@ pub struct NodeStats {
     pub wakes: u64,
     /// Packets the link wanted to send with no connection to send on.
     pub not_sent: u64,
+    /// Packets from the air not held because no `RECEIVED` at this MTU
+    /// could carry them (or the random source failed at boot).
+    pub not_held: u64,
+    /// Held packets a `FETCH` could not send; they stay held.
+    pub fetch_skipped: u64,
 }
 
 struct Conn<const MTU: usize> {
@@ -258,9 +361,16 @@ struct Session {
 }
 
 /// The radio's phone side. `BLE` and `USB` are the pairing slots (as
-/// [`Radio`]), `LINKS` the link connection slots, `MTU` the phone link's
-/// largest packet (at least 128; spec section 3: it must fit the largest air
-/// packet plus the `SEND` or `RECEIVED` fields plus the link's 22 bytes).
+/// [`Radio`]); `LINKS` the link connection slots in all, of which
+/// `USB_LINKS` are for USB and the rest for BLE, counted apart so a flood
+/// on one transport never displaces the other (as the pairing slots,
+/// spec section 10); `MTU` the phone link's largest packet (at least 128;
+/// spec section 3: it must fit the largest air packet plus the `SEND` or
+/// `RECEIVED` fields plus the link's 22 bytes). A held packet is never
+/// larger than a `RECEIVED` at this MTU can carry.
+///
+/// The store and the random source are taken by value and shared inside
+/// through one handle each ([`Shared`]); they are never copied.
 pub struct RadioNode<
     S,
     E,
@@ -268,19 +378,27 @@ pub struct RadioNode<
     const BLE: usize,
     const USB: usize,
     const LINKS: usize,
+    const USB_LINKS: usize,
     const MTU: usize,
 > where
-    S: RadioStore + PhoneStateStore + Clone + 'static,
-    E: Entropy + Clone + 'static,
+    S: RadioStore + PhoneStateStore + 'static,
+    E: Entropy + 'static,
     F: BodyFormat,
 {
-    radio: Radio<S, E, BLE, USB>,
-    store: S,
-    entropy: E,
+    radio: Radio<Shared<S>, Shared<E>, BLE, USB>,
+    store: Shared<S>,
+    entropy: Shared<E>,
     format: F,
     session: Option<Session>,
-    /// Counts sessions; held packets remember which one they went out in.
-    session_no: u32,
+    /// Counts handshakes (and rebuilt sessions); a held packet remembers the
+    /// one it was last handed over in, and a `FETCH` offers it again only
+    /// in a later one.
+    handover: u32,
+    /// The largest packet a `RECEIVED` can carry at this MTU (and the hold
+    /// store's slot size), checked before holding.
+    max_held: usize,
+    /// False if the random source failed at boot: nothing is held.
+    hold_on: bool,
     conns: [Option<Conn<MTU>>; LINKS],
     window_open: bool,
     window_closed_at: Duration,
@@ -291,11 +409,19 @@ pub struct RadioNode<
     clock: Duration,
 }
 
-impl<S, E, F, const BLE: usize, const USB: usize, const LINKS: usize, const MTU: usize>
-    RadioNode<S, E, F, BLE, USB, LINKS, MTU>
+impl<
+    S,
+    E,
+    F,
+    const BLE: usize,
+    const USB: usize,
+    const LINKS: usize,
+    const USB_LINKS: usize,
+    const MTU: usize,
+> RadioNode<S, E, F, BLE, USB, LINKS, USB_LINKS, MTU>
 where
-    S: RadioStore + PhoneStateStore + Clone + 'static,
-    E: Entropy + Clone + 'static,
+    S: RadioStore + PhoneStateStore + 'static,
+    E: Entropy + 'static,
     F: BodyFormat,
 {
     /// Start the radio from no power ([`Radio::boot`]), then load the wake
@@ -312,32 +438,51 @@ where
         usb_present: bool,
         out: &mut impl FnMut(NodeAction),
     ) -> Self {
-        assert!(LINKS > 0, "at least one link connection slot");
+        assert!(
+            USB_LINKS > 0 && USB_LINKS < LINKS,
+            "at least one link connection slot for each transport"
+        );
         assert!(
             link_config(MTU).validate().is_ok(),
             "the MTU must be 128 to 65535 bytes"
         );
+        // The largest packet one RECEIVED can carry: the MTU less the
+        // link's data overhead, the type byte and the body's own fields.
+        let max_held = MTU
+            .saturating_sub(data_overhead(link_config(MTU).counter_len))
+            .saturating_sub(1 + format.received_overhead())
+            .min(super::hold::MAX_HELD_PACKET);
+        let store = Shared::new(store);
+        let mut entropy = Shared::new(entropy);
         let mut acts = Vec::new();
         let radio = Radio::boot(
             keys,
             name,
-            store.clone(),
-            entropy.clone(),
+            store.handle(),
+            entropy.handle(),
             now,
             usb_present,
             &mut |a| acts.push(a),
         );
+        // Hold numbers start at a random place each boot, so a number from
+        // before a power cycle almost never names a new packet (review S-4).
+        // SPEC-GAP: the spec does not say how hold numbers relate across a
+        // power cycle; a per-boot epoch in the bodies would make it exact.
+        let mut start = [0u8; 4];
+        let hold_on = entropy.try_fill(&mut start).is_ok();
         let mut n = Self {
             radio,
             store,
             entropy,
             format,
             session: None,
-            session_no: 0,
+            handover: 0,
+            max_held,
+            hold_on,
             conns: std::array::from_fn(|_| None),
             window_open: false,
             window_closed_at: now,
-            hold: HoldStore::new(),
+            hold: HoldStore::starting_at(u32::from_be_bytes(start)),
             filters: Filters::none(),
             wake: WakeLimit::new(),
             stats: NodeStats::default(),
@@ -355,7 +500,7 @@ where
     }
 
     /// The pairing machine, for what the node does not wrap.
-    pub fn radio(&self) -> &Radio<S, E, BLE, USB> {
+    pub fn radio(&self) -> &Radio<Shared<S>, Shared<E>, BLE, USB> {
         &self.radio
     }
 
@@ -375,6 +520,12 @@ where
     /// Packets held now.
     pub fn held(&self) -> usize {
         self.hold.len()
+    }
+
+    /// Tests only: the hold numbers held now.
+    #[cfg(test)]
+    pub(crate) fn held_numbers(&self) -> Vec<HoldNumber> {
+        self.hold.numbers()
     }
 
     /// Bytes held now.
@@ -512,8 +663,12 @@ where
     ) {
         let now = self.tick(now);
         self.poll_inner(now, out);
-        if self.find(conn).is_some() {
-            return;
+        // An id that is already open is a new connection: the old one is
+        // gone (a lost close event, or a reused handle), and nothing of it
+        // (completion, session, half-read frame) carries over (review S-7).
+        if let Some(i) = self.find(conn) {
+            self.conns[i] = None;
+            self.conn_gone(now, conn, out);
         }
         // The flash is the only source of who is paired: check it again.
         self.check_trust(now, out);
@@ -524,16 +679,31 @@ where
             completed: false,
             deframer: Deframer::new(),
         };
-        if let Some(i) = self.conns.iter().position(Option::is_none) {
+        let cap = match transport {
+            Transport::Usb => USB_LINKS,
+            Transport::Ble => LINKS - USB_LINKS,
+        };
+        let used = self
+            .conns
+            .iter()
+            .flatten()
+            .filter(|c| c.transport == transport)
+            .count();
+        if used < cap
+            && let Some(i) = self.conns.iter().position(Option::is_none)
+        {
             self.conns[i] = Some(new);
             return;
         }
+        // SPEC-GAP: section 3 does not say whether BLE and USB share link
+        // slots; they are counted apart, and a new connection replaces only
+        // the oldest incomplete one on its own transport.
         let oldest = self
             .conns
             .iter()
             .enumerate()
             .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
-            .filter(|(_, c)| !c.completed)
+            .filter(|(_, c)| c.transport == transport && !c.completed)
             .min_by_key(|(_, c)| c.since)
             .map(|(i, _)| i);
         match oldest {
@@ -619,11 +789,17 @@ where
         if st.faulted || !st.paired {
             return;
         }
+        // A packet no RECEIVED could carry is never held: it could never be
+        // handed over (review S-2).
+        if !self.hold_on || packet.len() > self.max_held {
+            self.stats.not_held += 1;
+            return;
+        }
         let Some(hold) = self.hold.offer(now, packet, signal, &self.filters) else {
             return;
         };
         if self.live() && self.send_received(now, hold, signal, packet, out) {
-            self.hold.mark_delivered(self.session_no, hold);
+            self.hold.mark_delivered(self.handover, hold);
         } else {
             self.wake.held();
         }
@@ -685,6 +861,12 @@ where
                     self.wake = WakeLimit::new();
                 }
                 Action::Paired { .. } | Action::ResetDone => rebuild = true,
+                // A faulted radio holds nothing and wakes nobody: nobody can
+                // fetch until a reset (which wipes) or a boot (memory only).
+                Action::StoreFailed => {
+                    self.hold.clear();
+                    self.wake = WakeLimit::new();
+                }
                 _ => {}
             }
             out(NodeAction::Pairing(a));
@@ -767,7 +949,7 @@ where
         };
         let store_failed = Rc::new(Cell::new(false));
         let stamps = Stamps {
-            store: self.store.clone(),
+            store: self.store.handle(),
             phone: saved.phone_public,
             failed: store_failed.clone(),
         };
@@ -776,14 +958,14 @@ where
                 &id,
                 saved.phone_public,
                 link_config(MTU),
-                Box::new(self.entropy.clone()),
+                Box::new(self.entropy.handle()),
                 Duration::ZERO,
                 Box::new(stamps),
             )
         });
         match built {
             Ok(link) => {
-                self.session_no = self.session_no.wrapping_add(1).max(1);
+                self.handover = self.handover.wrapping_add(1).max(1);
                 self.session = Some(Session {
                     link,
                     phone: saved.phone_public,
@@ -810,6 +992,10 @@ where
             self.route(now, None, evs, out);
         }
         self.track_window(now);
+        // SPEC-GAP (review S-8): the 5 s rule is off during every window,
+        // because on BLE one connection carries both the pairing
+        // characteristic and the link, and a pairing takes up to 9 s (3 s for
+        // message 1, then 6 s for message 3). Displacement still frees slots.
         if !self.window_open {
             for i in 0..LINKS {
                 let due = self.conns[i]
@@ -868,8 +1054,17 @@ where
                         && (new_session || s.bound.is_none() || s.bound == Some(c))
                     {
                         s.bound = Some(c);
-                        if let Some(i) = self.find(c) {
-                            self.conns[i].as_mut().expect("found").completed = true;
+                        for k in self.conns.iter_mut().flatten() {
+                            if k.id == c {
+                                k.completed = true;
+                            } else if new_session && k.completed {
+                                // Only the connection that holds the session
+                                // is complete: any other must handshake
+                                // again, so it can be displaced and times
+                                // out (review S-1).
+                                k.completed = false;
+                                k.since = now;
+                            }
                         }
                     }
                 }
@@ -900,7 +1095,11 @@ where
             return;
         }
         if established {
+            // A new handshake: held packets not yet acknowledged are offered
+            // again by the next FETCH (review S-6).
+            self.handover = self.handover.wrapping_add(1).max(1);
             self.wake.connected();
+            // After every handshake, rekeys included (spec section 4).
             self.send_held(now, out);
         }
         for mut body in delivered {
@@ -956,7 +1155,7 @@ where
                 let mut holds = [HoldNumber(0); MAX_ACK];
                 match self.format.decode_fetch_ack(b, &mut holds) {
                     Some(n) if n <= MAX_ACK => {
-                        if self.hold.ack(self.session_no, &holds[..n]) > 0 {
+                        if self.hold.ack(&holds[..n]) > 0 {
                             self.wake.real_ack();
                         }
                     }
@@ -977,28 +1176,21 @@ where
         }
     }
 
-    /// `FETCH`: every held packet not yet handed over in this session, as
-    /// `RECEIVED` with its hold number. Nothing is deleted.
+    /// `FETCH`: every held packet not yet handed over since the last
+    /// handshake, oldest first, as `RECEIVED` with its hold number. Nothing
+    /// is deleted. A packet that cannot be sent is skipped (counted), never
+    /// a reason to stop: the others still go (review S-2).
     fn fetch(&mut self, now: Duration, out: &mut impl FnMut(NodeAction)) {
-        let session_no = self.session_no;
-        let mut sent: Vec<(HoldNumber, Signal, Vec<u8>)> = Vec::new();
-        // Collect first (the link needs `self`), then send in order; a
-        // packet that cannot be sent stays unmarked.
-        self.hold.fetch(session_no, |h, sig, p| {
-            sent.push((h, sig, p.to_vec()));
-            true
-        });
-        let mut failed_from = None;
-        for (k, (h, sig, p)) in sent.iter().enumerate() {
-            if !self.send_received(now, *h, *sig, p, out) {
-                failed_from = Some(k);
-                break;
-            }
-        }
-        if let Some(k) = failed_from {
-            // Not handed over: unmark so the next FETCH offers them again.
-            for (h, _, _) in &sent[k..] {
-                self.hold.mark_delivered(0, *h);
+        let epoch = self.handover;
+        // Copy first (the link needs `self`), then send each.
+        let mut todo: Vec<(HoldNumber, Signal, Vec<u8>)> = Vec::new();
+        self.hold
+            .pending(epoch, |h, sig, p| todo.push((h, sig, p.to_vec())));
+        for (h, sig, p) in &todo {
+            if self.send_received(now, *h, *sig, p, out) {
+                self.hold.mark_delivered(epoch, *h);
+            } else {
+                self.stats.fetch_skipped += 1;
             }
         }
     }
@@ -1049,11 +1241,19 @@ where
     }
 }
 
-impl<S, E, F, const BLE: usize, const USB: usize, const LINKS: usize, const MTU: usize>
-    std::fmt::Debug for RadioNode<S, E, F, BLE, USB, LINKS, MTU>
+impl<
+    S,
+    E,
+    F,
+    const BLE: usize,
+    const USB: usize,
+    const LINKS: usize,
+    const USB_LINKS: usize,
+    const MTU: usize,
+> std::fmt::Debug for RadioNode<S, E, F, BLE, USB, LINKS, USB_LINKS, MTU>
 where
-    S: RadioStore + PhoneStateStore + Clone + 'static,
-    E: Entropy + Clone + 'static,
+    S: RadioStore + PhoneStateStore + 'static,
+    E: Entropy + 'static,
     F: BodyFormat,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

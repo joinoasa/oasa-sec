@@ -128,6 +128,10 @@ pub trait BodyFormat {
     fn decode_fetch_ack(&mut self, body: &[u8], out: &mut [HoldNumber; MAX_ACK]) -> Option<usize>;
     /// A `HELD` body: how many packets are held.
     fn encode_held(&mut self, count: usize, out: &mut Vec<u8>);
+    /// The most bytes [`encode_received`](Self::encode_received) adds to a
+    /// packet (its hold number, signal level and any other field). The radio
+    /// holds only packets that fit one `RECEIVED` at its MTU with these.
+    fn received_overhead(&self) -> usize;
     /// A `RECEIVED` body for a held packet.
     fn encode_received(
         &mut self,

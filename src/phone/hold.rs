@@ -16,6 +16,10 @@
 //! deleted only by a `FETCH_ACK` that names it, by the limits (oldest first
 //! within its own share), after [`HOLD_FOR`], or by a wipe (reset, replace,
 //! power loss).
+//!
+//! Held packets are sealed by the sender; they are not secrets. A slot is
+//! still wiped when it is freed (defence in depth), but copies handed out
+//! (a `RECEIVED` on its way to the phone, firmware actions) are not.
 
 use std::time::Duration;
 
@@ -225,7 +229,7 @@ struct Entry {
     signal: Signal,
     len: usize,
     buf: [u8; MAX_HELD_PACKET],
-    /// The session number it was last handed over in (0: never).
+    /// The handover epoch it was last handed over in (0: never).
     delivered_in: u32,
 }
 
@@ -260,11 +264,18 @@ impl std::fmt::Debug for HoldStore {
 
 impl HoldStore {
     pub fn new() -> Self {
+        Self::starting_at(1)
+    }
+
+    /// An empty store whose first hold number is `first` (0 is skipped).
+    /// The radio starts each boot at a random place, so a number the phone
+    /// kept from before a power cycle almost never names a new packet.
+    pub fn starting_at(first: u32) -> Self {
         Self {
             slots: std::array::from_fn(|_| None),
             bytes: 0,
             seq: 0,
-            next_hold: 1,
+            next_hold: first.max(1),
         }
     }
 
@@ -280,6 +291,19 @@ impl HoldStore {
     /// Bytes held.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Tests only: the hold numbers held now, oldest first.
+    #[cfg(test)]
+    pub(crate) fn numbers(&self) -> Vec<HoldNumber> {
+        let mut v: Vec<(u64, HoldNumber)> = self
+            .slots
+            .iter()
+            .flatten()
+            .map(|e| (e.seq, e.hold))
+            .collect();
+        v.sort_unstable();
+        v.into_iter().map(|(_, h)| h).collect()
     }
 
     /// Whether a packet with this number is held.
@@ -363,52 +387,44 @@ impl HoldStore {
             .min()
     }
 
-    /// Hand over, oldest first, every packet not yet handed over in
-    /// `session`, and mark each one handed over. Nothing is deleted.
-    /// `give` returns false if it could not pass the packet on; that packet
-    /// stays unmarked.
-    pub fn fetch(&mut self, session: u32, mut give: impl FnMut(HoldNumber, Signal, &[u8]) -> bool) {
-        // Each pass marks one packet, so this ends after at most every slot;
-        // the bound keeps it so even if that ever stopped being true.
-        for _ in 0..HOLD_PACKETS {
-            let next = self
-                .slots
-                .iter_mut()
-                .flatten()
-                .filter(|e| e.delivered_in != session)
-                .min_by_key(|e| e.seq);
-            let Some(e) = next else { break };
-            // Mark first, so a packet `give` refuses is not offered again in
-            // this call; unmark it after.
-            let before = e.delivered_in;
-            e.delivered_in = session;
-            if !give(e.hold, e.signal, &e.buf[..e.len]) {
-                e.delivered_in = before;
-                break;
+    /// Every packet not handed over in handover `epoch`, oldest first.
+    /// Marks nothing (see [`mark_delivered`](Self::mark_delivered)).
+    pub fn pending(&self, epoch: u32, mut each: impl FnMut(HoldNumber, Signal, &[u8])) {
+        let mut todo: [Option<(u64, usize)>; HOLD_PACKETS] = [None; HOLD_PACKETS];
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(e) = slot.as_ref().filter(|e| e.delivered_in != epoch) {
+                todo[i] = Some((e.seq, i));
+            }
+        }
+        todo.sort_unstable_by_key(|t| t.map(|(seq, _)| seq));
+        for (_, i) in todo.iter().flatten() {
+            if let Some(e) = &self.slots[*i] {
+                each(e.hold, e.signal, &e.buf[..e.len]);
             }
         }
     }
 
-    /// Mark one packet handed over in `session` (sent at once while the
-    /// phone is connected).
-    pub fn mark_delivered(&mut self, session: u32, hold: HoldNumber) {
+    /// Mark one packet handed over in handover `epoch` (at once while the
+    /// phone is connected, or by a `FETCH`). `epoch` is never 0.
+    pub fn mark_delivered(&mut self, epoch: u32, hold: HoldNumber) {
         if let Some(e) = self.slots.iter_mut().flatten().find(|e| e.hold == hold) {
-            e.delivered_in = session;
+            e.delivered_in = epoch;
         }
     }
 
-    /// `FETCH_ACK`: delete the named packets that were handed over in
-    /// `session`, and no others. Returns how many were deleted.
+    /// `FETCH_ACK`: delete the named packets that have been handed over
+    /// to the phone (in any handshake since this boot), and no others.
+    /// Returns how many were deleted.
     // SPEC-GAP: the spec says the radio deletes the acknowledged packets
-    // "and no others". A number that was not handed over in this session
-    // (from an older session, a reboot's reused number, or an app bug) is
-    // ignored rather than deleted.
-    pub fn ack(&mut self, session: u32, holds: &[HoldNumber]) -> usize {
+    // "and no others". A number never handed over (the phone cannot know it,
+    // except by guessing or from before a power cycle, when numbers start
+    // elsewhere) is ignored rather than deleted.
+    pub fn ack(&mut self, holds: &[HoldNumber]) -> usize {
         let mut n = 0;
         for slot in self.slots.iter_mut() {
             if slot
                 .as_ref()
-                .is_some_and(|e| e.delivered_in == session && holds.contains(&e.hold))
+                .is_some_and(|e| e.delivered_in != 0 && holds.contains(&e.hold))
             {
                 self.bytes -= slot.as_ref().map_or(0, |e| e.len);
                 *slot = None;
@@ -506,6 +522,10 @@ impl WakeLimit {
     }
 
     /// A `FETCH_ACK` named at least one held packet: the wakes were real.
+    // SPEC-GAP (review S-5): `FETCH_ACK` both deletes and, here, counts as
+    // "the phone could open these". A phone that acknowledges junk to clear
+    // it also resets the back-off. Telling the two apart needs a body field
+    // the spec does not have yet.
     pub fn real_ack(&mut self) {
         self.paid = true;
         self.interval = WAKE_EVERY;

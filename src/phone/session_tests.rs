@@ -27,7 +27,9 @@ use crate::link::{
 };
 
 const MTU: usize = 256;
-type N = RadioNode<MemStore, TestEntropy, TestFormat, 3, 2, 3, MTU>;
+/// Four link slots: three for BLE, one for USB.
+type RadioNodeFor<E> = RadioNode<MemStore, E, TestFormat, 3, 2, 4, 1, MTU>;
+type N = RadioNodeFor<TestEntropy>;
 
 /// The phone's wall clock at monotonic zero (it has a clock).
 const WALL: Duration = Duration::from_secs(1_800_000_000);
@@ -222,6 +224,9 @@ impl BodyFormat for TestFormat {
     fn encode_held(&mut self, count: usize, out: &mut Vec<u8>) {
         out.extend_from_slice(&(count as u16).to_be_bytes());
     }
+    fn received_overhead(&self) -> usize {
+        6
+    }
     fn encode_received(&mut self, h: HoldNumber, sig: Signal, p: &[u8], out: &mut Vec<u8>) {
         out.extend_from_slice(&h.0.to_be_bytes());
         out.extend_from_slice(&sig.0.to_be_bytes());
@@ -362,6 +367,7 @@ impl Phone {
             Box::new(OsEntropy),
             wall,
             Box::new(stamps.clone()),
+            None,
         )
         .unwrap();
         Self {
@@ -961,7 +967,10 @@ fn case_18_idle_and_flooding_connections_do_not_keep_the_owner_out() {
 }
 
 #[test]
-fn case_18_every_slot_completed_refuses_a_new_connection() {
+fn case_18_sessions_one_after_another_leave_one_completed_connection() {
+    // The same phone makes a new session on three connections in turn
+    // (each a new handshake). Only the last holds the session; the others
+    // must handshake again, so they can be displaced and time out.
     let (mut b, done) = Bench::paired();
     let mut ps: Vec<Phone> = (10..13)
         .map(|c| Phone::new(&done, c, Transport::Ble))
@@ -969,11 +978,22 @@ fn case_18_every_slot_completed_refuses_a_new_connection() {
     for (k, p) in ps.iter_mut().enumerate() {
         b.connect(4.0 + 1.1 * k as f64, p);
     }
-    let v = b.open(9.0, Transport::Ble, 50);
-    assert_eq!(closed(&v, 50), Some(LinkCloseReason::SlotsFull));
-    for c in 10..13 {
-        assert!(closed(&v, c).is_none());
+    assert!(b.n.connected());
+    // New connections displace the two left behind, never the bound one.
+    let v = b.open(7.0, Transport::Ble, 50);
+    let v2 = b.open(7.1, Transport::Ble, 51);
+    let gone: Vec<_> = [10, 11]
+        .iter()
+        .filter(|c| closed(&v, **c).or(closed(&v2, **c)) == Some(LinkCloseReason::Displaced))
+        .collect();
+    assert_eq!(gone.len(), 2, "a connection left behind kept its slot");
+    for x in [&v, &v2] {
+        assert!(
+            closed(x, 12).is_none(),
+            "the bound connection was displaced"
+        );
     }
+    assert!(b.n.connected());
 }
 
 #[test]
@@ -1601,8 +1621,9 @@ fn case_21_an_ack_for_a_number_not_handed_over_in_this_session_deletes_nothing()
     b.air(7.0, &data_pkt(7, 1, 60));
     let mut p = p.reconnected(11);
     b.connect(8.0, &mut p);
-    // Hold numbers start at 1: ack it without fetching.
-    b.say(9.0, &mut p, &ack_msg(&[1, 2, 3]));
+    // The phone acks the right number without it ever being handed over.
+    let h = b.n.held_numbers()[0];
+    b.say(9.0, &mut p, &ack_msg(&[h.0, h.0.wrapping_add(1)]));
     assert_eq!(b.n.held(), 1);
 }
 
@@ -1646,10 +1667,7 @@ fn case_21_the_store_limits_hold() {
     assert_eq!(h.len(), HOLD_PACKETS);
     // The current filter keeps its whole share: the newest 21.
     let mut fetched = vec![];
-    h.fetch(1, |_, _, p| {
-        fetched.push(p.to_vec());
-        true
-    });
+    h.pending(1, |_, _, p| fetched.push(p.to_vec()));
     let current: Vec<_> = fetched.iter().filter(|p| p[2] == 9).collect();
     assert_eq!(current.len(), 21);
     assert!(current.iter().all(|p| p[4] >= 19), "not the newest");
@@ -1815,4 +1833,370 @@ fn a_faulted_radio_holds_nothing() {
         "a faulted radio held a packet nobody can fetch"
     );
     assert!(!b.log.iter().any(|a| matches!(a, NodeAction::Wake)));
+}
+
+// ---- review findings (S-1 to S-9) ----
+
+#[test]
+fn s1_a_session_made_on_another_connection_holds_no_slot_against_the_owner() {
+    // Each round, someone delivers the phone's first data packet of a new
+    // session on a connection of their own before the phone's copy arrives.
+    let (mut b, done) = Bench::paired();
+    let mut p = Phone::new(&done, 10, Transport::Ble);
+    let mut t = 4.0;
+    for round in 0..6u32 {
+        let oc = 10 + round;
+        let ac = 30 + round;
+        p = p.reconnected(oc);
+        let v = b.open(t, Transport::Ble, oc);
+        assert_ne!(
+            closed(&v, oc),
+            Some(LinkCloseReason::SlotsFull),
+            "round {round}: the owner was refused a slot"
+        );
+        let hs = packets(&p.link.start_handshake(s(t)).unwrap());
+        let v = b.bytes(t, oc, &frame(&hs[0]).unwrap());
+        let mut first = vec![];
+        for x in sends_to(&v, oc) {
+            first.extend(p.recv(t, &x));
+        }
+        b.open(t, Transport::Ble, ac);
+        for k in &first {
+            b.bytes(t, ac, &frame(k).unwrap());
+            b.bytes(t, oc, &frame(k).unwrap());
+        }
+        t += 10.0;
+        b.poll(t);
+        b.close(t, oc);
+        t += 10.0;
+        b.poll(t);
+    }
+    // When it stops, the owner gets in.
+    let mut p = p.reconnected(99);
+    let v = b.connect(t, &mut p);
+    assert_ne!(closed(&v, 99), Some(LinkCloseReason::SlotsFull));
+    assert!(b.n.connected());
+}
+
+#[test]
+fn s2_a_packet_too_large_for_received_is_not_held_and_blocks_nothing() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(
+        5.0,
+        &mut p,
+        &filters_msg(&[Filter::Index(7), Filter::Index(8)]),
+    );
+    b.close(6.0, 10);
+    b.air(7.0, &data_pkt(7, 1, 256));
+    b.air(7.1, &data_pkt(8, 2, 60));
+    b.air(7.2, &data_pkt(8, 3, 60));
+    let mut p = p.reconnected(11);
+    b.connect(10.0, &mut p);
+    b.say(11.0, &mut p, &[MSG_FETCH]);
+    assert_eq!(
+        p.received().len(),
+        2,
+        "a packet that cannot be sent blocked the rest"
+    );
+    assert_eq!(b.n.held(), 2, "a packet no RECEIVED can carry was held");
+}
+
+#[test]
+fn s4_an_ack_from_before_a_reboot_does_not_delete_a_new_packet() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(5.0, &mut p, &filters_msg(&[Filter::Index(7)]));
+    let v = b.air(6.0, &data_pkt(7, 1, 60));
+    for x in sends_to(&v, 10) {
+        p.recv(6.0, &x);
+    }
+    let before = p.received()[0].0;
+    b.reboot(10.0, true);
+    let mut p2 = p.reconnected(11);
+    b.connect(11.0, &mut p2);
+    let v = b.air(12.0, &data_pkt(7, 2, 60));
+    for x in sends_to(&v, 11) {
+        p2.recv(12.0, &x);
+    }
+    b.say(13.0, &mut p2, &ack_msg(&[before]));
+    assert_eq!(
+        b.n.held(),
+        1,
+        "an ack from before the reboot deleted a new packet"
+    );
+}
+
+#[test]
+fn s6_after_a_rekey_unacknowledged_packets_are_offered_again_and_acks_still_work() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(5.0, &mut p, &filters_msg(&[Filter::Index(7)]));
+    b.close(5.5, 10);
+    b.air(6.0, &data_pkt(7, 1, 60));
+    let mut p = p.reconnected(11);
+    b.connect(7.0, &mut p);
+    b.say(8.0, &mut p, &[MSG_FETCH]);
+    assert_eq!(p.received().len(), 1);
+    // A rekey on the same connection: a new handshake.
+    let t = 3600.0 + 7.0;
+    b.tick_both(t, &mut p);
+    assert!(p.link.stats().handshakes_completed >= 2, "no rekey");
+    b.say(t + 1.0, &mut p, &[MSG_FETCH]);
+    assert_eq!(
+        p.received().len(),
+        2,
+        "not offered again after a new handshake"
+    );
+    // An ack after the rekey for what was handed over before it deletes it.
+    let h = p.received()[0].0;
+    b.say(t + 2.0, &mut p, &ack_msg(&[h]));
+    assert_eq!(b.n.held(), 0);
+}
+
+#[test]
+fn s6_an_ack_after_a_rekey_deletes_what_was_fetched_before_it() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(5.0, &mut p, &filters_msg(&[Filter::Index(7)]));
+    b.close(5.5, 10);
+    b.air(6.0, &data_pkt(7, 1, 60));
+    let mut p = p.reconnected(11);
+    b.connect(7.0, &mut p);
+    b.say(8.0, &mut p, &[MSG_FETCH]);
+    let h = p.received()[0].0;
+    let t = 3600.0 + 7.0;
+    b.tick_both(t, &mut p);
+    b.say(t + 1.0, &mut p, &ack_msg(&[h]));
+    assert_eq!(b.n.held(), 0, "an ack after a rekey was ignored");
+}
+
+#[test]
+fn s7_a_reused_connection_id_starts_clean() {
+    let (mut b, _p) = Bench::connected();
+    // The transport reports connection 10 open again with no close between.
+    b.open(5.0, Transport::Ble, 10);
+    assert!(!b.n.connected(), "a reused id inherited the session");
+    // It must handshake like any new connection.
+    assert_eq!(
+        closed(&b.poll(10.5), 10),
+        Some(LinkCloseReason::NoHandshake)
+    );
+}
+
+#[test]
+fn s8_a_ble_flood_does_not_displace_the_usb_link() {
+    let (mut b, _done) = Bench::paired();
+    b.open(4.0, Transport::Usb, 50);
+    for c in 60..70 {
+        let v = b.open(4.1, Transport::Ble, c);
+        assert!(
+            closed(&v, 50).is_none(),
+            "a BLE connection displaced the USB link"
+        );
+    }
+}
+
+#[test]
+fn s8_a_flood_before_the_owner_completes_can_push_it_out_and_it_retries() {
+    // Like C-5 in part 1: accepted as denial, like jamming (spec section 7).
+    let (mut b, done) = Bench::paired();
+    let mut p = Phone::new(&done, 10, Transport::Ble);
+    b.open(4.0, Transport::Ble, 10);
+    for c in 60..70 {
+        b.open(4.0, Transport::Ble, c);
+    }
+    let hs = packets(&p.link.start_handshake(s(4.0)).unwrap());
+    let v = b.bytes(4.0, 10, &frame(&hs[0]).unwrap());
+    assert!(sends_to(&v, 10).is_empty());
+    // When the flood stops the owner retries and gets in; once in, a new
+    // flood never displaces it.
+    let mut p = p.reconnected(11);
+    b.connect(6.0, &mut p);
+    assert!(b.n.connected());
+    for c in 80..90 {
+        let v = b.open(6.5, Transport::Ble, c);
+        assert!(closed(&v, 11).is_none());
+    }
+    assert!(b.n.connected());
+}
+
+#[test]
+fn s9_a_fault_cancels_a_pending_wake_and_wipes_held_packets() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(5.0, &mut p, &filters_msg(&[Filter::Index(7)]));
+    b.close(6.0, 10);
+    b.air(7.0, &data_pkt(7, 1, 60));
+    b.air(8.0, &data_pkt(7, 2, 60));
+    let w0 = b.n.stats().wakes;
+    b.flash.borrow_mut().reads_fail = true;
+    b.open(9.0, Transport::Ble, 20);
+    assert!(b.n.status(s(9.0)).faulted);
+    b.poll(30.0);
+    assert_eq!(b.n.stats().wakes, w0, "a faulted radio woke the phone");
+    assert_eq!(b.n.held(), 0);
+}
+
+#[test]
+fn the_others_must_handshake_again_when_the_bound_connection_closes() {
+    let (mut b, _p) = Bench::connected();
+    b.open(4.5, Transport::Ble, 11);
+    b.close(8.0, 10);
+    // 11 opened at 4.5 but its 5 s start again at 8.0.
+    assert!(closed(&b.poll(9.6), 11).is_none());
+    assert_eq!(
+        closed(&b.poll(13.1), 11),
+        Some(LinkCloseReason::NoHandshake)
+    );
+}
+
+#[test]
+fn a_good_frame_then_a_bad_one_in_one_write_uses_neither() {
+    let (mut b, mut p) = Bench::connected();
+    let pkt = p.link.send(s(5.0), &send_msg(1)).unwrap();
+    let mut w = frame(&pkt).unwrap();
+    w.extend([0, 0]);
+    let v = b.bytes(5.0, 10, &w);
+    assert_eq!(closed(&v, 10), Some(LinkCloseReason::BadFrame));
+    assert_eq!(b.transmits(), 0, "a frame from a broken write was used");
+}
+
+/// A deterministic random source that is a plain value: a clone repeats
+/// the same bytes (as a seeded generator deriving `Clone` would). Every
+/// draw is logged, through a shared log, so repeats show.
+#[derive(Clone)]
+struct ValueRng {
+    state: u64,
+    log: Rc<RefCell<Vec<Vec<u8>>>>,
+}
+
+impl Entropy for ValueRng {
+    fn fill(&mut self, dst: &mut [u8]) {
+        for b in dst.iter_mut() {
+            self.state ^= self.state << 13;
+            self.state ^= self.state >> 7;
+            self.state ^= self.state << 17;
+            *b = (self.state >> 24) as u8;
+        }
+        self.log.borrow_mut().push(dst.to_vec());
+    }
+}
+
+#[test]
+fn s3_one_random_stream_feeds_the_link_key_and_the_session() {
+    type N3 = RadioNodeFor<ValueRng>;
+    let log = Rc::new(RefCell::new(vec![]));
+    let rng = ValueRng {
+        state: 0x9E37_79B9_7F4A_7C15,
+        log: log.clone(),
+    };
+    let id = Identity::generate().unwrap();
+    let label = LabelCode::new(*id.public_key()).unwrap();
+    let flash = Rc::new(RefCell::new(Flash::default()));
+    let mut sink = |_| {};
+    let mut n = N3::boot(
+        RadioKeys::new(id, &label).unwrap(),
+        Name::new(RADIO_NAME).unwrap(),
+        MemStore(flash.clone()),
+        rng,
+        TestFormat,
+        s(0.0),
+        true,
+        &mut sink,
+    );
+    n.poll(s(2.0), &mut sink);
+    // Pair over USB.
+    let mut acts = vec![];
+    n.pairing_channel_opened(s(3.0), Transport::Usb, 1, &mut |a| acts.push(a));
+    let (pp, m1) = PhonePairing::start(PairWith::Label(&label), "owner", &mut OsEntropy).unwrap();
+    n.pairing_message(s(3.0), 1, &m1, &mut |a| acts.push(a));
+    let done = pp.finish(&msg2_in(&acts, 1).unwrap()).unwrap();
+    n.pairing_message(s(3.0), 1, &done.msg3, &mut |a| acts.push(a));
+    // Connect and run a few handshakes: each draws session indexes.
+    for k in 0..3u32 {
+        let c = 10 + k;
+        let t = 4.0 + 2.0 * f64::from(k);
+        let mut p = Phone::new(&done, c, Transport::Ble);
+        let mut v = vec![];
+        n.link_opened(s(t), Transport::Ble, c, &mut |a| v.push(a));
+        let mut out = packets(&p.link.start_handshake(s(t)).unwrap());
+        for _ in 0..4 {
+            let mut back = vec![];
+            for pk in std::mem::take(&mut out) {
+                let mut v = vec![];
+                n.link_bytes(s(t), c, &frame(&pk).unwrap(), &mut |a| v.push(a));
+                back.extend(sends_to(&v, c));
+            }
+            for x in back {
+                out.extend(p.recv(t, &x));
+            }
+        }
+        assert!(n.connected(), "round {k}");
+        n.link_closed(s(t + 1.0), c, &mut |_| {});
+    }
+    // No draw repeats the start of an earlier one: one stream, not copies.
+    let draws = log.borrow();
+    assert!(draws.iter().any(|d| d.len() == 32), "no link key was drawn");
+    for i in 0..draws.len() {
+        for j in 0..i {
+            let n = draws[i].len().min(draws[j].len());
+            assert!(
+                n < 2 || draws[i][..n] != draws[j][..n],
+                "draw {i} repeats draw {j}: the random source was copied"
+            );
+        }
+    }
+}
+
+#[test]
+fn s12_the_phone_can_refuse_a_far_future_radio_handshake() {
+    let (b, done) = Bench::paired();
+    let link_private = b.flash.borrow().trust.as_ref().unwrap().2;
+    let radio = Identity::from_private_bytes(&link_private).unwrap();
+    // Someone with the radio's link key and a clock ten years ahead.
+    let mut forged = Link::new(
+        &radio,
+        *done.radio_link_key.public_key(),
+        link_config(MTU),
+        Box::new(OsEntropy),
+        WALL + Duration::from_secs(10 * 365 * 86_400),
+        Box::new(crate::link::MemoryTimestampStore::default()),
+    )
+    .unwrap();
+    let hs = packets(&forged.start_handshake(s(1.0)).unwrap());
+    let mut phone = phone_link(
+        &done.radio_link_key,
+        done.radio_link_public,
+        MTU,
+        Box::new(OsEntropy),
+        WALL,
+        Box::new(PhoneStamps::default()),
+        Some(Duration::from_secs(86_400)),
+    )
+    .unwrap();
+    let evs = phone.handle_packet(s(1.0), &hs[0]);
+    assert!(
+        packets(&evs).is_empty(),
+        "a far-future handshake was answered"
+    );
+    assert_eq!(phone.stats().dropped(DropReason::StaleHandshake), 1);
+    // The radio's own handshakes (timestamps from zero) still pass.
+    let mut real = Link::new(
+        &radio,
+        *done.radio_link_key.public_key(),
+        link_config(MTU),
+        Box::new(OsEntropy),
+        Duration::ZERO,
+        Box::new(crate::link::MemoryTimestampStore::default()),
+    )
+    .unwrap();
+    let hs = packets(&real.start_handshake(s(2.0)).unwrap());
+    assert_eq!(packets(&phone.handle_packet(s(2.0), &hs[0])).len(), 1);
+}
+
+#[test]
+fn s4_a_random_source_that_fails_at_boot_means_nothing_is_held() {
+    let (mut b, mut p) = Bench::connected();
+    b.say(5.0, &mut p, &filters_msg(&[Filter::Index(7)]));
+    b.entropy.0.set(true);
+    b.reboot(10.0, true);
+    b.air(11.0, &data_pkt(7, 1, 60));
+    assert_eq!(b.n.held(), 0, "held with hold numbers that may repeat");
+    assert_eq!(b.n.stats().not_held, 1);
 }
